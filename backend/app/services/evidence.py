@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import re
+import uuid
+from typing import Any
+
+from backend.app.domain.scoring import aggregate_scores, normalize_scores
+from backend.app.services.knowledge import KnowledgeBase
+from backend.app.services.text_utils import repair_mojibake
+
+
+def split_segments(text: str, limit: int = 8) -> list[str]:
+    segments = [re.sub(r"^[-*\d.、)）\s]+", "", item).strip() for item in re.split(r"[\r\n；;]+", text or "")]
+    return list(dict.fromkeys(item for item in segments if len(item) >= 6))[:limit]
+
+
+def infer_question_type(text: str) -> str:
+    if re.search(r"项目|经历|负责|挑战|成果", text): return "项目经历"
+    if re.search(r"冲突|失败|协作|分歧|压力", text): return "行为面试"
+    if re.search(r"指标|数据|算法|实验|测试|技术|架构", text): return "技术知识"
+    if re.search(r"业务|用户|市场|产品|需求", text): return "业务理解"
+    if re.search(r"规划|未来|离职|为什么选择", text): return "职业规划"
+    return "其他"
+
+
+class EvidenceReviewService:
+    def __init__(self, knowledge: KnowledgeBase):
+        self.knowledge = knowledge
+
+    def analyze_materials(self, job_description: str, resume_text: str) -> dict[str, Any]:
+        requirements = [
+            {"id": f"req-{index}", "title": text[:28], "description": text, "priority": "core" if index <= 3 else "important", "category": self._category(text)}
+            for index, text in enumerate(split_segments(job_description), 1)
+        ]
+        evidence = [
+            {"id": f"resume-{index}", "title": text[:28], "description": text, "metrics": re.findall(r"\d+(?:\.\d+)?(?:%|万|亿|人|次|天|月|年)?", text), "tags": [self._category(text)]}
+            for index, text in enumerate(split_segments(resume_text), 1)
+        ]
+        return {"jobRequirements": requirements, "resumeEvidence": evidence}
+
+    def parse_transcript(self, transcript: str) -> list[dict[str, Any]]:
+        transcript = repair_mojibake(transcript)
+        lines = [line.strip() for line in (transcript or "").splitlines() if line.strip()]
+        questions: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        timestamp = r"(?:(?:\[[^\]]+\]|(?:\d{1,2}:){1,2}\d{2})\s*)?"
+        interviewer_pattern = re.compile(rf"^{timestamp}(?:面试官|采访者|interviewer|问|q)\s*[:：]\s*(.+)$", re.I)
+        candidate_pattern = re.compile(rf"^{timestamp}(?:候选人|求职者|candidate|答|a)\s*[:：]\s*(.+)$", re.I)
+        unlabeled_question_pattern = re.compile(r"^\[(?:录音约\s*)?[^\]]+\]\s*(.+)$", re.I)
+        for line in lines:
+            interviewer = interviewer_pattern.match(line)
+            candidate = candidate_pattern.match(line)
+            unlabeled = unlabeled_question_pattern.match(line) if not interviewer and not candidate else None
+            if interviewer or (unlabeled and self._looks_like_question(unlabeled.group(1))):
+                question = (interviewer or unlabeled).group(1).strip()
+                if not self._looks_like_question(question):
+                    continue
+                if current and self._looks_like_follow_up(question):
+                    current["followUpQuestions"].append(question)
+                    continue
+                if current:
+                    questions.append(current)
+                current = self._question(question, len(questions) + 1, "high")
+            elif candidate and current:
+                current["candidateAnswer"] += ("\n" if current["candidateAnswer"] else "") + candidate.group(1).strip()
+            elif current:
+                current["candidateAnswer"] += ("\n" if current["candidateAnswer"] else "") + line
+        if current: questions.append(current)
+        if questions:
+            return questions[:40]
+
+        sentences = [part.strip() for part in re.split(r"(?<=[？?。！!])|\r?\n", transcript or "") if part.strip()]
+        current = None
+        for sentence in sentences:
+            if "?" in sentence or "？" in sentence or re.match(r"^(请|你|为什么|怎么|如何|介绍|讲一个|如果)", sentence):
+                if current: questions.append(current)
+                current = self._question(re.sub(r"^\S+[:：]\s*", "", sentence), len(questions) + 1, "low")
+            elif current:
+                current["candidateAnswer"] += sentence
+        if current: questions.append(current)
+        return questions[:40]
+
+    def review(self, interview: dict[str, Any], questions: list[dict[str, Any]], enable_web_verify: bool = False) -> dict[str, Any]:
+        materials = self.analyze_materials(interview.get("job_description", ""), interview.get("resume_text", ""))
+        reviews = [self._review_question(interview, question, materials) for question in questions]
+        overall = aggregate_scores([review["scores"] for review in reviews])
+        ordered = sorted(reviews, key=lambda item: item["scores"]["overall"])
+        risks = [{"questionId": item["id"], "title": item["interviewerQuestion"][:42], "reason": item["diagnosis"], "severity": item["priority"]["level"]} for item in ordered[:3]]
+        actions = self._action_plan(ordered)
+        summary = self._summary(overall, materials, enable_web_verify)
+        return {"reviews": reviews, "summary": summary, "overallScores": overall, "topRisks": risks, "actionItems": actions, "auditNotes": []}
+
+    def audit(self, interview: dict[str, Any], batch: dict[str, Any]) -> dict[str, Any]:
+        notes: list[str] = []
+        sources = {
+            "transcript": interview.get("raw_transcript", ""),
+            "job_description": interview.get("job_description", ""),
+            "resume": interview.get("resume_text", ""),
+        }
+        for review in batch["reviews"]:
+            valid_evidence = []
+            for evidence in review.get("evidenceRefs", []):
+                source = sources.get(evidence.get("sourceType", ""), "")
+                evidence["verified"] = bool(evidence.get("quote") and evidence["quote"] in source)
+                if evidence["verified"] or evidence.get("sourceType") == "knowledge":
+                    valid_evidence.append(evidence)
+                else:
+                    notes.append(f"题目 {review['id']} 移除了一条无法回查的引用")
+            review["evidenceRefs"] = valid_evidence
+            valid_quotes = {item["quote"] for item in valid_evidence if item.get("quote")}
+            for score_evidence in review.get("scoreEvidence", []):
+                if score_evidence.get("quote") not in valid_quotes:
+                    score_evidence["quote"] = ""
+                    score_evidence["rationale"] += "（该维度缺少可直接回查的原文引用）"
+            review["scores"] = normalize_scores(review.get("scores"))
+        batch["overallScores"] = aggregate_scores([review["scores"] for review in batch["reviews"]])
+        batch["auditNotes"] = notes or ["所有原文引用均已通过回查校验"]
+        return batch
+
+    def _review_question(self, interview: dict[str, Any], question: dict[str, Any], materials: dict[str, Any]) -> dict[str, Any]:
+        answer = str(question.get("candidateAnswer", "")).strip()
+        length_score = min(8.0, 3.5 + len(answer) / 90)
+        has_metric = bool(re.search(r"\d", answer))
+        has_structure = sum(bool(re.search(word, answer)) for word in ("首先", "其次", "最后", "背景", "目标", "结果")) >= 2
+        requirements = materials["jobRequirements"]
+        resume = materials["resumeEvidence"]
+        role_match = self._best_match(answer + question.get("interviewerQuestion", ""), requirements)
+        resume_match = self._best_match(answer, resume)
+        scores = normalize_scores({
+            "relevance": length_score + 0.8,
+            "structure": length_score + (0.8 if has_structure else -0.4),
+            "evidence": length_score + (1.0 if has_metric else -1.2),
+            "depth": length_score + (0.4 if len(answer) >= 160 else -0.5),
+            "roleFit": 5.0 if interview.get("analysis_mode") == "general" else length_score + (0.6 if role_match else -0.8),
+        })
+        quote = answer[: min(72, len(answer))]
+        evidence_refs: list[dict[str, Any]] = []
+        if quote:
+            evidence_refs.append(self._evidence("transcript", question["id"], quote, answer.find(quote), 1.0))
+        if role_match:
+            evidence_refs.append(self._evidence("job_description", role_match["id"], role_match["description"], interview.get("job_description", "").find(role_match["description"]), 0.95))
+        if resume_match:
+            evidence_refs.append(self._evidence("resume", resume_match["id"], resume_match["description"], interview.get("resume_text", "").find(resume_match["description"]), 0.95))
+        knowledge_hits = self.knowledge.search(f"{question.get('questionType', '')} {question.get('interviewerQuestion', '')}")
+        for hit in knowledge_hits[:2]:
+            evidence_refs.append({"id": str(uuid.uuid4()), "sourceType": "knowledge", "sourceId": hit.id, "quote": hit.text[:180], "locator": hit.source, "verified": True, "confidence": hit.confidence, "title": hit.title, "url": ""})
+        missing = []
+        if not has_metric: missing.append("可验证的量化结果")
+        if len(answer) < 140: missing.append("个人关键行动与决策过程")
+        strengths = ["回答覆盖了问题主题"]
+        if has_metric: strengths.append("提供了量化或可核验信息")
+        if has_structure: strengths.append("表达具有清晰的先后结构")
+        weaknesses = missing or ["可以进一步压缩背景并强化个人贡献"]
+        diagnosis = "回答具备真实经历基础，但需要把个人判断、关键行动和结果因果关系说得更清楚。" if answer else "本题缺少有效回答，需要先补充真实经历，系统不会替你编造事实。"
+        score_evidence = [
+            {"dimension": "relevance", "score": scores["relevance"], "rationale": "回答是否直接覆盖问题核心。", "quote": quote, "evidenceIds": [evidence_refs[0]["id"]] if quote else []},
+            {"dimension": "evidence", "score": scores["evidence"], "rationale": "检查是否包含可回查事实和量化结果。", "quote": quote if has_metric else "", "evidenceIds": [evidence_refs[0]["id"]] if quote and has_metric else []},
+        ]
+        risk_level = "high" if scores["overall"] < 5.5 else "medium" if scores["overall"] < 7.2 else "low"
+        return {
+            **question,
+            "scores": scores,
+            "scoreEvidence": score_evidence,
+            "evidenceRefs": evidence_refs,
+            "diagnosis": diagnosis,
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "suggestedStructure": "先给结论，再按情境、任务、关键行动、结果和复盘展开。",
+            "improvedAnswer": self._star_answer(answer, missing),
+            "knowledgeToPrepare": ["项目核心指标口径", "个人决策与复盘案例"],
+            "roleFitDiagnosis": {
+                "matchedRequirementIds": [role_match["id"]] if role_match else [],
+                "missingRequirementIds": [requirements[1]["id"]] if len(requirements) > 1 and not role_match else [],
+                "resumeEvidenceIds": [resume_match["id"]] if resume_match else [],
+                "riskLevel": risk_level if requirements else "unknown",
+                "summary": "回答已找到岗位要求和简历证据的对应关系。" if role_match else "当前材料中没有找到足够强的岗位对应证据。",
+            },
+            "starRewrite": {
+                "situation": answer or "[待补充：项目背景]",
+                "task": "[待补充：你承担的明确目标]",
+                "action": "[待补充：你的关键行动、判断和取舍]",
+                "result": "原回答含有结果信息，请明确指标口径。" if has_metric else "[待补充：量化结果]",
+                "fullAnswer": self._star_answer(answer, missing),
+                "missingInformation": missing,
+            },
+            "priority": {"level": risk_level, "reason": "证据完整度与岗位映射共同决定本题复盘优先级。"},
+        }
+
+    @staticmethod
+    def _question(text: str, order: int, confidence: str) -> dict[str, Any]:
+        return {"id": str(uuid.uuid4()), "order": order, "interviewerQuestion": text, "followUpQuestions": [], "candidateAnswer": "", "questionType": infer_question_type(text), "confidence": confidence, "initialDiagnosis": [], "confirmed": False, "version": 1}
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        if re.search(r"(?:不用作为正式问题|不用展开|我补充说明一下|稍微停一下|我看下时间|录音转写|只是确认|你有什么想问|候选人向面试官提问)", text):
+            return False
+        return bool(
+            re.search(r"[?？]", text)
+            or re.search(r"(?:请|介绍|讲讲|谈谈|说说|如何|怎么|为什么|哪些|什么|是否|能否|能不能|你会|你认为|你负责)", text)
+        )
+
+    @staticmethod
+    def _looks_like_follow_up(text: str) -> bool:
+        return bool(
+            re.match(r"(?:如果.+发生冲突|如果业务方不同意|说具体一点|我打断一下|你刚才提到|刚才你提到|能再具体|请再具体)", text)
+            or re.search(r"(?:不要只讲过程|怎么证明这不是偶然结果)", text)
+        )
+
+    @staticmethod
+    def _evidence(source_type: str, source_id: str, quote: str, offset: int, confidence: float) -> dict[str, Any]:
+        return {"id": str(uuid.uuid4()), "sourceType": source_type, "sourceId": source_id, "quote": quote, "locator": f"字符 {max(0, offset)}", "verified": offset >= 0, "confidence": confidence, "title": "", "url": ""}
+
+    @staticmethod
+    def _best_match(text: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", text.lower()))
+        ranked = []
+        for item in items:
+            item_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", item.get("description", "").lower()))
+            ranked.append((len(tokens & item_tokens), item))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return ranked[0][1] if ranked and ranked[0][0] > 0 else None
+
+    @staticmethod
+    def _category(text: str) -> str:
+        if re.search(r"数据|指标|分析|实验", text): return "数据分析"
+        if re.search(r"用户|需求|产品", text): return "产品能力"
+        if re.search(r"协作|沟通|推动", text): return "协作推动"
+        return "经历证据"
+
+    @staticmethod
+    def _star_answer(answer: str, missing: list[str]) -> str:
+        base = answer or "[待补充：真实经历和原始回答]"
+        suffix = " ".join(f"[待补充：{item}]" for item in missing)
+        return f"{base}\n建议按 STAR 重述：明确背景与目标，突出你的关键行动和取舍，最后说明结果与复盘。{suffix}".strip()
+
+    @staticmethod
+    def _action_plan(ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ids = [item["id"] for item in ordered]
+        return [
+            {"id": str(uuid.uuid4()), "title": "重写最低分问题的两分钟回答", "description": "补齐个人行动、取舍与量化结果，并计时复述。", "priority": "high", "practiceType": "answer_revision", "sourceQuestionIds": ids[:1], "completed": False},
+            {"id": str(uuid.uuid4()), "title": "整理三条可复用的项目证据", "description": "记录指标口径、个人贡献和最终结果。", "priority": "medium", "practiceType": "evidence_collection", "sourceQuestionIds": ids[1:2], "completed": False},
+            {"id": str(uuid.uuid4()), "title": "逐项映射岗位核心要求", "description": "为每条核心要求准备一个真实案例。", "priority": "medium", "practiceType": "role_fit_preparation", "sourceQuestionIds": [], "completed": False},
+        ]
+
+    @staticmethod
+    def _summary(scores: dict[str, float], materials: dict[str, Any], web: bool) -> str:
+        weakest = min((name for name in scores if name != "overall"), key=lambda name: scores[name])
+        web_note = "已按规则启用受限联网核验；联网信息不参与直接加分。" if web else "本次仅使用本地材料和知识库。"
+        return f"本场综合得分 {scores['overall']:.1f}/10，当前最需要提升的维度是 {weakest}。系统已将结论绑定到原回答、JD 和简历证据。{web_note}"

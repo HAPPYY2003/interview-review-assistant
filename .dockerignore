@@ -1,0 +1,16 @@
+.git
+.venv
+.pip-cache
+.env
+__pycache__
+*.pyc
+.pytest_cache
+.playwright-browsers
+data/offer_radar.db
+data/offer_radar.db-*
+data/uploads
+data/sessions
+data/traces
+data/*.log
+test-results
+playwright-report

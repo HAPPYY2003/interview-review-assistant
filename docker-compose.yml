@@ -1,0 +1,17 @@
+services:
+  offer-radar:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      AGENT_RUNTIME: ${AGENT_RUNTIME:-fixture}
+      LLM_MODEL_ID: ${LLM_MODEL_ID:-gpt-4.1-mini}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      WEB_VERIFY_ENABLED: ${WEB_VERIFY_ENABLED:-false}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+    volumes:
+      - offer-radar-data:/app/data
+
+volumes:
+  offer-radar-data:
