@@ -1,0 +1,21 @@
+{
+  "company": "星舟协作",
+  "position": "高级产品经理",
+  "round": "业务二面",
+  "interviewDate": "2026-07-18",
+  "reviewGoal": "检查问题定位、数据证据、个人决策和跨团队推动能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "expectedParse": {
+    "segments": 12,
+    "questions": 6,
+    "topics": 3,
+    "followUps": 3,
+    "needsConfirmation": 0
+  },
+  "expectedFocus": [
+    "应识别 3 个主题和多轮追问",
+    "回答包含可回查的指标与实验信息",
+    "主题评分应综合主回答与追问，不对追问单独打分"
+  ]
+}

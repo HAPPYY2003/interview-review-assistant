@@ -9,18 +9,92 @@ from backend.app.services.knowledge import KnowledgeBase
 from backend.app.services.text_utils import repair_mojibake
 
 
+QUESTION_TYPES = ("项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他")
+QUESTION_TYPE_ALIASES = {
+    "project": "项目经历",
+    "project_experience": "项目经历",
+    "experience": "项目经历",
+    "technical": "技术知识",
+    "technical_knowledge": "技术知识",
+    "technical_question": "技术知识",
+    "business": "业务理解",
+    "business_understanding": "业务理解",
+    "product_sense": "业务理解",
+    "career": "职业规划",
+    "career_planning": "职业规划",
+    "reverse_question": "反问环节",
+    "candidate_question": "反问环节",
+    "other": "其他",
+}
+
+
 def split_segments(text: str, limit: int = 8) -> list[str]:
     segments = [re.sub(r"^[-*\d.、)）\s]+", "", item).strip() for item in re.split(r"[\r\n；;]+", text or "")]
     return list(dict.fromkeys(item for item in segments if len(item) >= 6))[:limit]
 
 
 def infer_question_type(text: str) -> str:
+    if re.search(r"有什么想问|还有什么问题|想了解我们|反问", text): return "反问环节"
+    if re.search(r"冲突|失败|协作|分歧|压力|说服|推动.*分歧", text): return "行为面试"
+    if re.search(r"指标|数据|算法|实验|测试|技术|架构|系统设计|性能|代码", text): return "技术知识"
+    if re.search(r"职业规划|职业发展|离职|未来(?:三年|五年|职业)|为什么选择(?:我们|这家公司|该公司|这个岗位|该岗位|这个行业)", text): return "职业规划"
     if re.search(r"项目|经历|负责|挑战|成果", text): return "项目经历"
-    if re.search(r"冲突|失败|协作|分歧|压力", text): return "行为面试"
-    if re.search(r"指标|数据|算法|实验|测试|技术|架构", text): return "技术知识"
-    if re.search(r"业务|用户|市场|产品|需求", text): return "业务理解"
-    if re.search(r"规划|未来|离职|为什么选择", text): return "职业规划"
+    if re.search(r"业务|用户|市场|产品|需求|商业", text): return "业务理解"
     return "其他"
+
+
+def normalize_question_type(value: Any, text: str = "") -> str:
+    raw = str(value or "").strip()
+    if raw in QUESTION_TYPES:
+        return raw
+    key = re.sub(r"[\s-]+", "_", raw.lower())
+    if key in QUESTION_TYPE_ALIASES:
+        return QUESTION_TYPE_ALIASES[key]
+    return infer_question_type(text)
+
+
+def infer_topic_title(text: str, question_type: Any = "") -> str:
+    kind = normalize_question_type(question_type, text)
+    if kind == "行为面试":
+        if re.search(r"分歧|冲突", text) and re.search(r"跨团队|研发|设计|协作|团队", text):
+            return "跨团队分歧处理"
+        if re.search(r"分歧|冲突", text):
+            return "分歧与冲突处理"
+        if re.search(r"失败|失误|挫折", text):
+            return "失败复盘与改进"
+        if re.search(r"压力|紧急|截止", text):
+            return "压力与优先级管理"
+        if re.search(r"说服|影响|推动|协作", text):
+            return "沟通协作与推动"
+        return "行为经历复盘"
+    if kind == "技术知识":
+        if re.search(r"实验|显著|样本量|分流", text):
+            return "实验分析与决策"
+        if re.search(r"数据|指标|漏斗", text):
+            return "数据分析与指标"
+        if re.search(r"架构|系统设计|性能", text):
+            return "系统设计与架构"
+        if re.search(r"算法|模型|代码", text):
+            return "算法与技术原理"
+        return "技术能力"
+    if kind == "项目经历":
+        if re.search(r"挑战|困难|复杂", text):
+            return "挑战项目复盘"
+        if re.search(r"成果|结果|提升|增长", text):
+            return "项目成果与影响"
+        return "项目职责与实践"
+    if kind == "业务理解":
+        if re.search(r"用户|需求", text):
+            return "用户与需求洞察"
+        if re.search(r"市场|竞品|商业", text):
+            return "市场与商业判断"
+        return "业务与产品理解"
+    if kind == "职业规划":
+        return "职业选择与规划"
+    if kind == "反问环节":
+        return "候选人反问"
+    cleaned = re.sub(r"[？?。！!]", "", text).strip()
+    return cleaned[:18] if cleaned else "其他问题"
 
 
 class EvidenceReviewService:
@@ -119,6 +193,7 @@ class EvidenceReviewService:
 
     def _review_question(self, interview: dict[str, Any], question: dict[str, Any], materials: dict[str, Any]) -> dict[str, Any]:
         answer = str(question.get("candidateAnswer", "")).strip()
+        source_transcript = interview.get("raw_transcript", "")
         length_score = min(8.0, 3.5 + len(answer) / 90)
         has_metric = bool(re.search(r"\d", answer))
         has_structure = sum(bool(re.search(word, answer)) for word in ("首先", "其次", "最后", "背景", "目标", "结果")) >= 2
@@ -133,10 +208,25 @@ class EvidenceReviewService:
             "depth": length_score + (0.4 if len(answer) >= 160 else -0.5),
             "roleFit": 5.0 if interview.get("analysis_mode") == "general" else length_score + (0.6 if role_match else -0.8),
         })
-        quote = answer[: min(72, len(answer))]
+        root_answer = str(question.get("extractedAnswer") or question.get("candidateAnswer", "")).strip()
+        quote = root_answer[: min(72, len(root_answer))]
         evidence_refs: list[dict[str, Any]] = []
         if quote:
-            evidence_refs.append(self._evidence("transcript", question["id"], quote, answer.find(quote), 1.0))
+            source_id = (question.get("answerSegmentIds") or [question["id"]])[0]
+            evidence_refs.append(self._evidence("transcript", source_id, quote, source_transcript.find(quote), 1.0))
+        follow_up_turns = []
+        for follow_up in question.get("followUpTurns", []):
+            follow_up = dict(follow_up)
+            follow_answer = str(follow_up.get("extractedAnswer") or follow_up.get("candidateAnswer", "")).strip()
+            impact = self._follow_up_impact(root_answer, follow_answer)
+            follow_up["followUpImpact"] = impact
+            follow_up_turns.append(follow_up)
+            follow_quote = follow_answer[: min(72, len(follow_answer))]
+            if follow_quote:
+                source_id = (follow_up.get("answerSegmentIds") or [follow_up["id"]])[0]
+                ref = self._evidence("transcript", source_id, follow_quote, source_transcript.find(follow_quote), float(follow_up.get("confidence") != "low"))
+                ref["title"] = f"追问影响：{impact}"
+                evidence_refs.append(ref)
         if role_match:
             evidence_refs.append(self._evidence("job_description", role_match["id"], role_match["description"], interview.get("job_description", "").find(role_match["description"]), 0.95))
         if resume_match:
@@ -159,6 +249,7 @@ class EvidenceReviewService:
         risk_level = "high" if scores["overall"] < 5.5 else "medium" if scores["overall"] < 7.2 else "low"
         return {
             **question,
+            "followUpTurns": follow_up_turns,
             "scores": scores,
             "scoreEvidence": score_evidence,
             "evidenceRefs": evidence_refs,
@@ -185,6 +276,18 @@ class EvidenceReviewService:
             },
             "priority": {"level": risk_level, "reason": "证据完整度与岗位映射共同决定本题复盘优先级。"},
         }
+
+    @staticmethod
+    def _follow_up_impact(root_answer: str, follow_answer: str) -> str:
+        if not follow_answer or len(follow_answer) < 12:
+            return "暴露回答不足"
+        if re.search(r"(?:但是|并不是|相反|不一致|其实没有|前面说错)", follow_answer):
+            return "存在前后矛盾"
+        if re.search(r"\d|首先|其次|具体|例如|因为|指标|结果", follow_answer):
+            return "补充有效证据"
+        root_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}", root_answer))
+        follow_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}", follow_answer))
+        return "与主回答一致" if root_tokens & follow_tokens else "暴露回答不足"
 
     @staticmethod
     def _question(text: str, order: int, confidence: str) -> dict[str, Any]:

@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import settings
 from backend.app.database import Database
-from backend.app.schemas import InterviewCreate, InterviewImport, MaterialText, QuestionPatch, ReviewRunCreate
+from backend.app.schemas import ConfirmQuestionsRequest, InterviewCreate, InterviewImport, MaterialText, QuestionPatch, ReviewRunCreate, TranscriptSegmentPatch
+from backend.app.services.audio import AudioInspectionError, inspect_audio
 from backend.app.services.document_parser import DocumentParseError, DocumentParser
 from backend.app.services.evidence import EvidenceReviewService
 from backend.app.services.knowledge import KnowledgeBase
+from backend.app.services.parse_workflow import ParseWorkflow
 from backend.app.services.workflow import ReviewWorkflow
 
 
@@ -27,6 +31,7 @@ knowledge = KnowledgeBase(settings.knowledge_dir)
 review_service = EvidenceReviewService(knowledge)
 document_parser = DocumentParser(settings.max_file_bytes)
 workflow = ReviewWorkflow(database, review_service, settings)
+parse_workflow = ParseWorkflow(database, settings)
 background_tasks: set[asyncio.Task[Any]] = set()
 
 
@@ -39,7 +44,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="Offer Radar Agent", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Offer Radar Agent", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
@@ -63,6 +68,13 @@ def get_run_or_404(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="未找到复盘任务") from exc
 
 
+def get_parse_run_or_404(run_id: str) -> dict[str, Any]:
+    try:
+        return database.get_parse_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到解析任务") from exc
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
@@ -71,6 +83,10 @@ def health() -> dict[str, Any]:
         "demoMode": settings.demo_mode,
         "knowledgeChunks": len(knowledge.documents),
         "webVerifyAvailable": settings.web_verify_enabled and bool(settings.tavily_api_key),
+        "audioTranscriptionAvailable": bool(settings.deepgram_api_key) and not settings.demo_mode,
+        "asrProvider": settings.asr_provider,
+        "maxAudioBytes": settings.max_audio_bytes,
+        "maxAudioSeconds": settings.max_audio_seconds,
     }
 
 
@@ -82,6 +98,23 @@ def create_interview(payload: InterviewCreate) -> dict[str, Any]:
 @app.get("/api/v1/interviews")
 def list_interviews() -> list[dict[str, Any]]:
     return database.list_interviews()
+
+
+@app.delete("/api/v1/interviews/{interview_id}")
+def delete_interview(interview_id: str) -> dict[str, bool]:
+    get_interview_or_404(interview_id)
+    parse_run_ids = database.get_parse_run_ids(interview_id)
+    paths = database.delete_interview(interview_id)
+    for stored_path in paths:
+        candidate = (settings.root_dir / stored_path).resolve()
+        uploads = (settings.data_dir / "uploads").resolve()
+        if uploads in candidate.parents:
+            candidate.unlink(missing_ok=True)
+    upload_dir = settings.data_dir / "uploads" / interview_id
+    shutil.rmtree(upload_dir, ignore_errors=True)
+    for parse_run_id in parse_run_ids:
+        shutil.rmtree(settings.data_dir / "parse-runs" / parse_run_id, ignore_errors=True)
+    return {"deleted": True}
 
 
 @app.post("/api/v1/interviews/import")
@@ -97,18 +130,70 @@ async def upload_material(
     interview_id: str,
     material_type: str = Form(...),
     file: UploadFile = File(...),
+    cloud_consent: bool = Form(default=False),
 ) -> dict[str, Any]:
     get_interview_or_404(interview_id)
     if settings.demo_mode:
         raise HTTPException(status_code=403, detail="在线示例模式不接受私人材料上传")
-    if material_type not in {"job_description", "resume", "transcript"}:
+    if material_type not in {"job_description", "resume", "transcript", "transcript_audio"}:
         raise HTTPException(status_code=422, detail="材料类型不正确")
+    if material_type == "transcript_audio":
+        if not cloud_consent:
+            raise HTTPException(status_code=422, detail="上传音频前必须确认已获授权并同意发送到 Deepgram")
+        suffix = Path(file.filename or "").suffix.lower()
+        upload_dir = settings.data_dir / "uploads" / interview_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        target = upload_dir / f"{uuid.uuid4()}{suffix}"
+        size = 0
+        try:
+            with target.open("wb") as handle:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > settings.max_audio_bytes:
+                        raise AudioInspectionError("音频超过 200MB 限制")
+                    handle.write(chunk)
+            inspection = inspect_audio(target, file.filename or "", settings)
+            relative_path = str(target.relative_to(settings.root_dir)).replace("\\", "/")
+            return database.add_material(
+                interview_id,
+                material_type,
+                "",
+                file.filename,
+                {"format": inspection.suffix.removeprefix("."), "cloudConsent": True},
+                storage_path=relative_path,
+                mime_type=inspection.mime_type,
+                size_bytes=inspection.size_bytes,
+                sha256=inspection.sha256,
+                duration_seconds=inspection.duration_seconds,
+                processing_status="UPLOADED",
+            )
+        except AudioInspectionError as exc:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
     content = await file.read(settings.max_file_bytes + 1)
     try:
         parsed = document_parser.parse(file.filename or "", content)
     except DocumentParseError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return database.add_material(interview_id, material_type, parsed.text, file.filename, parsed.metadata)
+
+
+@app.get("/api/v1/materials/{material_id}/content")
+def get_material_content(material_id: str) -> FileResponse:
+    try:
+        material = database.get_material(material_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到材料") from exc
+    if material["material_type"] != "transcript_audio" or not material.get("storage_path"):
+        raise HTTPException(status_code=404, detail="该材料没有可回放音频")
+    candidate = (settings.root_dir / material["storage_path"]).resolve()
+    uploads = (settings.data_dir / "uploads").resolve()
+    if uploads not in candidate.parents or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="音频文件不存在")
+    return FileResponse(candidate, media_type=material.get("mime_type") or "application/octet-stream")
 
 
 @app.post("/api/v1/interviews/{interview_id}/materials/text")
@@ -119,19 +204,95 @@ def add_material_text(interview_id: str, payload: MaterialText) -> dict[str, Any
     return database.add_material(interview_id, payload.material_type, payload.text.strip(), payload.filename, {"format": "text", "characters": len(payload.text)})
 
 
-@app.post("/api/v1/interviews/{interview_id}/parse")
-def parse_interview(interview_id: str) -> dict[str, Any]:
+def _schedule_parse(run_id: str) -> None:
+    task = asyncio.create_task(asyncio.to_thread(parse_workflow.execute, run_id))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+@app.post("/api/v1/interviews/{interview_id}/parse", status_code=202)
+async def parse_interview(interview_id: str) -> dict[str, Any]:
     interview = get_interview_or_404(interview_id)
-    if not interview["raw_transcript"].strip():
-        raise HTTPException(status_code=422, detail="面试文字稿不能为空")
-    database.update_interview(interview_id, status="PARSING")
-    questions = review_service.parse_transcript(interview["raw_transcript"])
-    if not questions:
-        database.update_interview(interview_id, status="FAILED")
-        raise HTTPException(status_code=422, detail="未识别到问题，请保留‘面试官：’和‘候选人：’标记")
-    database.replace_questions(interview_id, questions)
-    database.update_interview(interview_id, status="WAITING_CONFIRMATION")
-    return {"questions": questions, "status": "WAITING_CONFIRMATION", "requiresHumanConfirmation": True}
+    material = database.latest_material(interview_id, ["transcript_audio", "transcript"])
+    if not material and interview["raw_transcript"].strip():
+        material = database.add_material(
+            interview_id,
+            "transcript",
+            interview["raw_transcript"],
+            "pasted-transcript.txt",
+            {"format": "text", "characters": len(interview["raw_transcript"])},
+        )
+    if not material:
+        raise HTTPException(status_code=422, detail="面试文字稿或音频不能为空")
+    if material["material_type"] == "transcript_audio" and not settings.deepgram_api_key:
+        raise HTTPException(status_code=409, detail="音频解析需要在服务端配置 DEEPGRAM_API_KEY")
+    provider = "deepgram" if material["material_type"] == "transcript_audio" else "text"
+    run = database.create_parse_run(interview_id, material["id"], provider)
+    _schedule_parse(run["id"])
+    return {
+        "parseRunId": run["id"],
+        "interviewId": interview_id,
+        "status": run["status"],
+        "eventsUrl": f"/api/v1/parse-runs/{run['id']}/events",
+    }
+
+
+@app.get("/api/v1/parse-runs/{run_id}")
+def get_parse_run(run_id: str) -> dict[str, Any]:
+    return get_parse_run_or_404(run_id)
+
+
+@app.get("/api/v1/parse-runs/{run_id}/events")
+async def stream_parse_events(run_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")) -> StreamingResponse:
+    get_parse_run_or_404(run_id)
+    try:
+        cursor = int(last_event_id or 0)
+    except ValueError:
+        cursor = 0
+
+    async def generate():
+        nonlocal cursor
+        idle = 0
+        while True:
+            run = database.get_parse_run(run_id)
+            pending = [event for event in run["events"] if event["id"] > cursor]
+            for event in pending:
+                cursor = event["id"]
+                payload = json.dumps(event["data"], ensure_ascii=False)
+                yield f"id: {event['id']}\nevent: {event['type']}\ndata: {payload}\n\n"
+            if run["status"] in {"COMPLETED", "FAILED", "CANCELLED"} and not pending:
+                break
+            idle += 1
+            if idle % 15 == 0:
+                yield ": heartbeat\n\n"
+            await asyncio.sleep(0.35)
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/v1/interviews/{interview_id}/segments")
+def get_interview_segments(interview_id: str) -> dict[str, Any]:
+    get_interview_or_404(interview_id)
+    audio = database.latest_material(interview_id, ["transcript_audio"])
+    return {
+        "segments": database.get_segments(interview_id),
+        "topics": database.get_question_topics(interview_id),
+        "unresolvedCount": len(database.unresolved_segments(interview_id)),
+        "audio": {
+            "materialId": audio["id"],
+            "filename": audio.get("filename", ""),
+            "durationSeconds": audio.get("duration_seconds"),
+            "url": f"/api/v1/materials/{audio['id']}/content",
+        } if audio else None,
+    }
+
+
+@app.patch("/api/v1/interviews/{interview_id}/segments")
+def patch_interview_segments(interview_id: str, payload: TranscriptSegmentPatch) -> dict[str, Any]:
+    get_interview_or_404(interview_id)
+    segments = database.update_segments(interview_id, [item.model_dump(by_alias=True, exclude_none=True) for item in payload.segments])
+    database.update_interview(interview_id, status="WAITING_CONFIRMATION", latest_run_id=None)
+    return {"segments": segments, "unresolvedCount": len(database.unresolved_segments(interview_id)), "invalidatedPreviousReport": True}
 
 
 @app.patch("/api/v1/interviews/{interview_id}/questions")
@@ -143,12 +304,20 @@ def patch_questions(interview_id: str, payload: QuestionPatch) -> dict[str, Any]
 
 
 @app.post("/api/v1/interviews/{interview_id}/confirm")
-def confirm_questions(interview_id: str) -> dict[str, Any]:
+def confirm_questions(interview_id: str, payload: ConfirmQuestionsRequest | None = Body(default=None)) -> dict[str, Any]:
     get_interview_or_404(interview_id)
     questions = database.get_questions(interview_id)
     if not questions:
         raise HTTPException(status_code=409, detail="没有可确认的问题")
-    database.confirm_questions(interview_id)
+    unresolved_segments = database.unresolved_segments(interview_id)
+    unresolved_questions = [item for item in questions if item.get("needsConfirmation")]
+    acknowledge = bool(payload and payload.acknowledge_unresolved)
+    if (unresolved_segments or unresolved_questions) and not acknowledge:
+        raise HTTPException(status_code=409, detail="仍有低置信度或未归类片段，请处理或显式确认忽略")
+    ignored_ids = list(payload.ignored_segment_ids) if payload else []
+    if acknowledge:
+        ignored_ids.extend(item["id"] for item in unresolved_segments)
+    database.confirm_questions(interview_id, dict.fromkeys(ignored_ids))
     return {"status": "WAITING_CONFIRMATION", "confirmedCount": len(questions)}
 
 
@@ -158,22 +327,53 @@ def _schedule_run(run_id: str) -> None:
     task.add_done_callback(background_tasks.discard)
 
 
+def _schedule_fallback(run_id: str) -> None:
+    task = asyncio.create_task(asyncio.to_thread(workflow.execute_fallback, run_id))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 @app.post("/api/v1/interviews/{interview_id}/review-runs", status_code=202)
 async def create_review_run(interview_id: str, payload: ReviewRunCreate | None = Body(default=None)) -> dict[str, Any]:
     get_interview_or_404(interview_id)
     questions = database.get_questions(interview_id)
-    if not questions or not all(item["confirmed"] for item in questions):
-        raise HTTPException(status_code=409, detail="必须先人工确认全部问题")
+    if not questions:
+        raise HTTPException(status_code=409, detail="没有可复盘的问题")
+    review_mode = payload.review_mode if payload else "full"
+    unconfirmed = [item for item in questions if not item["confirmed"]]
+    unresolved = database.unresolved_segments(interview_id) or [item for item in questions if item.get("needsConfirmation")]
+    if review_mode == "full" and unconfirmed:
+        raise HTTPException(status_code=409, detail="完整复盘必须先人工确认全部问题")
+    if review_mode == "quick" and unconfirmed and not (payload and payload.acknowledge_unreviewed):
+        raise HTTPException(status_code=409, detail="快速复盘需要确认使用未经人工校对的题卡")
+    if unresolved and not (payload and payload.acknowledge_unresolved):
+        raise HTTPException(status_code=409, detail="仍有低置信度或未归类片段，请显式确认后再复盘")
     enable_web = bool(payload.enable_web_verify) if payload else False
     enable_web = enable_web and settings.web_verify_enabled and bool(settings.tavily_api_key)
-    run = database.create_run(interview_id, enable_web)
+    if settings.agent_runtime == "helloagents" and not settings.real_agent_enabled:
+        raise HTTPException(status_code=503, detail="真实 Agent 模式缺少可用模型配置；系统不会自动切换为 Fixture")
+    agent_mode = "fixture" if settings.agent_runtime == "fixture" else "helloagents"
+    run = database.create_run(interview_id, enable_web, review_mode, agent_mode=agent_mode, input_digest=workflow.input_digest(interview_id))
     _schedule_run(run["id"])
-    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
+    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "reviewMode": review_mode, "agentMode": agent_mode, "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
 
 
 @app.get("/api/v1/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
-    return get_run_or_404(run_id)
+    run = get_run_or_404(run_id)
+    artifacts = database.get_stage_artifacts(run_id)
+    run["artifacts"] = [
+        {key: item[key] for key in ("id", "phase", "topic_id", "version", "status", "agent_type", "model", "session_id", "duration_seconds", "token_count", "created_at")}
+        for item in artifacts
+    ]
+    accepted_topics = {item["topic_id"] for item in artifacts if item["phase"] == "evidence_review" and item["status"] == "ACCEPTED"}
+    run["progress"] = {
+        "completedTopics": len(accepted_topics),
+        "auditRound": run.get("audit_round", 0),
+        "revisionCount": run.get("revision_count", 0),
+        "checkpoint": run.get("checkpoint", {}),
+    }
+    return run
 
 
 @app.get("/api/v1/runs/{run_id}/events")
@@ -209,10 +409,36 @@ async def resume_run(run_id: str) -> dict[str, Any]:
     run = get_run_or_404(run_id)
     if run["status"] not in {"FAILED", "CANCELLED"}:
         raise HTTPException(status_code=409, detail="只有失败或取消的任务可以恢复")
-    database.update_run(run_id, status="REVIEWING", phase="resuming", error="")
-    database.append_event(run_id, "RUN_RESUMED", {"message": "从已确认题卡重新执行最近阶段"})
+    if run.get("input_digest") and run["input_digest"] != workflow.input_digest(run["interview_id"]):
+        raise HTTPException(status_code=409, detail="题卡或材料已经修改，请创建新的复盘任务")
+    if run.get("agent_mode") == "deterministic_fallback":
+        raise HTTPException(status_code=409, detail="降级任务不能恢复为真实 Agent，请创建新的复盘任务")
+    database.update_run(run_id, status="REVIEWING", phase="resuming", error="", failure_code="")
+    database.append_event(run_id, "RUN_RESUMED", {"message": "从最近已接受的 Agent artifact 恢复"})
     _schedule_run(run_id)
     return {"id": run_id, "status": "REVIEWING"}
+
+
+@app.post("/api/v1/runs/{run_id}/fallback", status_code=202)
+async def fallback_run(run_id: str) -> dict[str, Any]:
+    run = get_run_or_404(run_id)
+    if run["status"] != "FAILED":
+        raise HTTPException(status_code=409, detail="只有失败任务可以由用户主动生成降级报告")
+    if run.get("input_digest") and run["input_digest"] != workflow.input_digest(run["interview_id"]):
+        raise HTTPException(status_code=409, detail="题卡或材料已经修改，不能生成旧任务的降级报告")
+    database.update_run(
+        run_id,
+        status="REVIEWING",
+        phase="fallback_pending",
+        agent_mode="deterministic_fallback",
+        degraded=True,
+        error="",
+        failure_code="",
+    )
+    database.update_interview(run["interview_id"], status="REVIEWING")
+    database.append_event(run_id, "FALLBACK_REQUESTED", {"message": "用户主动选择确定性降级报告"})
+    _schedule_fallback(run_id)
+    return {"id": run_id, "status": "REVIEWING", "agentMode": "deterministic_fallback", "degraded": True}
 
 
 @app.get("/api/v1/interviews/{interview_id}/report")

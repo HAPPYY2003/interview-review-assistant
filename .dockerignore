@@ -11,6 +11,10 @@ data/offer_radar.db-*
 data/uploads
 data/sessions
 data/traces
+data/parse-runs
 data/*.log
+data/ui-*.png
 test-results
 playwright-report
+memory
+tool-output

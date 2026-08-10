@@ -1,0 +1,21 @@
+{
+  "company": "澄海零售",
+  "position": "数据分析师",
+  "round": "专业一面",
+  "interviewDate": "2026-07-22",
+  "reviewGoal": "检查语音转写稿的说话人识别、SQL 分析思路、指标口径和证据完整性",
+  "analysisMode": "full_context",
+  "inputMode": "text_asr",
+  "expectedParse": {
+    "segments": 14,
+    "questions": 7,
+    "topics": 7,
+    "followUps": 0,
+    "needsConfirmation": 7
+  },
+  "expectedFocus": [
+    "speaker_0 与 speaker_1 需要人工确认角色",
+    "回答缺少部分指标口径和个人贡献证据",
+    "确认前不应直接启动正式复盘"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "company": "北辰云服",
+  "position": "Java 后端工程师",
+  "round": "技术二面",
+  "interviewDate": "2026-07-25",
+  "reviewGoal": "检查系统设计、故障处理、量化证据以及回答前后矛盾",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "expectedParse": {
+    "segments": 15,
+    "questions": 7,
+    "topics": 3,
+    "followUps": 4,
+    "needsConfirmation": 0
+  },
+  "expectedFocus": [
+    "设备调试片段应被识别为噪声",
+    "数据库迁移回答存在停机时间矛盾",
+    "追问应标记为暴露不足或存在前后矛盾"
+  ]
+}

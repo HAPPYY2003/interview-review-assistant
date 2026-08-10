@@ -10,4 +10,5 @@ jieba==0.42.1
 rank-bm25==0.2.2
 tavily-python==0.7.12
 httpx==0.28.1
-
+filetype==1.2.0
+mutagen==1.47.0

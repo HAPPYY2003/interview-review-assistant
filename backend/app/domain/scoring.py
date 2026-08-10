@@ -5,6 +5,13 @@ from typing import Mapping, Sequence
 
 
 DIMENSIONS = ("relevance", "structure", "evidence", "depth", "roleFit")
+LEVEL_SCORES = {
+    "优秀": 9.0,
+    "良好": 7.5,
+    "合格": 6.0,
+    "较弱": 4.0,
+    "缺失": 2.0,
+}
 WEIGHTS = {
     "relevance": 0.20,
     "structure": 0.15,
@@ -35,3 +42,9 @@ def aggregate_scores(items: Sequence[Mapping[str, object]]) -> dict[str, float]:
         return {name: 0.0 for name in (*DIMENSIONS, "overall")}
     return {name: round(mean(item[name] for item in valid), 1) for name in (*DIMENSIONS, "overall")}
 
+
+def scores_from_levels(levels: Mapping[str, object]) -> dict[str, float]:
+    missing = [name for name in DIMENSIONS if str(levels.get(name, "")) not in LEVEL_SCORES]
+    if missing:
+        raise ValueError(f"缺少合法评分等级：{', '.join(missing)}")
+    return normalize_scores({name: LEVEL_SCORES[str(levels[name])] for name in DIMENSIONS})

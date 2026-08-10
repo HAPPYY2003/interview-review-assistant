@@ -1,6 +1,11 @@
+import os
 from pathlib import Path
 
 import pytest
+
+os.environ["AGENT_RUNTIME"] = "fixture"
+os.environ["LLM_API_KEY"] = ""
+os.environ["DEEPGRAM_API_KEY"] = ""
 
 from backend.app.config import ROOT_DIR, Settings
 
@@ -24,4 +29,3 @@ def settings_factory(tmp_path):
         settings.ensure_directories()
         return settings
     return factory
-
