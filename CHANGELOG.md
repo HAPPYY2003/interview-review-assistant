@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-14
+
 ### Added
 
 - Deepgram `nova-3` 音频转写，支持 MP3、M4A、WAV、FLAC 和 OGG。

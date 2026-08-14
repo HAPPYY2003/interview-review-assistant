@@ -58,7 +58,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="Offer Radar Agent", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Offer Radar Agent", version="0.2.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
