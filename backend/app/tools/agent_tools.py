@@ -142,7 +142,24 @@ class EvidenceLookupTool(Tool):
         for item in matches:
             self.registry[item["id"]] = item
         status = ToolResponse.success if matches else ToolResponse.partial
-        return status(text=f"找到 {len(matches)} 条可回查证据", data={"matches": matches})
+        if not matches:
+            return status(text="没有找到可回查证据", data={"matches": []})
+        visible_matches = [
+            {
+                "evidenceId": item["id"],
+                "sourceType": item["sourceType"],
+                "locator": item["locator"],
+                "quote": item["quote"],
+            }
+            for item in matches
+        ]
+        return status(
+            text=(
+                f"找到 {len(matches)} 条可回查证据。提交复盘时 evidenceIds 只能使用下列 evidenceId：\n"
+                f"{json.dumps(visible_matches, ensure_ascii=False)}"
+            ),
+            data={"matches": matches},
+        )
 
 
 class ScoreTool(Tool):
@@ -358,12 +375,24 @@ class SubmitPlanTool(Tool):
         self.last_error = ""
 
     def get_parameters(self) -> list[ToolParameter]:
-        return [ToolParameter(name="plan_json", type="string", description="符合 GrowthPlanSubmission Schema 的 JSON 字符串", required=True)]
+        day_format = "格式：标题|||训练内容|||维度|||优先级|||完成标准；维度使用 relevance/structure/evidence/depth/roleFit，优先级使用 high/medium"
+        return [
+            ToolParameter(name="summary", type="string", description="整场复盘总结", required=True),
+            ToolParameter(name="next_focus", type="string", description="下一场面试重点", required=True),
+            ToolParameter(name="risks_text", type="string", description="可选。每行格式：标题|||原因|||high或medium|||topicId1,topicId2；没有可靠 topicId 时留空", required=False, default=""),
+            *[
+                ToolParameter(name=f"day_{day}", type="string", description=f"第 {day} 天训练。{day_format}", required=True)
+                for day in range(1, 8)
+            ],
+        ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
         try:
-            payload = GrowthPlanSubmission.model_validate_json(str(parameters.get("plan_json", "{}")))
-        except ValidationError as exc:
+            if "plan_json" in parameters:
+                payload = GrowthPlanSubmission.model_validate_json(str(parameters.get("plan_json", "{}")))
+            else:
+                payload = GrowthPlanSubmission.model_validate(self._flat_payload(parameters))
+        except (ValidationError, ValueError) as exc:
             return self._reject(f"成长计划未通过 Schema：{exc}")
         invalid_topics = sorted({topic_id for risk in payload.top_risks for topic_id in risk.topic_ids} - self.topic_ids)
         if invalid_topics:
@@ -374,7 +403,49 @@ class SubmitPlanTool(Tool):
             for item in result["actionItems"]
         ]
         self.last_submission = result
+        self.last_error = ""
         return ToolResponse.success(text="七天成长计划已通过结构校验", data={"accepted": True, "actionCount": 7})
+
+    @staticmethod
+    def _flat_payload(parameters: dict[str, Any]) -> dict[str, Any]:
+        actions = []
+        for day in range(1, 8):
+            raw = str(parameters.get(f"day_{day}", "")).strip()
+            parts = [part.strip() for part in raw.split("|||", 4)]
+            if len(parts) != 5 or not all(parts):
+                raise ValueError(f"day_{day} 必须包含标题、训练内容、维度、优先级和完成标准")
+            title, description, dimension, priority, criterion = parts
+            actions.append({
+                "day": day,
+                "title": title,
+                "description": description,
+                "dimension": dimension,
+                "priority": priority,
+                "successCriterion": criterion,
+            })
+
+        risks = []
+        for line in str(parameters.get("risks_text", "")).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split("|||", 3)]
+            if len(parts) != 4 or not all(parts):
+                raise ValueError("risks_text 每行必须包含标题、原因、严重度和 topicId")
+            title, reason, severity, topic_ids = parts
+            risks.append({
+                "title": title,
+                "reason": reason,
+                "severity": severity,
+                "topicIds": [item.strip() for item in topic_ids.split(",") if item.strip()],
+            })
+
+        return {
+            "summary": str(parameters.get("summary", "")).strip(),
+            "topRisks": risks,
+            "nextFocus": str(parameters.get("next_focus", "")).strip(),
+            "actionItems": actions,
+        }
 
     def _reject(self, message: str) -> ToolResponse:
         self.last_error = message

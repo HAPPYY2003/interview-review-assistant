@@ -171,6 +171,14 @@ def run() -> None:
             source_turns = page.locator(".topic-source-turn")
             assert source_turns.count() >= 1, "current topic sources should be visible below the review"
             assert page.locator(".source-drawer").count() == 0, "topic sources should not open in a drawer"
+            assert page.locator("[data-segment-role]").count() >= 1, "source structure should allow speaker correction"
+            assert page.locator("[data-source-assignment]").count() >= 1, "source structure should allow question/answer reassignment"
+            boundary_toggles = page.locator("[data-toggle-boundary]")
+            if boundary_toggles.count():
+                boundary_toggles.first.click()
+                assert page.locator("[data-split-mode]").count() == 1, "boundary editor should explain how split parts are assigned"
+                assert page.locator("[data-split-boundary]").count() >= 1, "boundary editor should expose clickable atom boundaries"
+                boundary_toggles.first.click()
             assert page.locator(".topic-review-footer").count() == 1, "pending review should end with topic actions"
             assert page.locator("#openReviewDialog").count() == 1, "review header should expose one Agent entry point"
             assert not page.locator("#reviewDialog").is_visible(), "Agent settings should stay closed until requested"
@@ -303,6 +311,57 @@ def run() -> None:
             page.locator(".accordion-panel").wait_for()
             assert_no_overflow(page, "desktop report page")
             page.screenshot(path=OUTPUT_DIR / "ui-report-desktop.png", full_page=True)
+
+            report_url = page.url
+            page.goto(f"{BASE_URL}/#/trends", wait_until="networkidle")
+            add_trend = page.locator("#openTrendImport")
+            assert add_trend.is_visible(), "growth trends should expose a manual import entry point"
+            add_trend.click()
+            trend_dialog = page.locator("#trendImportDialog")
+            assert trend_dialog.is_visible()
+            available_candidate = trend_dialog.locator(
+                "input[data-select-trend-candidate]:not([disabled])"
+            ).first
+            assert available_candidate.count() == 1, "completed review should be available for import"
+            candidate_id = available_candidate.get_attribute("data-select-trend-candidate")
+            available_candidate.check()
+            assert page.locator("#importSelectedTrends").is_enabled()
+            page.locator("#importSelectedTrends").click()
+            trend_dialog.wait_for(state="hidden")
+            assert page.locator(".trend-item").count() >= 1
+            assert "已添加" in page.locator(".toast").inner_text()
+
+            add_trend.click()
+            trend_dialog.wait_for(state="visible")
+            imported_candidate = trend_dialog.locator(
+                f'input[data-select-trend-candidate="{candidate_id}"]'
+            )
+            assert imported_candidate.is_disabled()
+            assert "已添加" in imported_candidate.locator("xpath=ancestor::label").inner_text()
+            assert_no_overflow(page, "desktop growth import dialog")
+            page.screenshot(path=OUTPUT_DIR / "ui-trends-import-desktop.png", full_page=True)
+            page.locator("[data-close-trend-import]").first.click()
+            page.goto(report_url, wait_until="networkidle")
+            assert page.locator("#editReportCards").is_visible()
+
+            page.locator("#editReportCards").click()
+            page.wait_for_url(re.compile(r"#/parse/.+\?from=report"), timeout=10_000)
+            page.locator(".topic-editor").wait_for(timeout=10_000)
+            assert page.locator("#returnToReport").is_visible()
+            regenerate = page.locator("#openReviewDialog")
+            assert regenerate.inner_text() == "重新生成复盘报告"
+            assert regenerate.is_disabled(), "report regeneration should stay disabled before a real edit"
+            page.locator(".main-turn-edit").click()
+            page.get_by_role("button", name="保存修改").click()
+            assert regenerate.is_disabled(), "saving unchanged text must not invalidate the report"
+            page.locator(".main-turn-edit").click()
+            editor = page.locator('.turn-edit-form [data-edit-field="question"]')
+            editor.fill(f"{editor.input_value()}（补充）")
+            page.get_by_role("button", name="保存修改").click()
+            assert regenerate.is_enabled(), "a real card edit should enable report regeneration"
+            page.locator("#returnToReport").click()
+            page.wait_for_url(re.compile(r"#/review/"), timeout=10_000)
+            assert page.locator("#editReportCards").is_visible()
 
             run_page = desktop.new_page()
             run_page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)

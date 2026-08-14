@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -13,6 +14,13 @@ from backend.app.services.evidence import QUESTION_TYPES, infer_topic_title, nor
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class ActiveAgentRunError(RuntimeError):
+    def __init__(self, run_id: str, interview_id: str):
+        super().__init__("another real Agent review is already running")
+        self.run_id = run_id
+        self.interview_id = interview_id
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -62,7 +70,10 @@ class Database:
             extracted_answer TEXT NOT NULL DEFAULT '', edited_question TEXT NOT NULL DEFAULT '',
             edited_answer TEXT NOT NULL DEFAULT '', topic_title TEXT NOT NULL DEFAULT '',
             needs_confirmation INTEGER NOT NULL DEFAULT 0, provenance_status TEXT NOT NULL DEFAULT 'source',
-            follow_up_impact TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            follow_up_impact TEXT NOT NULL DEFAULT '', confidence_score REAL NOT NULL DEFAULT 75,
+            raw_confidence_score REAL NOT NULL DEFAULT 75, confidence_details_json TEXT NOT NULL DEFAULT '{}',
+            confirmation_reasons_json TEXT NOT NULL DEFAULT '[]', parse_method TEXT NOT NULL DEFAULT 'legacy',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS parse_runs (
@@ -80,8 +91,24 @@ class Database:
             start_char INTEGER, end_char INTEGER, confidence REAL NOT NULL DEFAULT 0,
             speaker_confidence REAL,
             needs_confirmation INTEGER NOT NULL DEFAULT 0, excluded INTEGER NOT NULL DEFAULT 0,
+            confidence_details_json TEXT NOT NULL DEFAULT '{}', confirmation_reasons_json TEXT NOT NULL DEFAULT '[]',
+            parse_method TEXT NOT NULL DEFAULT 'legacy',
             FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE,
             FOREIGN KEY(material_id) REFERENCES materials(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS transcript_atoms (
+            id TEXT PRIMARY KEY, interview_id TEXT NOT NULL, material_id TEXT, order_index INTEGER NOT NULL,
+            raw_text TEXT NOT NULL, start_char INTEGER, end_char INTEGER, start_time REAL, end_time REAL,
+            speaker_label TEXT NOT NULL DEFAULT '', speaker_role TEXT NOT NULL DEFAULT 'unknown',
+            confidence REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE,
+            FOREIGN KEY(material_id) REFERENCES materials(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS segment_atom_links (
+            segment_id TEXT NOT NULL, atom_id TEXT NOT NULL, order_index INTEGER NOT NULL,
+            PRIMARY KEY(segment_id, atom_id),
+            FOREIGN KEY(segment_id) REFERENCES transcript_segments(id) ON DELETE CASCADE,
+            FOREIGN KEY(atom_id) REFERENCES transcript_atoms(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS question_segment_links (
             question_id TEXT NOT NULL, segment_id TEXT NOT NULL, link_role TEXT NOT NULL,
@@ -155,9 +182,17 @@ class Database:
                 "needs_confirmation": "INTEGER NOT NULL DEFAULT 0",
                 "provenance_status": "TEXT NOT NULL DEFAULT 'legacy'",
                 "follow_up_impact": "TEXT NOT NULL DEFAULT ''",
+                "confidence_score": "REAL NOT NULL DEFAULT 75",
+                "raw_confidence_score": "REAL NOT NULL DEFAULT 75",
+                "confidence_details_json": "TEXT NOT NULL DEFAULT '{}'",
+                "confirmation_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+                "parse_method": "TEXT NOT NULL DEFAULT 'legacy'",
             },
             "transcript_segments": {
                 "speaker_confidence": "REAL",
+                "confidence_details_json": "TEXT NOT NULL DEFAULT '{}'",
+                "confirmation_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+                "parse_method": "TEXT NOT NULL DEFAULT 'legacy'",
             },
             "review_runs": {
                 "review_mode": "TEXT NOT NULL DEFAULT 'full'",
@@ -253,6 +288,7 @@ class Database:
     def delete_interview(self, interview_id: str) -> list[str]:
         with self._lock, self.connect() as connection:
             rows = connection.execute("SELECT storage_path FROM materials WHERE interview_id=?", (interview_id,)).fetchall()
+            connection.execute("DELETE FROM growth_snapshots WHERE interview_id=?", (interview_id,))
             connection.execute("DELETE FROM interviews WHERE id=?", (interview_id,))
         return [row[0] for row in rows if row[0]]
 
@@ -388,38 +424,324 @@ class Database:
             connection.execute(
                 """INSERT INTO transcript_segments(id, interview_id, material_id, order_index, raw_text,
                 normalized_text, speaker_label, speaker_role, start_time, end_time, start_char, end_char,
-                confidence, speaker_confidence, needs_confirmation, excluded) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                confidence, speaker_confidence, needs_confirmation, excluded, confidence_details_json,
+                confirmation_reasons_json, parse_method) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     item["id"], interview_id, material_id, item.get("ordinal", index), item.get("rawText", ""),
                     item.get("normalizedText", item.get("rawText", "")), item.get("speakerLabel", ""),
                     item.get("speakerRole", "unknown"), item.get("startTime"), item.get("endTime"),
                     item.get("startChar"), item.get("endChar"), float(item.get("confidence", 0)), item.get("speakerConfidence"),
                     int(item.get("needsConfirmation", False)), int(item.get("excluded", False)),
+                    json.dumps(item.get("confidenceDetails", {}), ensure_ascii=False),
+                    json.dumps(item.get("confirmationReasons", []), ensure_ascii=False), item.get("parseMethod", "legacy"),
                 ),
             )
+            for atom_order, atom_id in enumerate(item.get("atomIds", []), 1):
+                connection.execute(
+                    "INSERT OR IGNORE INTO segment_atom_links(segment_id,atom_id,order_index) VALUES(?,?,?)",
+                    (item["id"], atom_id, atom_order),
+                )
+
+    @staticmethod
+    def _replace_atoms(
+        connection: sqlite3.Connection,
+        interview_id: str,
+        material_id: str | None,
+        atoms: Iterable[dict[str, Any]],
+    ) -> None:
+        connection.execute("DELETE FROM transcript_atoms WHERE interview_id=?", (interview_id,))
+        for index, item in enumerate(atoms, 1):
+            connection.execute(
+                """INSERT INTO transcript_atoms(id,interview_id,material_id,order_index,raw_text,start_char,end_char,
+                start_time,end_time,speaker_label,speaker_role,confidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    item["id"], interview_id, material_id, item.get("ordinal", index), item.get("rawText", ""),
+                    item.get("startChar"), item.get("endChar"), item.get("startTime"), item.get("endTime"),
+                    item.get("speakerLabel", ""), item.get("speakerRole", "unknown"), float(item.get("confidence", 0)),
+                ),
+            )
+
+    def get_atoms(self, interview_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM transcript_atoms WHERE interview_id=? ORDER BY order_index", (interview_id,)
+            ).fetchall()
+        return [self._atom_dict(row) for row in rows]
 
     def get_segments(self, interview_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id=? ORDER BY order_index", (interview_id,)
             ).fetchall()
-        return [self._segment_dict(row) for row in rows]
+            links = connection.execute(
+                """SELECT l.* FROM segment_atom_links l JOIN transcript_segments s ON s.id=l.segment_id
+                WHERE s.interview_id=? ORDER BY l.order_index""", (interview_id,),
+            ).fetchall()
+        by_segment: dict[str, list[str]] = {}
+        for link in links:
+            by_segment.setdefault(link["segment_id"], []).append(link["atom_id"])
+        return [self._segment_dict(row, by_segment.get(row["id"], [])) for row in rows]
 
     def update_segments(self, interview_id: str, updates: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         with self._lock, self.connect() as connection:
             for item in updates:
+                current = connection.execute(
+                    "SELECT * FROM transcript_segments WHERE id=? AND interview_id=?", (item["id"], interview_id)
+                ).fetchone()
+                if not current:
+                    continue
+                reasons = json.loads(current["confirmation_reasons_json"] or "[]")
+                role = item.get("speakerRole", current["speaker_role"])
+                reasons = [reason for reason in reasons if reason.get("code") != "SPEAKER_ROLE_UNCERTAIN"]
+                if role == "unknown":
+                    reasons.append({"code": "SPEAKER_ROLE_UNCERTAIN", "label": "说话人身份不明确", "dimension": "speaker", "score": 55, "evidenceAtomIds": [], "impact": 45, "summary": ""})
+                needs_confirmation = int(bool(reasons))
                 connection.execute(
                     """UPDATE transcript_segments SET speaker_role=COALESCE(?,speaker_role),
-                    needs_confirmation=COALESCE(?,needs_confirmation), excluded=COALESCE(?,excluded)
+                    needs_confirmation=?, excluded=COALESCE(?,excluded), confirmation_reasons_json=?,
+                    parse_method=CASE WHEN ? IS NULL THEN parse_method ELSE 'edited' END
                     WHERE id=? AND interview_id=?""",
                     (
                         item.get("speakerRole"),
-                        int(item["needsConfirmation"]) if "needsConfirmation" in item else None,
+                        needs_confirmation,
                         int(item["excluded"]) if "excluded" in item else None,
+                        json.dumps(reasons, ensure_ascii=False), item.get("speakerRole"),
                         item["id"], interview_id,
                     ),
                 )
         return self.get_segments(interview_id)
+
+    def split_segment(
+        self,
+        interview_id: str,
+        segment_id: str,
+        after_atom_id: str,
+        *,
+        question_id: str | None = None,
+        left_assignment: str | None = None,
+        right_assignment: str | None = None,
+    ) -> list[dict[str, Any]]:
+        assignments = (left_assignment, right_assignment)
+        if any(value is not None for value in assignments) and (not question_id or any(value not in {"question", "answer", "none"} for value in assignments)):
+            raise ValueError("指定拆分归属时必须同时提供题卡、左侧归属和右侧归属")
+        with self._lock, self.connect() as connection:
+            segment = connection.execute(
+                "SELECT * FROM transcript_segments WHERE id=? AND interview_id=?", (segment_id, interview_id)
+            ).fetchone()
+            if not segment:
+                raise KeyError(segment_id)
+            atom_rows = connection.execute(
+                """SELECT a.* FROM segment_atom_links l JOIN transcript_atoms a ON a.id=l.atom_id
+                WHERE l.segment_id=? ORDER BY l.order_index""", (segment_id,),
+            ).fetchall()
+            atom_ids = [row["id"] for row in atom_rows]
+            if after_atom_id not in atom_ids or atom_ids.index(after_atom_id) >= len(atom_ids) - 1:
+                raise ValueError("拆分位置必须位于当前话轮的两个原子之间")
+            split_index = atom_ids.index(after_atom_id) + 1
+            left, right = atom_rows[:split_index], atom_rows[split_index:]
+            new_id = str(uuid.uuid4())
+            reasons = self._manual_segment_reasons(segment)
+            needs_confirmation = int(bool(reasons))
+            left_text = self._text_from_atom_rows(connection, segment["material_id"], left)
+            right_text = self._text_from_atom_rows(connection, segment["material_id"], right)
+            connection.execute(
+                """UPDATE transcript_segments SET raw_text=?,normalized_text=?,end_time=?,end_char=?,
+                needs_confirmation=?,confidence_details_json=?,confirmation_reasons_json=?,parse_method='edited'
+                WHERE id=?""",
+                (left_text, " ".join(left_text.split()), left[-1]["end_time"], left[-1]["end_char"], needs_confirmation,
+                 json.dumps({"manualBoundaryEdit": True}, ensure_ascii=False), json.dumps(reasons, ensure_ascii=False), segment_id),
+            )
+            connection.execute(
+                """INSERT INTO transcript_segments(id,interview_id,material_id,order_index,raw_text,normalized_text,
+                speaker_label,speaker_role,start_time,end_time,start_char,end_char,confidence,speaker_confidence,
+                needs_confirmation,excluded,confidence_details_json,confirmation_reasons_json,parse_method)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (new_id, interview_id, segment["material_id"], segment["order_index"] + 1, right_text, " ".join(right_text.split()),
+                 segment["speaker_label"], segment["speaker_role"], right[0]["start_time"], right[-1]["end_time"],
+                 right[0]["start_char"], right[-1]["end_char"], segment["confidence"], segment["speaker_confidence"],
+                 needs_confirmation, segment["excluded"], json.dumps({"manualBoundaryEdit": True}, ensure_ascii=False),
+                 json.dumps(reasons, ensure_ascii=False), "edited"),
+            )
+            connection.execute("DELETE FROM segment_atom_links WHERE segment_id=?", (segment_id,))
+            for order, row in enumerate(left, 1):
+                connection.execute("INSERT INTO segment_atom_links VALUES(?,?,?)", (segment_id, row["id"], order))
+            for order, row in enumerate(right, 1):
+                connection.execute("INSERT INTO segment_atom_links VALUES(?,?,?)", (new_id, row["id"], order))
+            links = connection.execute(
+                "SELECT * FROM question_segment_links WHERE segment_id=?", (segment_id,)
+            ).fetchall()
+            if question_id and not any(link["question_id"] == question_id for link in links):
+                raise ValueError("当前话轮不属于指定题卡")
+            for link in links:
+                connection.execute(
+                    """UPDATE question_segment_links SET order_index=order_index+1
+                    WHERE question_id=? AND link_role=? AND order_index>?""",
+                    (link["question_id"], link["link_role"], link["order_index"]),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO question_segment_links VALUES(?,?,?,?)",
+                    (link["question_id"], new_id, link["link_role"], link["order_index"] + 1),
+                )
+            connection.execute(
+                "UPDATE transcript_segments SET order_index=order_index+1 WHERE interview_id=? AND id<>? AND order_index>?",
+                (interview_id, new_id, segment["order_index"]),
+            )
+            self._renumber_segments(connection, interview_id)
+            if question_id:
+                connection.execute(
+                    "DELETE FROM question_segment_links WHERE question_id=? AND segment_id IN (?,?)",
+                    (question_id, segment_id, new_id),
+                )
+                for target_id, assignment in ((segment_id, left_assignment), (new_id, right_assignment)):
+                    if assignment != "none":
+                        connection.execute(
+                            "INSERT INTO question_segment_links(question_id,segment_id,link_role,order_index) VALUES(?,?,?,?)",
+                            (question_id, target_id, assignment, 0),
+                        )
+                self._renumber_question_segment_links(connection, question_id)
+            self._refresh_question_texts(connection, interview_id)
+        return self.get_segments(interview_id)
+
+    def merge_segments(self, interview_id: str, segment_ids: Iterable[str]) -> list[dict[str, Any]]:
+        requested = list(dict.fromkeys(segment_ids))
+        if len(requested) < 2:
+            raise ValueError("至少选择两个相邻话轮")
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM transcript_segments WHERE interview_id=? AND id IN ({','.join('?' for _ in requested)}) ORDER BY order_index",
+                (interview_id, *requested),
+            ).fetchall()
+            if len(rows) != len(requested):
+                raise KeyError("话轮不存在")
+            ordinals = [row["order_index"] for row in rows]
+            if ordinals != list(range(min(ordinals), max(ordinals) + 1)):
+                raise ValueError("只能合并相邻话轮")
+            keep_id = rows[0]["id"]
+            selected = {row["id"] for row in rows}
+            question_links = connection.execute(
+                """SELECT l.* FROM question_segment_links l JOIN question_cards q ON q.id=l.question_id
+                WHERE q.interview_id=? ORDER BY l.question_id,l.link_role,l.order_index""", (interview_id,),
+            ).fetchall()
+            link_signatures: dict[str, set[tuple[str, str]]] = {segment_id: set() for segment_id in selected}
+            for link in question_links:
+                if link["segment_id"] in selected:
+                    link_signatures[link["segment_id"]].add((link["question_id"], link["link_role"]))
+            signatures = [link_signatures[row["id"]] for row in rows]
+            if any(signature != signatures[0] for signature in signatures[1:]):
+                raise ValueError("只能合并同一题卡中同属问题或同属回答的相邻话轮")
+            if len({row["speaker_role"] for row in rows}) > 1:
+                raise ValueError("不同说话人的话轮不能合并")
+            rebuilt: dict[tuple[str, str], list[str]] = {}
+            for link in question_links:
+                key = (link["question_id"], link["link_role"])
+                target = rebuilt.setdefault(key, [])
+                value = keep_id if link["segment_id"] in selected else link["segment_id"]
+                if value not in target:
+                    target.append(value)
+            for question_id in {key[0] for key in rebuilt}:
+                question_ids = set(rebuilt.get((question_id, "question"), []))
+                answer_ids = set(rebuilt.get((question_id, "answer"), []))
+                if question_ids & answer_ids:
+                    raise ValueError("同一原文片段不能同时归属问题和回答")
+            atom_rows = connection.execute(
+                f"""SELECT a.* FROM segment_atom_links l JOIN transcript_atoms a ON a.id=l.atom_id
+                WHERE l.segment_id IN ({','.join('?' for _ in requested)}) ORDER BY a.order_index""", tuple(requested),
+            ).fetchall()
+            text = self._text_from_atom_rows(connection, rows[0]["material_id"], atom_rows)
+            roles = {row["speaker_role"] for row in rows}
+            role = roles.pop() if len(roles) == 1 else "unknown"
+            reasons = [] if role != "unknown" else [{
+                "code": "SPEAKER_ROLE_UNCERTAIN", "label": "说话人身份不明确", "dimension": "speaker",
+                "score": 55, "evidenceAtomIds": [row["id"] for row in atom_rows], "impact": 45, "summary": "合并的话轮原说话人不一致",
+            }]
+            connection.execute(
+                """UPDATE transcript_segments SET raw_text=?,normalized_text=?,speaker_role=?,start_time=?,end_time=?,
+                start_char=?,end_char=?,needs_confirmation=?,confidence_details_json=?,confirmation_reasons_json=?,parse_method='edited'
+                WHERE id=?""",
+                (text, " ".join(text.split()), role, atom_rows[0]["start_time"], atom_rows[-1]["end_time"],
+                 atom_rows[0]["start_char"], atom_rows[-1]["end_char"], int(bool(reasons)),
+                 json.dumps({"manualBoundaryEdit": True}, ensure_ascii=False), json.dumps(reasons, ensure_ascii=False), keep_id),
+            )
+            connection.execute("DELETE FROM segment_atom_links WHERE segment_id=?", (keep_id,))
+            for order, atom in enumerate(atom_rows, 1):
+                connection.execute("INSERT INTO segment_atom_links VALUES(?,?,?)", (keep_id, atom["id"], order))
+            for row in rows[1:]:
+                connection.execute("DELETE FROM transcript_segments WHERE id=?", (row["id"],))
+            question_ids = [row[0] for row in connection.execute("SELECT id FROM question_cards WHERE interview_id=?", (interview_id,)).fetchall()]
+            if question_ids:
+                connection.execute(
+                    f"DELETE FROM question_segment_links WHERE question_id IN ({','.join('?' for _ in question_ids)})", tuple(question_ids)
+                )
+            for (question_id, role_name), ids in rebuilt.items():
+                for order, segment_id in enumerate(ids, 1):
+                    connection.execute("INSERT INTO question_segment_links VALUES(?,?,?,?)", (question_id, segment_id, role_name, order))
+            self._renumber_segments(connection, interview_id)
+            self._refresh_question_texts(connection, interview_id)
+        return self.get_segments(interview_id)
+
+    @staticmethod
+    def _text_from_atom_rows(connection: sqlite3.Connection, material_id: str | None, rows: list[sqlite3.Row]) -> str:
+        if not rows:
+            return ""
+        start, end = rows[0]["start_char"], rows[-1]["end_char"]
+        if material_id and start is not None and end is not None:
+            material = connection.execute("SELECT text FROM materials WHERE id=?", (material_id,)).fetchone()
+            if material and material["text"]:
+                return str(material["text"])[int(start):int(end)].strip()
+        parts = [str(row["raw_text"]).strip() for row in rows if str(row["raw_text"]).strip()]
+        if parts and all(re.search(r"[\u3400-\u9fff]", part) for part in parts):
+            return "".join(parts)
+        return " ".join(parts)
+
+    @staticmethod
+    def _manual_segment_reasons(segment: sqlite3.Row) -> list[dict[str, Any]]:
+        reasons = [
+            item for item in json.loads(segment["confirmation_reasons_json"] or "[]")
+            if item.get("code") not in {"QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "CHUNK_OVERLAP_CONFLICT"}
+        ]
+        if segment["speaker_role"] == "unknown" and not any(item.get("code") == "SPEAKER_ROLE_UNCERTAIN" for item in reasons):
+            reasons.append({"code": "SPEAKER_ROLE_UNCERTAIN", "label": "说话人身份不明确", "dimension": "speaker", "score": 55, "evidenceAtomIds": [], "impact": 45, "summary": ""})
+        return reasons
+
+    @staticmethod
+    def _renumber_segments(connection: sqlite3.Connection, interview_id: str) -> None:
+        rows = connection.execute("SELECT id FROM transcript_segments WHERE interview_id=? ORDER BY order_index,id", (interview_id,)).fetchall()
+        for order, row in enumerate(rows, 1):
+            connection.execute("UPDATE transcript_segments SET order_index=? WHERE id=?", (order, row["id"]))
+
+    @staticmethod
+    def _renumber_question_segment_links(connection: sqlite3.Connection, question_id: str) -> None:
+        for role in ("question", "answer"):
+            rows = connection.execute(
+                """SELECT l.segment_id FROM question_segment_links l
+                JOIN transcript_segments s ON s.id=l.segment_id
+                WHERE l.question_id=? AND l.link_role=? ORDER BY s.order_index,s.id""",
+                (question_id, role),
+            ).fetchall()
+            for order, row in enumerate(rows, 1):
+                connection.execute(
+                    "UPDATE question_segment_links SET order_index=? WHERE question_id=? AND segment_id=? AND link_role=?",
+                    (order, question_id, row["segment_id"], role),
+                )
+
+    @staticmethod
+    def _refresh_question_texts(connection: sqlite3.Connection, interview_id: str) -> None:
+        questions = connection.execute("SELECT * FROM question_cards WHERE interview_id=?", (interview_id,)).fetchall()
+        for question in questions:
+            values: dict[str, str] = {}
+            for role in ("question", "answer"):
+                rows = connection.execute(
+                    """SELECT s.raw_text FROM question_segment_links l JOIN transcript_segments s ON s.id=l.segment_id
+                    WHERE l.question_id=? AND l.link_role=? ORDER BY l.order_index""", (question["id"], role),
+                ).fetchall()
+                values[role] = "\n".join(row["raw_text"] for row in rows).strip()
+            effective_question = question["edited_question"] or values["question"]
+            effective_answer = question["edited_answer"] or values["answer"]
+            connection.execute(
+                """UPDATE question_cards SET extracted_question=?,extracted_answer=?,question=?,answer=?,confirmed=0,
+                provenance_status='edited',updated_at=? WHERE id=?""",
+                (values["question"], values["answer"], effective_question, effective_answer, utc_now(), question["id"]),
+            )
 
     def replace_questions(self, interview_id: str, questions: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         question_list = list(questions)
@@ -448,8 +770,9 @@ class Database:
                 """INSERT INTO question_cards(id, interview_id, order_index, question, answer, question_type,
                 confidence, initial_diagnosis_json, confirmed, version, topic_root_id, parent_question_id,
                 turn_type, extracted_question, extracted_answer, edited_question, edited_answer, topic_title,
-                needs_confirmation, provenance_status, follow_up_impact, created_at, updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                needs_confirmation, provenance_status, follow_up_impact, confidence_score, raw_confidence_score,
+                confidence_details_json, confirmation_reasons_json, parse_method, created_at, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     question_id, interview_id, item.get("order", 1), effective_question, effective_answer,
                     question_type, item.get("confidence", "medium"),
@@ -458,7 +781,10 @@ class Database:
                     extracted_question, extracted_answer, edited_question, edited_answer,
                     item.get("topicTitle", ""), int(item.get("needsConfirmation", False)),
                     item.get("provenanceStatus", "edited" if edited_question or edited_answer else "source"),
-                    item.get("followUpImpact", ""), now, now,
+                    item.get("followUpImpact", ""), float(item.get("confidenceScore", {"high": 90, "medium": 75, "low": 50}.get(item.get("confidence"), 75))),
+                    float(item.get("rawConfidenceScore", item.get("confidenceScore", {"high": 90, "medium": 75, "low": 50}.get(item.get("confidence"), 75)))),
+                    json.dumps(item.get("confidenceDetails", {}), ensure_ascii=False),
+                    json.dumps(item.get("confirmationReasons", []), ensure_ascii=False), item.get("parseMethod", "legacy"), now, now,
                 ),
             )
         for item in question_list:
@@ -473,10 +799,13 @@ class Database:
         self,
         interview_id: str,
         material_id: str | None,
+        atoms: Iterable[dict[str, Any]],
         segments: Iterable[dict[str, Any]],
         questions: Iterable[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM transcript_segments WHERE interview_id=?", (interview_id,))
+            self._replace_atoms(connection, interview_id, material_id, atoms)
             self._replace_segments(connection, interview_id, material_id, segments)
             self._replace_questions(connection, interview_id, questions)
         return self.get_questions(interview_id)
@@ -485,13 +814,28 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM question_cards WHERE interview_id=? ORDER BY order_index", (interview_id,)).fetchall()
             links = connection.execute(
-                """SELECT l.* FROM question_segment_links l JOIN question_cards q ON q.id=l.question_id
+                """SELECT l.*,s.raw_text FROM question_segment_links l
+                JOIN question_cards q ON q.id=l.question_id
+                JOIN transcript_segments s ON s.id=l.segment_id
                 WHERE q.interview_id=? ORDER BY l.order_index""", (interview_id,),
             ).fetchall()
         by_question: dict[str, dict[str, list[str]]] = {}
+        linked_text: dict[str, dict[str, list[str]]] = {}
         for link in links:
             by_question.setdefault(link["question_id"], {"question": [], "answer": []})[link["link_role"]].append(link["segment_id"])
-        return [self._question_dict(row, by_question.get(row["id"])) for row in rows]
+            linked_text.setdefault(link["question_id"], {"question": [], "answer": []})[link["link_role"]].append(link["raw_text"])
+        questions = []
+        for row in rows:
+            item = self._question_dict(row, by_question.get(row["id"]))
+            if row["id"] in by_question:
+                extracted_question = "\n".join(linked_text[row["id"]]["question"]).strip()
+                extracted_answer = "\n".join(linked_text[row["id"]]["answer"]).strip()
+                item["extractedQuestion"] = extracted_question
+                item["extractedAnswer"] = extracted_answer
+                item["interviewerQuestion"] = item["editedQuestion"] or extracted_question
+                item["candidateAnswer"] = item["editedAnswer"] or extracted_answer
+            questions.append(item)
+        return questions
 
     def get_question_topics(self, interview_id: str) -> list[dict[str, Any]]:
         questions = self.get_questions(interview_id)
@@ -541,22 +885,51 @@ class Database:
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         now = utc_now()
+        reused_run_id: str | None = None
         with self._lock, self.connect() as connection:
-            connection.execute(
-                """INSERT INTO review_runs(id, interview_id, status, phase, hello_session_id, error,
-                metrics_json, events_json, enable_web_verify, review_mode, plan_json, checkpoint_json,
-                input_digest, agent_mode, degraded, failure_code, audit_round, revision_count, created_at, updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    run_id, interview_id, "REVIEWING", "queued", None, None, "{}", "[]",
-                    int(enable_web_verify), review_mode, "{}", "{}", input_digest, agent_mode,
-                    0, "", 0, 0, now, now,
-                ),
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """SELECT id,interview_id,agent_mode FROM review_runs
+                WHERE interview_id=? AND status IN ('REVIEWING','AUDITING')
+                ORDER BY created_at DESC LIMIT 1""",
+                (interview_id,),
+            ).fetchone()
+            if active:
+                if str(active["agent_mode"]) == agent_mode:
+                    reused_run_id = str(active["id"])
+                else:
+                    raise ActiveAgentRunError(str(active["id"]), str(active["interview_id"]))
+            if not reused_run_id and agent_mode == "helloagents":
+                global_active = connection.execute(
+                    """SELECT id,interview_id FROM review_runs
+                    WHERE agent_mode='helloagents' AND status IN ('REVIEWING','AUDITING')
+                    ORDER BY created_at DESC LIMIT 1"""
+                ).fetchone()
+                if global_active:
+                    raise ActiveAgentRunError(str(global_active["id"]), str(global_active["interview_id"]))
+            if not reused_run_id:
+                connection.execute(
+                    """INSERT INTO review_runs(id, interview_id, status, phase, hello_session_id, error,
+                    metrics_json, events_json, enable_web_verify, review_mode, plan_json, checkpoint_json,
+                    input_digest, agent_mode, degraded, failure_code, audit_round, revision_count, created_at, updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id, interview_id, "REVIEWING", "queued", None, None, "{}", "[]",
+                        int(enable_web_verify), review_mode, "{}", "{}", input_digest, agent_mode,
+                        0, "", 0, 0, now, now,
+                    ),
+                )
+        if reused_run_id:
+            self.update_interview(interview_id, status="REVIEWING", latest_run_id=reused_run_id)
+            run = self.get_run(reused_run_id)
+            run["reused"] = True
+            return run
         self.update_interview(interview_id, status="REVIEWING", latest_run_id=run_id)
         message = "快速复盘任务已创建" if review_mode == "quick" else "复盘任务已创建"
         self.append_event(run_id, "RUN_CREATED", {"phase": "queued", "reviewMode": review_mode, "message": message})
-        return self.get_run(run_id)
+        run = self.get_run(run_id)
+        run["reused"] = False
+        return run
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self.connect() as connection:
@@ -589,6 +962,45 @@ class Database:
         assignment = ", ".join(f"{key}=?" for key in fields)
         with self._lock, self.connect() as connection:
             connection.execute(f"UPDATE review_runs SET {assignment} WHERE id=?", (*fields.values(), run_id))
+
+    def fail_stale_runs(self, stale_before: str) -> list[str]:
+        failed: list[str] = []
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,interview_id,events_json FROM review_runs
+                WHERE status IN ('REVIEWING','AUDITING') AND updated_at<?""",
+                (stale_before,),
+            ).fetchall()
+            for row in rows:
+                events = json.loads(row["events_json"] or "[]")
+                events.append({
+                    "id": len(events) + 1,
+                    "type": "RUN_FAILED",
+                    "data": {
+                        "status": "FAILED",
+                        "code": "AGENT_PROCESS_INTERRUPTED",
+                        "message": "服务重启前 Agent 长时间无心跳，可从最近检查点恢复。",
+                    },
+                    "createdAt": now,
+                })
+                connection.execute(
+                    """UPDATE review_runs SET status='FAILED',phase='failed',error=?,failure_code=?,events_json=?,updated_at=?
+                    WHERE id=?""",
+                    (
+                        "服务重启前 Agent 长时间无心跳，可从最近检查点恢复。",
+                        "AGENT_PROCESS_INTERRUPTED",
+                        json.dumps(events, ensure_ascii=False),
+                        now,
+                        row["id"],
+                    ),
+                )
+                connection.execute(
+                    "UPDATE interviews SET status='FAILED',updated_at=? WHERE id=? AND latest_run_id=?",
+                    (now, row["interview_id"], row["id"]),
+                )
+                failed.append(row["id"])
+        return failed
 
     def append_event(self, run_id: str, event_type: str, data: dict[str, Any]) -> dict[str, Any]:
         with self._lock, self.connect() as connection:
@@ -709,10 +1121,102 @@ class Database:
     def get_growth_trends(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT g.*, i.company, i.position, i.interview_date FROM growth_snapshots g
-                JOIN interviews i ON i.id=g.interview_id ORDER BY g.created_at"""
+                """SELECT g.*, i.company, i.position, i.interview_date,
+                COALESCE(r.updated_at,g.created_at) AS report_generated_at
+                FROM growth_snapshots g JOIN interviews i ON i.id=g.interview_id
+                LEFT JOIN review_runs r ON r.id=g.run_id
+                ORDER BY g.created_at"""
             ).fetchall()
         return [{**dict(row), "scores": json.loads(row["scores_json"]), "weakDimensions": json.loads(row["weak_dimensions_json"]), "actionItems": json.loads(row["action_items_json"])} for row in rows]
+
+    def get_growth_candidates(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT i.id AS interview_id,i.company,i.position,i.round,i.interview_date,
+                r.id AS run_id,r.metrics_json,r.updated_at AS completed_at,
+                EXISTS(SELECT 1 FROM growth_snapshots g WHERE g.interview_id=i.id) AS already_added
+                FROM interviews i JOIN review_runs r ON r.id=i.latest_run_id
+                WHERE i.status='COMPLETED' AND r.status='COMPLETED'
+                ORDER BY CASE WHEN i.interview_date='' THEN 1 ELSE 0 END,i.interview_date DESC,r.updated_at DESC"""
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            metrics = json.loads(row["metrics_json"] or "{}")
+            report = metrics.get("report") or {}
+            scores = report.get("overallScores") or {}
+            if not scores or float(scores.get("overall") or 0) <= 0:
+                continue
+            candidates.append({
+                "interviewId": row["interview_id"], "runId": row["run_id"], "company": row["company"],
+                "position": row["position"], "round": row["round"], "interviewDate": row["interview_date"],
+                "completedAt": row["completed_at"], "scores": scores, "alreadyAdded": bool(row["already_added"]),
+            })
+        return candidates
+
+    def import_growth_snapshots(self, interview_ids: Iterable[str]) -> dict[str, Any]:
+        requested = list(dict.fromkeys(interview_ids))
+        added_ids: list[str] = []
+        existing_ids: list[str] = []
+        unavailable_ids: list[str] = []
+        with self._lock, self.connect() as connection:
+            for interview_id in requested:
+                existing = connection.execute(
+                    "SELECT id FROM growth_snapshots WHERE interview_id=? LIMIT 1", (interview_id,)
+                ).fetchone()
+                if existing:
+                    existing_ids.append(interview_id)
+                    continue
+                row = connection.execute(
+                    """SELECT i.id AS interview_id,r.id AS run_id,r.metrics_json
+                    FROM interviews i JOIN review_runs r ON r.id=i.latest_run_id
+                    WHERE i.id=? AND i.status='COMPLETED' AND r.status='COMPLETED'""",
+                    (interview_id,),
+                ).fetchone()
+                if not row:
+                    unavailable_ids.append(interview_id)
+                    continue
+                metrics = json.loads(row["metrics_json"] or "{}")
+                report = metrics.get("report") or {}
+                scores = report.get("overallScores") or {}
+                if not scores or float(scores.get("overall") or 0) <= 0:
+                    unavailable_ids.append(interview_id)
+                    continue
+                weak = sorted(
+                    (key for key in scores if key != "overall"),
+                    key=lambda key: float(scores.get(key) or 0),
+                )[:2]
+                connection.execute(
+                    "INSERT INTO growth_snapshots VALUES(?,?,?,?,?,?,?)",
+                    (
+                        str(uuid.uuid4()), interview_id, row["run_id"], json.dumps(scores),
+                        json.dumps(weak, ensure_ascii=False),
+                        json.dumps(report.get("actionItems") or [], ensure_ascii=False), utc_now(),
+                    ),
+                )
+                added_ids.append(interview_id)
+        return {
+            "requestedCount": len(requested), "addedCount": len(added_ids),
+            "alreadyExistsCount": len(existing_ids), "unavailableCount": len(unavailable_ids),
+            "addedInterviewIds": added_ids, "alreadyExistsInterviewIds": existing_ids,
+            "unavailableInterviewIds": unavailable_ids,
+        }
+
+    def delete_growth_snapshot(self, snapshot_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute("DELETE FROM growth_snapshots WHERE id=?", (snapshot_id,))
+        return cursor.rowcount > 0
+
+    def delete_growth_snapshots(self, snapshot_ids: Iterable[str]) -> int:
+        unique_ids = list(dict.fromkeys(snapshot_ids))
+        if not unique_ids:
+            return 0
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM growth_snapshots WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            )
+        return cursor.rowcount
 
     @staticmethod
     def _question_dict(row: sqlite3.Row, links: dict[str, list[str]] | None = None) -> dict[str, Any]:
@@ -728,10 +1232,14 @@ class Database:
             "needsConfirmation": bool(row["needs_confirmation"]), "provenanceStatus": row["provenance_status"],
             "followUpImpact": row["follow_up_impact"], "questionSegmentIds": links.get("question", []),
             "answerSegmentIds": links.get("answer", []),
+            "confidenceScore": float(row["confidence_score"]), "rawConfidenceScore": float(row["raw_confidence_score"]),
+            "confidenceDetails": json.loads(row["confidence_details_json"] or "{}"),
+            "confirmationReasons": json.loads(row["confirmation_reasons_json"] or "[]"),
+            "parseMethod": row["parse_method"],
         }
 
     @staticmethod
-    def _segment_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _segment_dict(row: sqlite3.Row, atom_ids: list[str] | None = None) -> dict[str, Any]:
         return {
             "id": row["id"], "ordinal": row["order_index"], "rawText": row["raw_text"],
             "normalizedText": row["normalized_text"], "speakerLabel": row["speaker_label"],
@@ -739,4 +1247,16 @@ class Database:
             "startChar": row["start_char"], "endChar": row["end_char"], "confidence": row["confidence"],
             "speakerConfidence": row["speaker_confidence"],
             "needsConfirmation": bool(row["needs_confirmation"]), "excluded": bool(row["excluded"]),
+            "atomIds": atom_ids or [], "confidenceDetails": json.loads(row["confidence_details_json"] or "{}"),
+            "confirmationReasons": json.loads(row["confirmation_reasons_json"] or "[]"),
+            "parseMethod": row["parse_method"],
+        }
+
+    @staticmethod
+    def _atom_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "ordinal": row["order_index"], "rawText": row["raw_text"],
+            "startChar": row["start_char"], "endChar": row["end_char"], "startTime": row["start_time"],
+            "endTime": row["end_time"], "speakerLabel": row["speaker_label"], "speakerRole": row["speaker_role"],
+            "confidence": float(row["confidence"]),
         }

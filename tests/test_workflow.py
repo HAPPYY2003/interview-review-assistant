@@ -1,7 +1,10 @@
 import json
+import time
+
+import pytest
 
 from backend.app.agents.runtime import AgentRuntimeResult
-from backend.app.database import Database
+from backend.app.database import ActiveAgentRunError, Database
 from backend.app.services.evidence import EvidenceReviewService
 from backend.app.services.knowledge import KnowledgeBase
 from backend.app.services.workflow import ReviewWorkflow
@@ -20,7 +23,7 @@ def build_workflow(settings):
     return database, review_service, ReviewWorkflow(database, review_service, settings)
 
 
-def test_complete_fixture_workflow_and_growth_memory(settings_factory):
+def test_complete_fixture_workflow_and_manual_growth_import(settings_factory):
     settings = settings_factory()
     database, service, workflow = build_workflow(settings)
     interview = database.create_interview({
@@ -49,7 +52,22 @@ def test_complete_fixture_workflow_and_growth_memory(settings_factory):
     assert report["status"] == "COMPLETED"
     assert len(report["questions"]) == 2
     assert report["interview"]["overallScores"]["overall"] > 0
-    assert database.get_growth_trends()
+    assert database.get_growth_trends() == []
+    candidates = database.get_growth_candidates()
+    candidate = next(item for item in candidates if item["interviewId"] == interview["id"])
+    assert candidate["alreadyAdded"] is False
+
+    imported = database.import_growth_snapshots([interview["id"]])
+    assert imported["addedCount"] == 1
+    assert imported["alreadyExistsCount"] == 0
+    growth = database.get_growth_trends()[0]
+    assert growth["interview_id"] == interview["id"]
+    assert growth["report_generated_at"] == completed["updated_at"]
+
+    duplicate = database.import_growth_snapshots([interview["id"]])
+    assert duplicate["addedCount"] == 0
+    assert duplicate["alreadyExistsCount"] == 1
+    assert len(database.get_growth_trends()) == 1
 
     transcript_refs = [ref for question in report["questions"] for ref in question["evidenceRefs"] if ref["sourceType"] == "transcript"]
     assert transcript_refs
@@ -72,6 +90,86 @@ def test_question_edit_invalidates_previous_run(settings_factory):
     updated = database.get_interview(interview["id"])
     assert updated["status"] == "WAITING_CONFIRMATION"
     assert updated["latest_run_id"] is None
+
+
+def test_create_run_reuses_active_review_for_same_interview(settings_factory):
+    settings = settings_factory()
+    database, service, _ = build_workflow(settings)
+    interview = database.create_interview({"id": "single-active-run", "raw_transcript": TRANSCRIPT})
+    database.replace_questions(interview["id"], service.parse_transcript(TRANSCRIPT))
+    database.confirm_questions(interview["id"])
+
+    first = database.create_run(interview["id"])
+    database.update_interview(interview["id"], latest_run_id=None)
+    second = database.create_run(interview["id"])
+
+    assert second["id"] == first["id"]
+    assert second["reused"] is True
+    assert database.get_interview(interview["id"])["latest_run_id"] == first["id"]
+    with database.connect() as connection:
+        active_count = connection.execute(
+            "SELECT COUNT(*) FROM review_runs WHERE interview_id=? AND status IN ('REVIEWING','AUDITING')",
+            (interview["id"],),
+        ).fetchone()[0]
+    assert active_count == 1
+
+
+def test_only_one_real_agent_run_can_be_active_globally(settings_factory):
+    settings = settings_factory()
+    database, service, _ = build_workflow(settings)
+    first_interview = database.create_interview({"id": "global-agent-first", "raw_transcript": TRANSCRIPT})
+    second_interview = database.create_interview({"id": "global-agent-second", "raw_transcript": TRANSCRIPT})
+    for interview in (first_interview, second_interview):
+        database.replace_questions(interview["id"], service.parse_transcript(TRANSCRIPT))
+        database.confirm_questions(interview["id"])
+
+    first = database.create_run(first_interview["id"], agent_mode="helloagents")
+    reused = database.create_run(first_interview["id"], agent_mode="helloagents")
+
+    assert reused["id"] == first["id"]
+    assert reused["reused"] is True
+    with pytest.raises(ActiveAgentRunError) as error:
+        database.create_run(second_interview["id"], agent_mode="helloagents")
+    assert error.value.run_id == first["id"]
+    assert error.value.interview_id == first_interview["id"]
+
+    fixture = database.create_run(second_interview["id"], agent_mode="fixture")
+    assert fixture["id"] != first["id"]
+
+
+def test_topic_payload_excludes_parse_provenance_ids():
+    topic = {
+        "title": "项目复盘",
+        "mainTurn": {
+            "id": "topic-1",
+            "version": 1,
+            "interviewerQuestion": "请介绍项目。",
+            "candidateAnswer": "我负责方案设计。",
+            "questionType": "项目经历",
+            "confirmed": True,
+            "needsConfirmation": False,
+            "questionSegmentIds": ["U0001"],
+            "confidenceDetails": {"evidenceAtomIds": ["A0001"]},
+        },
+        "followUps": [{
+            "id": "follow-up-1",
+            "version": 1,
+            "interviewerQuestion": "结果如何？",
+            "candidateAnswer": "转化率提升。",
+            "questionType": "项目经历",
+            "confirmed": True,
+            "needsConfirmation": False,
+            "answerSegmentIds": ["U0002"],
+        }],
+    }
+
+    payload = ReviewWorkflow._topic_for_agent(topic)
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "A0001" not in serialized
+    assert "U0001" not in serialized
+    assert "U0002" not in serialized
+    assert payload["followUpTurns"][0]["id"] == "follow-up-1"
 
 
 class ScriptedAgentRuntime:
@@ -145,6 +243,30 @@ class ScriptedAgentRuntime:
         return AgentRuntimeResult(text="scripted", session_id=f"session-{agent_type}", metadata={"duration_seconds": 0.01, "tokens": 10})
 
 
+class BlockingAgentRuntime(ScriptedAgentRuntime):
+    def __init__(self):
+        super().__init__()
+        self.block_topic_id = None
+
+    def run_task_agent(self, agent_type, task, tools, *, max_steps=8):
+        by_name = {tool.name: tool for tool in tools}
+        if agent_type == "react" and by_name["SubmitTopicReview"].topic["id"] == self.block_topic_id:
+            time.sleep(2)
+            return AgentRuntimeResult(text="late result", metadata={"duration_seconds": 2})
+        return super().run_task_agent(agent_type, task, tools, max_steps=max_steps)
+
+
+class GrowthRuntimeFailure(ScriptedAgentRuntime):
+    def run_task_agent(self, agent_type, task, tools, *, max_steps=8):
+        if agent_type == "plan":
+            return AgentRuntimeResult(
+                text="growth provider rejected the request",
+                metadata={"duration_seconds": 0.01, "error": "forced tool choice is unsupported"},
+                success=False,
+            )
+        return super().run_task_agent(agent_type, task, tools, max_steps=max_steps)
+
+
 def test_real_mode_report_is_built_from_agent_artifacts(monkeypatch, settings_factory):
     settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
     database, service, workflow = build_workflow(settings)
@@ -175,8 +297,8 @@ def test_real_mode_report_is_built_from_agent_artifacts(monkeypatch, settings_fa
     assert {"supervisor_plan", "evidence_review", "reflection_audit", "growth_plan"}.issubset(phases)
 
 
-def _agent_workflow(settings_factory, runtime):
-    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+def _agent_workflow(settings_factory, runtime, **setting_overrides):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key", **setting_overrides)
     database, service, workflow = build_workflow(settings)
     interview = database.create_interview({"id": "agent-recovery", "position": "产品经理", "job_description": "负责实验设计。", "raw_transcript": TRANSCRIPT})
     database.replace_questions(interview["id"], service.parse_transcript(TRANSCRIPT))
@@ -204,6 +326,70 @@ def test_topic_checkpoint_resume_skips_accepted_artifacts(settings_factory):
     assert database.get_run(run["id"])["status"] == "COMPLETED"
     assert topic_ids[0] not in succeeding.topic_calls
     assert succeeding.topic_calls[topic_ids[1]] == 1
+
+
+def test_agent_timeout_fails_with_progress_and_resumes_from_checkpoint(settings_factory):
+    blocking = BlockingAgentRuntime()
+    database, workflow, interview, run = _agent_workflow(
+        settings_factory,
+        blocking,
+        agent_task_timeout=1,
+        agent_heartbeat_interval=0.1,
+    )
+    topic_ids = [item["id"] for item in database.get_question_topics(interview["id"])]
+    blocking.block_topic_id = topic_ids[1]
+
+    workflow.execute(run["id"])
+
+    failed = database.get_run(run["id"])
+    event_types = [event["type"] for event in failed["events"]]
+    assert failed["status"] == "FAILED"
+    assert failed["failure_code"] == "AGENT_TIMEOUT"
+    assert database.accepted_artifact(run["id"], "evidence_review", topic_ids[0]) is not None
+    assert "TOOL_STARTED" in event_types
+    assert "TOOL_FINISHED" in event_types
+    assert "AGENT_HEARTBEAT" in event_types
+    assert "AGENT_TIMEOUT" in event_types
+
+    succeeding = ScriptedAgentRuntime()
+    workflow.agent_runtime = succeeding
+    database.update_run(run["id"], status="REVIEWING", phase="resuming", error="", failure_code="")
+    workflow.execute(run["id"])
+
+    assert database.get_run(run["id"])["status"] == "COMPLETED"
+    assert topic_ids[0] not in succeeding.topic_calls
+    assert succeeding.topic_calls[topic_ids[1]] == 1
+
+
+def test_growth_runtime_failure_keeps_accepted_audit_and_reports_real_stage(settings_factory):
+    database, workflow, _, run = _agent_workflow(settings_factory, GrowthRuntimeFailure())
+
+    workflow.execute(run["id"])
+
+    failed = database.get_run(run["id"])
+    assert failed["status"] == "FAILED"
+    assert failed["phase"] == "growth_plan"
+    assert failed["failure_code"] == "AGENT_RUNTIME_FAILED"
+    assert failed["checkpoint"]["auditAccepted"] is True
+    assert "forced tool choice is unsupported" in failed["error"]
+    assert failed["events"][-1]["data"]["phase"] == "growth_plan"
+    assert any(event["type"] == "AGENT_RUNTIME_FAILED" for event in failed["events"])
+
+
+def test_stale_running_task_is_marked_recoverable_after_restart(settings_factory):
+    settings = settings_factory()
+    database, service, workflow = build_workflow(settings)
+    interview = database.create_interview({"id": "stale-agent", "raw_transcript": TRANSCRIPT})
+    database.replace_questions(interview["id"], service.parse_transcript(TRANSCRIPT))
+    run = database.create_run(interview["id"], agent_mode="helloagents")
+
+    failed_ids = database.fail_stale_runs("9999-01-01T00:00:00+00:00")
+
+    failed = database.get_run(run["id"])
+    assert failed_ids == [run["id"]]
+    assert failed["status"] == "FAILED"
+    assert failed["failure_code"] == "AGENT_PROCESS_INTERRUPTED"
+    assert failed["events"][-1]["type"] == "RUN_FAILED"
 
 
 def test_reflection_revises_only_affected_topic_and_keeps_versions(settings_factory):

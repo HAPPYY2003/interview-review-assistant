@@ -14,6 +14,8 @@ const EVENT_TYPES = [
   "TOPIC_ANALYSIS_STARTED", "TOPIC_ANALYSIS_COMPLETED", "SUBMISSION_REJECTED", "CHECKPOINT_SAVED",
   "AUDIT_STARTED", "AUDIT_COMPLETED", "AUDIT_RECOVERY_STARTED", "REVISION_REQUIRED", "TOPIC_REVISION_COMPLETED",
   "GROWTH_PLAN_COMPLETED", "AGENT_STARTED", "AGENT_FINISHED", "RUN_RESUMED", "FALLBACK_REQUESTED",
+  "TOOL_STARTED", "TOOL_FINISHED", "AGENT_HEARTBEAT", "AGENT_TIMEOUT",
+  "AGENT_RUNTIME_FAILED", "SUBMISSION_MISSING",
   "FALLBACK_STARTED", "RUN_FINISHED", "RUN_FAILED"
 ];
 const PARSE_EVENT_TYPES = ["PARSE_CREATED", "PARSE_PHASE_STARTED", "PARSE_TOOL_FINISHED", "AGENT_STARTED", "AGENT_FINISHED", "PARSE_FINISHED", "PARSE_FAILED"];
@@ -48,10 +50,25 @@ const PARSE_PHASE_LABELS = {
   failed: "解析失败"
 };
 const AGENT_LABELS = {
+  Supervisor: "PlanSolve 复盘主管",
   "ReActAgent ParseAgent": "ReAct 材料解析主管",
   EvidenceAnalyst: "ReAct 证据分析师",
   QualityAuditor: "Reflection 质量审计员",
   GrowthPlanner: "PlanSolve 成长教练"
+};
+const CONFIRMATION_REASON_LABELS = {
+  QUESTION_BOUNDARY_UNCERTAIN: "问题边界不明确",
+  ANSWER_BOUNDARY_UNCERTAIN: "回答边界不明确",
+  QA_PAIRING_AMBIGUOUS: "问答对应关系不明确",
+  SPEAKER_ROLE_UNCERTAIN: "说话人身份不明确",
+  MAIN_FOLLOWUP_UNCERTAIN: "主问题与追问关系不明确",
+  FOLLOWUP_PARENT_UNCERTAIN: "追问归属不明确",
+  QUESTION_TYPE_UNCERTAIN: "题型分类不确定",
+  TOPIC_GROUPING_UNCERTAIN: "主题归并不确定",
+  SOURCE_QUALITY_LOW: "原始文稿结构较弱",
+  ANSWER_MISSING: "未识别到回答",
+  CHUNK_OVERLAP_CONFLICT: "分块结果冲突",
+  REFERENCE_VALIDATION_FAILED: "原文引用校验失败"
 };
 const EVENT_LABELS = {
   RUN_CREATED: "复盘任务已创建",
@@ -70,6 +87,12 @@ const EVENT_LABELS = {
   GROWTH_PLAN_COMPLETED: "成长计划完成",
   AGENT_STARTED: "Agent 开始执行",
   AGENT_FINISHED: "Agent 执行结束",
+  TOOL_STARTED: "工具开始执行",
+  TOOL_FINISHED: "工具执行完成",
+  AGENT_HEARTBEAT: "Agent 执行心跳",
+  AGENT_TIMEOUT: "Agent 执行超时",
+  AGENT_RUNTIME_FAILED: "Agent 运行失败",
+  SUBMISSION_MISSING: "Agent 未提交结构化结果",
   RUN_RESUMED: "任务已恢复",
   FALLBACK_REQUESTED: "已请求降级报告",
   FALLBACK_STARTED: "降级报告开始生成",
@@ -84,10 +107,18 @@ const state = {
   events: [],
   health: null,
   trends: [],
+  selectedTrendIds: [],
+  trendCandidates: [],
+  selectedTrendCandidateIds: [],
+  trendImportDialogOpen: false,
+  trendImportLoading: false,
   loading: false,
   error: "",
   expandedQuestionId: null,
+  questionReviewTab: "summary",
+  questionEvidenceFocus: "",
   editingTurnId: null,
+  structureEditingSegmentId: null,
   expandedFollowUpIds: [],
   collapsedFollowUpIds: [],
   reviewMode: null,
@@ -104,14 +135,21 @@ window.addEventListener("hashchange", async () => {
   state.route = parseRoute();
   state.error = "";
   state.expandedQuestionId = null;
+  state.questionReviewTab = "summary";
+  state.questionEvidenceFocus = "";
   state.editingTurnId = null;
+  state.structureEditingSegmentId = null;
   state.expandedFollowUpIds = [];
   state.collapsedFollowUpIds = [];
   state.reviewMode = null;
   state.acknowledgeUnresolved = false;
   state.acknowledgeUnreviewed = false;
   state.reviewDialogOpen = false;
+  state.trendImportDialogOpen = false;
+  state.trendCandidates = [];
+  state.selectedTrendCandidateIds = [];
   state.reviewNavFilter = "all";
+  state.selectedTrendIds = [];
   await loadRouteData();
   render();
 });
@@ -170,6 +208,7 @@ async function loadRouteData() {
     try {
       const result = await api("/api/v1/profile/trends");
       state.trends = result.snapshots || [];
+      state.selectedTrendIds = state.selectedTrendIds.filter(id => state.trends.some(item => item.id === id));
     } catch (error) {
       state.error = readableError(error);
     }
@@ -178,11 +217,14 @@ async function loadRouteData() {
 }
 
 function parseRoute() {
-  const parts = (location.hash.replace(/^#/, "") || "/").split("/").filter(Boolean);
+  const rawRoute = location.hash.replace(/^#/, "") || "/";
+  const [path, queryString = ""] = rawRoute.split("?", 2);
+  const query = new URLSearchParams(queryString);
+  const parts = path.split("/").filter(Boolean);
   if (!parts.length) return { name: "home", params: {} };
   if (parts[0] === "new") return { name: "new", params: {} };
   if (parts[0] === "trends") return { name: "trends", params: {} };
-  if (parts[0] === "parse" && parts[1]) return { name: "parse", params: { id: parts[1] } };
+  if (parts[0] === "parse" && parts[1]) return { name: "parse", params: { id: parts[1], from: query.get("from") || "materials" } };
   if (parts[0] === "run" && parts[1]) return { name: "run", params: { id: parts[1], runId: parts[2] || "" } };
   if (parts[0] === "review" && parts[1]) return { name: "review", params: { id: parts[1] } };
   return { name: "home", params: {} };
@@ -202,6 +244,12 @@ function render() {
   if (state.reviewDialogOpen) {
     requestAnimationFrame(() => {
       const dialog = document.querySelector("#reviewDialog");
+      if (dialog && !dialog.open) dialog.showModal();
+    });
+  }
+  if (state.trendImportDialogOpen) {
+    requestAnimationFrame(() => {
+      const dialog = document.querySelector("#trendImportDialog");
       if (dialog && !dialog.open) dialog.showModal();
     });
   }
@@ -259,12 +307,13 @@ function renderHomePage() {
 }
 
 function renderRecordRow(record) {
-  const route = record.status === "completed" ? `#/review/${record.id}` : ["reviewing", "auditing"].includes(record.status) && record.runId ? `#/run/${record.id}/${record.runId}` : `#/parse/${record.id}`;
+  const route = record.status === "completed" ? `#/review/${record.id}` : ["reviewing", "auditing"].includes(record.status) && record.runId ? `#/run/${record.id}/${record.runId}` : `#/parse/${record.id}${record.report ? "?from=report" : ""}`;
   const primaryActionLabel = record.status === "completed" ? "查看报告" : "继续复盘";
   const primaryActionIcon = record.status === "completed" ? "file-text" : "arrow-right";
   const interviewDate = record.interviewDate || "未填写日期";
+  const reportGeneratedAt = record.report?.interview?.latestAIMetadata?.generatedAt;
   return `<div class="table-row data">
-    <div class="table-main"><button class="table-title record-title-link" type="button" data-nav="${route}" aria-label="${primaryActionLabel}：${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}">${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}</button></div>
+    <div class="table-main"><button class="table-title record-title-link" type="button" data-nav="${route}" aria-label="${primaryActionLabel}：${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}">${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}</button>${reportGeneratedAt ? `<span class="table-report-generated">报告生成 ${escapeHtml(formatDateMinute(reportGeneratedAt))}</span>` : ""}</div>
     <time class="table-meta table-date" data-label="日期" datetime="${escapeHtml(record.interviewDate || "")}">${escapeHtml(interviewDate)}</time>
     <div class="table-meta" data-label="轮次">${escapeHtml(record.round || "--")}</div>
     <div class="table-meta" data-label="问题">${record.questions?.length || record.questionCount || 0} 道</div>
@@ -285,6 +334,7 @@ function renderLucideIcon(name) {
     "chevron-up": '<path d="m18 15-6-6-6 6"></path>',
     "circle-check": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><path d="m9 11 3 3L22 4"></path>',
     "file-text": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" x2="16" y1="13" y2="13"></line><line x1="8" x2="16" y1="17" y2="17"></line>',
+    "plus": '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
     "locate-fixed": '<line x1="2" x2="5" y1="12" y2="12"></line><line x1="19" x2="22" y1="12" y2="12"></line><line x1="12" x2="12" y1="2" y2="5"></line><line x1="12" x2="12" y1="19" y2="22"></line><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle>',
     "git-merge": '<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>',
     "pencil": '<path d="M21.17 6.17 17.83 2.83a2.83 2.83 0 0 0-4 0L3 13.66V21h7.34L21.17 10.17a2.83 2.83 0 0 0 0-4Z"></path><path d="m12.5 4.5 7 7"></path>',
@@ -393,6 +443,8 @@ function renderParsePage() {
   const pendingCount = record.topics.length - reviewedCount;
   const allTopicsReviewed = pendingCount === 0;
   const progress = record.topics.length ? Math.round(reviewedCount / record.topics.length * 100) : 0;
+  const fromReport = state.route.params.from === "report";
+  const reportEditDirty = Boolean(record.reportEditDirty);
   return `
     <section class="page review-page">
       ${renderSteps(2)}
@@ -401,7 +453,10 @@ function renderParsePage() {
         <div class="review-header-status" aria-label="校对进度">
           <div class="review-header-progress"><span>校对进度</span><strong>${reviewedCount}/${record.topics.length} 个主题已确认</strong><div class="review-progress-track"><span style="width:${progress}%"></span></div></div>
           <div class="review-header-buttons">
-            <button type="button" class="button compact" id="openReviewDialog">开始 Agent 复盘</button>
+            ${fromReport
+              ? `<button type="button" class="button secondary compact" id="returnToReport" ${record.report ? "" : "disabled"}>返回复盘报告</button>
+                <button type="button" class="button compact" id="openReviewDialog" ${reportEditDirty ? "" : `disabled title="修改题卡后可重新生成"`}>重新生成复盘报告</button>`
+              : `<button type="button" class="button compact" id="openReviewDialog">开始 Agent 复盘</button>`}
           </div>
         </div>
       </div>
@@ -534,11 +589,12 @@ function renderFollowUpTurn(turn, index) {
   const expanded = followUpIsExpanded(turn);
   const editing = state.editingTurnId === turn.id;
   const status = turnReviewState(turn);
+  const reason = turnConfirmationReasons(turn)[0];
   const answer = turn.candidateAnswer || "未识别到回答";
   return `<section class="follow-up-turn ${expanded ? "expanded" : ""}">
     <span class="thread-node"></span>
     <button type="button" class="follow-up-question" data-toggle-followup="${turn.id}" aria-expanded="${expanded}">
-      <span class="follow-up-question-copy"><small>追问 ${index + 1}</small><span class="follow-up-question-line"><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问内容")}</strong><span class="follow-up-question-meta"><span class="topic-state ${status.key}">${status.label}</span>${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span></span></span>
+      <span class="follow-up-question-copy"><small>追问 ${index + 1}${reason ? ` · ${escapeHtml(reason)}` : ""}</small><span class="follow-up-question-line"><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问内容")}</strong><span class="follow-up-question-meta"><span class="topic-state ${status.key}">${status.label}</span>${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span></span></span>
     </button>
     ${editing ? renderTurnEditForm(turn, `追问 ${index + 1}`) : expanded ? `<div class="follow-up-answer"><span>候选人回答${turn.editedAnswer ? `<em>人工修订</em>` : ""}</span><p>${escapeHtml(answer)}</p><div class="follow-up-actions"><button type="button" class="text-action" data-edit-turn="${turn.id}">${renderLucideIcon("pencil")}编辑追问</button><button type="button" class="text-action" data-split-followup="${turn.id}">${renderLucideIcon("split")}拆为独立主题</button></div></div>` : ""}
   </section>`;
@@ -569,11 +625,12 @@ function renderReviewDialog(record, reviewedCount, unresolvedCount) {
     : state.reviewMode === "local"
       ? "仅使用面试稿、JD、简历和本地知识库，不访问互联网。"
       : "请选择本次复盘使用的资料范围。";
+  const fromReport = state.route.params.from === "report";
   const startLabel = state.loading
     ? "正在创建任务..."
-    : unconfirmedCount
-      ? "启动快速复盘"
-      : "启动 Agent 复盘";
+    : fromReport
+      ? unconfirmedCount ? "重新生成快速报告" : "重新生成复盘报告"
+      : unconfirmedCount ? "启动快速复盘" : "启动 Agent 复盘";
   const acknowledgementText = unconfirmedCount && unresolvedCount
     ? "我已了解未校对题卡和未归类内容会在报告中标记"
     : unconfirmedCount
@@ -581,7 +638,7 @@ function renderReviewDialog(record, reviewedCount, unresolvedCount) {
       : "我已了解未归类内容会在报告中标记";
   return `<dialog class="review-dialog" id="reviewDialog" aria-labelledby="reviewDialogTitle">
     <div class="review-dialog-header">
-      <h2 id="reviewDialogTitle">开始 Agent 复盘</h2>
+      <h2 id="reviewDialogTitle">${fromReport ? "重新生成复盘报告" : "开始 Agent 复盘"}</h2>
       <button type="button" class="icon-button" data-close-review-dialog aria-label="关闭复盘设置">${renderLucideIcon("x")}</button>
     </div>
     <div class="review-dialog-body">
@@ -618,34 +675,84 @@ function renderTopicSources(topic, record) {
   const turns = [topic.mainTurn, ...(topic.followUps || [])];
   const segmentIds = new Set(turns.flatMap(turn => [...(turn.questionSegmentIds || []), ...(turn.answerSegmentIds || [])]));
   return `<section class="topic-sources" id="topic-sources">
-    <div class="topic-sources-heading"><div><strong>本主题文字来源</strong><span>主问题与全部追问原文 · 只读</span></div><span>${segmentIds.size} 个原始片段</span></div>
+    <div class="topic-sources-heading"><div><strong>本主题原文结构</strong><span>原文不可修改 · 可调整说话人、边界和问答归属</span></div><span>${segmentIds.size} 个原始话轮</span></div>
     ${record.audio ? `<div class="topic-source-audio"><div><strong>${escapeHtml(record.audio.filename || "面试音频")}</strong><span>点击片段时间可从对应位置播放</span></div><audio id="sourceAudio" controls preload="metadata" src="${escapeHtml(record.audio.url)}"></audio></div>` : ""}
     <div class="topic-source-turns">${turns.map((turn, index) => renderTopicSourceTurn(turn, index === 0 ? "主问题" : `追问 ${index}`, record)).join("")}</div>
   </section>`;
 }
 
 function renderTopicSourceTurn(turn, label, record) {
+  const questionIds = [...(turn.questionSegmentIds || [])];
+  const answerIds = [...(turn.answerSegmentIds || [])];
+  const sharedIds = questionIds.filter(id => answerIds.includes(id));
+  const questionOnlyIds = questionIds.filter(id => !sharedIds.includes(id));
+  const answerOnlyIds = answerIds.filter(id => !sharedIds.includes(id));
+  const questionFallback = sourceFallback(turn, "question");
+  const answerFallback = sourceFallback(turn, "answer");
   return `<section class="topic-source-turn">
     <div class="topic-source-turn-label"><strong>${label}</strong></div>
     <div class="topic-source-lines">
-      ${renderTopicSourceLines(record, turn.questionSegmentIds, turn.extractedQuestion || turn.interviewerQuestion, "interviewer")}
-      ${renderTopicSourceLines(record, turn.answerSegmentIds, turn.extractedAnswer || turn.candidateAnswer, "candidate")}
+      ${questionOnlyIds.length || !questionIds.length ? renderTopicSourceLines(record, questionOnlyIds, questionIds.length ? "" : questionFallback.text, "interviewer", turn.id, "question", questionFallback.label) : ""}
+      ${sharedIds.length ? renderTopicSourceLines(record, sharedIds, "", "unknown", turn.id, "conflict") : ""}
+      ${answerOnlyIds.length || !answerIds.length ? renderTopicSourceLines(record, answerOnlyIds, answerIds.length ? "" : answerFallback.text, "candidate", turn.id, "answer", answerFallback.label) : ""}
     </div>
   </section>`;
 }
 
-function renderTopicSourceLines(record, ids = [], fallback = "", fallbackRole = "unknown") {
+function sourceFallback(turn, role) {
+  const edited = role === "question" ? turn.editedQuestion : turn.editedAnswer;
+  if (edited) return { text: edited, label: "人工修订（无原文关联）" };
+  const extracted = role === "question" ? turn.extractedQuestion : turn.extractedAnswer;
+  const effective = role === "question" ? turn.interviewerQuestion : turn.candidateAnswer;
+  const text = extracted || effective || "";
+  return { text, label: text ? "历史抽取文本（无原文关联）" : "" };
+}
+
+function renderTopicSourceLines(record, ids = [], fallback = "", fallbackRole = "unknown", turnId = "", assignment = "", fallbackLabel = "") {
   const byId = new Map((record.segments || []).map(segment => [segment.id, segment]));
+  const atomMap = new Map((record.atoms || []).map(atom => [atom.id, atom]));
   const segments = ids.map(id => byId.get(id)).filter(Boolean);
   if (!segments.length && fallback) {
-    segments.push({ id: "", ordinal: 0, rawText: fallback, speakerRole: fallbackRole, speakerLabel: "抽取文本" });
+    segments.push({ id: "", ordinal: 0, rawText: fallback, speakerRole: fallbackRole, fallbackLabel });
   }
   if (!segments.length) return `<div class="topic-source-empty">未找到对应原始片段</div>`;
   return segments.map(segment => {
     const role = { interviewer: "面试官", candidate: "候选人", system_noise: "系统/噪声", unknown: "未知" }[segment.speakerRole] || "未知";
-    const locator = segment.startTime == null ? (segment.ordinal ? `S${String(segment.ordinal).padStart(4, "0")}` : "抽取文本") : formatDuration(segment.startTime);
+    const locator = segment.startTime == null ? (segment.ordinal ? `S${String(segment.ordinal).padStart(4, "0")}` : (segment.fallbackLabel || "无原文关联")) : formatDuration(segment.startTime);
     const locatorElement = record.audio && segment.startTime != null ? `<button type="button" class="topic-source-locator" data-seek="${segment.startTime}">${locator}</button>` : `<span class="topic-source-locator">${locator}</span>`;
-    return `<div class="topic-source-line"><span class="topic-source-role ${escapeHtml(segment.speakerRole || "unknown")}">${role}</span><p>${escapeHtml(segment.rawText || "")}</p>${locatorElement}</div>`;
+    const atoms = (segment.atomIds || []).map(id => atomMap.get(id)).filter(Boolean);
+    const previous = (record.segments || [])[Math.max(0, (record.segments || []).findIndex(item => item.id === segment.id) - 1)];
+    const canMergePrevious = segment.id && previous?.id && previous.id !== segment.id
+      && ids.includes(previous.id) && previous.speakerRole === segment.speakerRole;
+    const reasons = (segment.confirmationReasons || []).map(item => item.label || CONFIRMATION_REASON_LABELS[item.code] || item.code).filter(Boolean);
+    const splitAssignmentLabel = assignment === "question" ? "问题" : assignment === "answer" ? "回答" : "当前归属";
+    const defaultSplitMode = assignment === "conflict" ? "question_answer" : "preserve";
+    const boundaryEditor = state.structureEditingSegmentId === segment.id && atoms.length > 1
+      ? `<div class="source-boundary-editor" aria-label="选择拆分位置">
+          <div class="source-boundary-toolbar">
+            <label><span>拆分方式</span><select data-split-mode>
+              ${assignment !== "conflict" ? `<option value="preserve" ${defaultSplitMode === "preserve" ? "selected" : ""}>两侧仍为${splitAssignmentLabel}</option>` : ""}
+              <option value="question_answer" ${defaultSplitMode === "question_answer" ? "selected" : ""}>左侧问题 · 右侧回答</option>
+            </select></label>
+            <span>点击文字间的灰色竖线完成拆分</span>
+          </div>
+          <div class="source-boundary-atoms">${atoms.map((atom, index) => `<span class="source-atom">${escapeHtml(atom.rawText || "")}</span>${index < atoms.length - 1 ? `<button type="button" class="source-boundary-point" data-split-boundary data-segment-id="${segment.id}" data-turn-id="${turnId}" data-after-atom="${atom.id}" aria-label="从这里拆分" data-tooltip="从这里拆分"></button>` : ""}`).join("")}</div>
+        </div>`
+      : "";
+    return `<div class="topic-source-line">
+      <span class="topic-source-role ${escapeHtml(segment.speakerRole || "unknown")}">${role}</span>
+      <div class="topic-source-content">
+        <p>${escapeHtml(segment.rawText || "")}</p>
+        ${reasons.length ? `<span class="source-reason">${renderLucideIcon("triangle-alert")}${escapeHtml(reasons.join("、"))}</span>` : ""}
+        ${segment.id ? `<div class="source-structure-actions">
+          <label><span>说话人</span><select data-segment-role data-segment-id="${segment.id}">${[["interviewer", "面试官"], ["candidate", "候选人"], ["unknown", "未知"], ["system_noise", "噪声"]].map(([value, text]) => `<option value="${value}" ${segment.speakerRole === value ? "selected" : ""}>${text}</option>`).join("")}</select></label>
+          <label><span>归属</span><select data-source-assignment data-segment-id="${segment.id}" data-turn-id="${turnId}">${assignment === "conflict" ? `<option value="conflict" selected disabled>问题和回答（冲突）</option>` : ""}<option value="question" ${assignment === "question" ? "selected" : ""}>问题</option><option value="answer" ${assignment === "answer" ? "selected" : ""}>回答</option><option value="none">不关联</option></select></label>
+          ${atoms.length > 1 ? `<button type="button" class="text-action" data-toggle-boundary="${segment.id}">${renderLucideIcon("scissors")}${state.structureEditingSegmentId === segment.id ? "收起边界" : "拆分话轮"}</button>` : ""}
+          ${canMergePrevious ? `<button type="button" class="text-action" data-merge-previous data-segment-id="${segment.id}" data-previous-id="${previous.id}">${renderLucideIcon("git-merge")}合并上一话轮</button>` : ""}
+        </div>${boundaryEditor}` : ""}
+      </div>
+      ${locatorElement}
+    </div>`;
   }).join("");
 }
 
@@ -677,19 +784,23 @@ function topicReviewReasons(topic, record) {
   const reasons = [];
   topicTurns(topic).forEach(turn => {
     if (turn.confirmed) return;
-    const turnReasons = [];
+    const turnReasons = turnConfirmationReasons(turn);
     if (!String(turn.interviewerQuestion || "").trim()) turnReasons.push("问题内容缺失");
     if (!String(turn.candidateAnswer || "").trim()) turnReasons.push("未识别到回答");
-    if (turn.confidence === "low") turnReasons.push("识别置信度低");
     const segmentIds = [...(turn.questionSegmentIds || []), ...(turn.answerSegmentIds || [])];
     const segments = segmentIds.map(id => segmentMap.get(id)).filter(Boolean);
-    if (segments.some(segment => segment.speakerRole === "unknown")) turnReasons.push("说话人待确认");
-    if (segments.some(segment => segment.needsConfirmation)) turnReasons.push("原始片段质量待确认");
-    if (["conflict", "partial", "unverified"].includes(turn.provenanceStatus)) turnReasons.push("分块或引用结果冲突");
+    if (!turnReasons.length && segments.some(segment => segment.speakerRole === "unknown")) turnReasons.push("说话人身份不明确");
+    if (!turnReasons.length && segments.some(segment => segment.needsConfirmation)) turnReasons.push("原始片段质量待确认");
+    if (!turnReasons.length && ["conflict", "partial", "unverified", "fallback"].includes(turn.provenanceStatus)) turnReasons.push("分块或引用结果冲突");
+    if (!turnReasons.length && turn.confidence === "low") turnReasons.push("识别置信度低");
     if (turn.needsConfirmation && !turnReasons.length) turnReasons.push("问答边界或分类待确认");
     reasons.push(...turnReasons);
   });
   return [...new Set(reasons)];
+}
+
+function turnConfirmationReasons(turn) {
+  return [...new Set((turn?.confirmationReasons || []).map(reason => reason.label || CONFIRMATION_REASON_LABELS[reason.code] || reason.code).filter(Boolean))];
 }
 
 function topicReviewState(topic) {
@@ -752,7 +863,7 @@ function renderRunPage() {
       </div>
       <section class="surface agent-timeline">
         <div class="section-title">执行轨迹</div>
-        ${state.events.length ? state.events.map(renderEvent).join("") : `<div class="empty"><div class="empty-title">等待任务事件</div><p>连接建立后会显示阶段和工具状态，不展示模型隐藏思考。</p></div>`}
+        ${state.events.length ? compactRunEvents(state.events).map(renderEvent).join("") : `<div class="empty"><div class="empty-title">等待任务事件</div><p>连接建立后会显示阶段和工具状态，不展示模型隐藏思考。</p></div>`}
       </section>
     </section>`;
 }
@@ -768,7 +879,9 @@ function agentStage(key, agent, title, phase, detail = "", statusOverride = "") 
 
 function renderEvent(event) {
   const data = event.data || {};
-  const title = data.agent ? AGENT_LABELS[data.agent] || data.agent : data.tool || EVENT_LABELS[event.type] || event.type.replaceAll("_", " ");
+  const eventLabel = EVENT_LABELS[event.type] || event.type.replaceAll("_", " ");
+  const actor = data.tool || (data.agent ? AGENT_LABELS[data.agent] || data.agent : "");
+  const title = actor ? `${actor} · ${eventLabel}` : eventLabel;
   const metrics = [
     data.segmentCount != null ? `${data.segmentCount} 个片段` : "",
     data.questionCount != null ? `${data.questionCount} 个问题` : "",
@@ -779,10 +892,28 @@ function renderEvent(event) {
     data.round != null ? `第 ${data.round} 轮` : "",
     data.findingCount != null ? `${data.findingCount} 条发现` : "",
     data.revisionCount != null ? `${data.revisionCount} 次修订` : "",
+    data.evidenceCount != null ? `${data.evidenceCount} 条证据` : "",
+    data.hitCount != null ? `${data.hitCount} 条知识` : "",
+    data.sourceCount != null ? `${data.sourceCount} 个来源` : "",
+    data.score != null ? `评分 ${data.score}` : "",
     data.durationSeconds != null ? `耗时 ${Number(data.durationSeconds).toFixed(2)} 秒` : ""
   ].filter(Boolean).join(" · ");
   const detail = data.message || (data.hits != null ? `检索并校验 ${data.hits} 条证据` : metrics || data.status || "阶段事件已记录");
   return `<div class="timeline-row"><span class="timeline-index">${String(event.id).padStart(2, "0")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p></div><time>${formatTime(event.createdAt)}</time></div>`;
+}
+
+function compactRunEvents(events) {
+  const latestHeartbeat = new Map();
+  events.forEach((event, index) => {
+    if (event.type !== "AGENT_HEARTBEAT") return;
+    const data = event.data || {};
+    latestHeartbeat.set(`${data.agent || "agent"}:${data.attempt || 1}`, index);
+  });
+  return events.filter((event, index) => {
+    if (event.type !== "AGENT_HEARTBEAT") return true;
+    const data = event.data || {};
+    return latestHeartbeat.get(`${data.agent || "agent"}:${data.attempt || 1}`) === index;
+  });
 }
 
 function renderReviewPage() {
@@ -794,37 +925,42 @@ function renderReviewPage() {
   const questions = report.questions || [];
   const actions = report.actions || [];
   const quickReview = interview.reviewMode === "quick";
-  const provenanceLabel = interview.degraded ? "确定性降级报告" : interview.agentMode === "fixture" ? "Fixture 模拟报告" : "HelloAgents Agent 生成";
-  const provenanceClass = interview.degraded ? "degraded" : interview.agentMode === "fixture" ? "fixture" : "agent";
+  const nextFocus = String(interview.nextFocus || "").trim();
+  const nextFocusText = nextFocus.replace(/^下一场(?:面试)?重点[：:]\s*/, "");
   return `
     <section class="page report-page">
       ${renderSteps(4)}
-      <div class="page-header"><div><span class="eyebrow">EVIDENCE REVIEW</span><h1 class="page-title">${escapeHtml(interview.company)} · ${escapeHtml(interview.position)}</h1><p class="page-desc">${escapeHtml(interview.round || "未填写轮次")} · ${escapeHtml(modeLabel(interview.analysisMode))}</p></div><div class="filters"><button class="button secondary" data-nav="#/parse/${record.id}">编辑题卡</button><button class="button" id="exportReport">导出 Markdown</button></div></div>
-      <div class="summary-band"><div class="summary-heading"><div><span class="eyebrow">整场结论</span><h2>岗位信号与回答质量</h2></div><div class="report-badges"><span class="mode-badge ${provenanceClass}">${escapeHtml(provenanceLabel)}</span><span class="mode-badge ${quickReview ? "quick" : ""}">${quickReview ? "快速复盘 · 含未校对题卡" : "证据已审计"}</span></div></div><p>${escapeHtml(interview.summary || "暂无总结")}</p></div>
+      <div class="page-header"><div><span class="eyebrow">EVIDENCE REVIEW</span><h1 class="page-title">${escapeHtml(interview.company)} · ${escapeHtml(interview.position)}</h1><p class="page-desc">${escapeHtml(interview.round || "未填写轮次")} · ${escapeHtml(modeLabel(interview.analysisMode))}</p></div><div class="filters"><button class="button secondary" id="editReportCards">编辑题卡</button><button class="button" id="exportReport">导出 Markdown</button></div></div>
+      <div class="summary-band"><div class="summary-heading"><h2>整场复盘结论</h2>${quickReview ? `<span class="mode-badge quick">快速复盘·含未校对题卡</span>` : ""}</div><p>${escapeHtml(interview.summary || "暂无总结")}</p>${nextFocusText ? `<div class="summary-focus"><span>下一场重点</span><strong>${escapeHtml(nextFocusText)}</strong></div>` : ""}</div>
       ${renderScoreSection(interview.overallScores)}
       ${renderRiskSection(interview.topRisks || [])}
-      <section class="report-band"><div class="band-header"><div><span class="eyebrow">ACTION PLAN</span><h2>七天行动计划</h2></div></div><div class="action-list">${actions.map(action => renderAction(record, action)).join("")}</div></section>
-      <section class="report-band"><div class="band-header"><div><span class="eyebrow">QUESTION REVIEW</span><h2>逐题证据复盘</h2></div></div><div class="accordion">${questions.map(renderQuestionReview).join("")}</div></section>
-      <section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">REFLECTION AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">修订 ${Number(interview.auditRevisionCount || 0)} 次</span></div><ul>${(interview.auditNotes || []).map(note => `<li>${escapeHtml(note)}</li>`).join("")}</ul></section>
-      <div class="metadata-line">${escapeHtml(interview.latestAIMetadata?.provider || "--")} · ${escapeHtml(interview.latestAIMetadata?.model || "--")} · ${formatTime(interview.latestAIMetadata?.generatedAt)}</div>
+      <section class="report-band action-plan-band"><div class="band-header"><div><span class="eyebrow">ACTION PLAN</span><h2>七天行动计划</h2></div><span class="section-count">${actions.length} 项训练</span></div><div class="action-list">${actions.map(action => renderAction(record, action)).join("")}</div></section>
+      <section class="report-band question-review-band"><div class="band-header"><h2>逐题证据复盘</h2><span class="section-count">${questions.length} 个主题</span></div><div class="accordion">${questions.map((question, index) => renderQuestionReviewV2(question, index)).join("")}</div></section>
+      ${renderAuditSection(interview)}
+      <div class="metadata-line">${escapeHtml(interview.latestAIMetadata?.provider || "--")} · ${escapeHtml(interview.latestAIMetadata?.model || "--")} · ${formatDateMinute(interview.latestAIMetadata?.generatedAt)}</div>
     </section>`;
 }
 
 function renderScoreSection(scores = {}) {
-  return `<section class="report-band"><div class="band-header"><div><span class="eyebrow">SCORE</span><h2>五维评分</h2></div><div class="overall-score">${Number(scores.overall || 0).toFixed(1)}<span>/10</span></div></div><div class="score-grid">${Object.entries(SCORE_LABELS).filter(([key]) => key !== "overall").map(([key, label]) => `<div class="score-tile"><div><span>${label}</span><strong>${Number(scores[key] || 0).toFixed(1)}</strong></div><div class="score-bar"><span style="width:${Math.min(100, Number(scores[key] || 0) * 10)}%"></span></div></div>`).join("")}</div></section>`;
+  return `<section class="report-band score-band"><div class="band-header"><div><span class="eyebrow">SCORE</span><h2>五维评分</h2></div><div class="overall-score"><strong>${Number(scores.overall || 0).toFixed(1)}</strong><span>/10</span></div></div><div class="score-grid">${Object.entries(SCORE_LABELS).filter(([key]) => key !== "overall").map(([key, label]) => `<div class="score-tile"><div class="score-tile-heading"><span>${label}</span><strong>${Number(scores[key] || 0).toFixed(1)}</strong></div><div class="score-bar"><i style="width:${Math.min(100, Number(scores[key] || 0) * 10)}%"></i></div></div>`).join("")}</div></section>`;
 }
 
 function renderRiskSection(risks) {
-  return `<section class="report-band"><div class="band-header"><div><span class="eyebrow">TOP RISKS</span><h2>优先风险</h2></div></div><div class="risk-list">${risks.length ? risks.map((risk, index) => `<div class="risk-row"><span class="risk-rank">${index + 1}</span><div><strong class="risk-title">${escapeHtml(risk.title)}</strong><p>${escapeHtml(risk.reason)}</p></div><span class="tag ${risk.severity}">${risk.severity === "high" ? "高风险" : "需关注"}</span></div>`).join("") : `<p class="small">没有识别到突出风险。</p>`}</div></section>`;
+  return `<section class="report-band risk-band"><div class="band-header"><div><span class="eyebrow">FOCUS AREAS</span><h2>重点关注项</h2></div>${risks.length ? `<span class="section-count">${risks.length} 项</span>` : ""}</div><div class="risk-list">${risks.length ? risks.map((risk, index) => `<div class="risk-row"><span class="risk-rank">${String(index + 1).padStart(2, "0")}</span><div class="risk-copy"><strong class="risk-title">${escapeHtml(risk.title)}</strong><p>${escapeHtml(risk.reason)}</p></div><span class="risk-level ${escapeHtml(risk.severity || "medium")}">${risk.severity === "high" ? "重点关注" : "建议关注"}</span></div>`).join("") : `<div class="risk-empty">${renderLucideIcon("circle-check")}<div><strong>暂无需要特别关注的问题</strong><span>本场未发现需要单独列出的关注事项。</span></div></div>`}</div></section>`;
 }
 
 function renderAction(record, action) {
-  return `<label class="action-item"><input type="checkbox" data-action="${action.id}" ${action.completed ? "checked" : ""} /><span><strong>${escapeHtml(action.title)}</strong><span class="action-description">${escapeHtml(action.description || "")}</span></span><span class="tag ${action.priority}">${action.priority === "high" ? "高优先" : "中优先"}</span></label>`;
+  const dimension = SCORE_LABELS[action.dimension] || action.dimension || "综合训练";
+  const day = Math.max(1, Number(action.day || 1));
+  return `<label class="action-item ${action.completed ? "done" : ""}"><input class="action-check" type="checkbox" data-action="${action.id}" ${action.completed ? "checked" : ""} /><span class="action-copy"><span class="action-heading"><span class="action-day">第 ${day} 天</span><strong>${escapeHtml(action.title)}</strong><span class="action-priority ${escapeHtml(action.priority || "medium")}">${action.priority === "high" ? "高优先" : "中优先"}</span></span><span class="action-description">${escapeHtml(action.description || "")}</span><span class="action-meta"><span>${escapeHtml(dimension)}</span>${action.successCriterion ? `<span>完成标准：${escapeHtml(action.successCriterion)}</span>` : ""}</span></span></label>`;
 }
 
-function renderQuestionReview(question) {
+function renderQuestionReview(question, index = 0) {
   const expanded = state.expandedQuestionId === question.id;
-  return `<div class="accordion-item"><button class="accordion-button" data-expand="${question.id}"><span><strong>${String(question.order).padStart(2, "0")} ${escapeHtml(question.interviewerQuestion)}</strong><span class="meta-row"><span class="tag">${escapeHtml(question.questionType)}</span><span>${Number(question.scores?.overall || 0).toFixed(1)} 分</span></span></span><span>${expanded ? "−" : "+"}</span></button>${expanded ? `<div class="accordion-panel">
+  const score = Number(question.scores?.overall || 0);
+  const scoreClass = score >= 8 ? "strong" : score >= 6 ? "steady" : "attention";
+  const followUpCount = (question.followUpTurns || []).length;
+  return `<div class="accordion-item ${expanded ? "expanded" : ""}"><button class="accordion-button" data-expand="${question.id}" aria-expanded="${expanded}"><span class="question-review-index">${String(index + 1).padStart(2, "0")}</span><span class="question-review-copy"><strong>${escapeHtml(question.interviewerQuestion)}</strong><span class="meta-row"><span class="question-type-label">${escapeHtml(question.questionType)}</span>${followUpCount ? `<span>${followUpCount} 个追问</span>` : ""}</span></span><span class="question-review-score ${scoreClass}"><strong>${score.toFixed(1)}</strong><small>/10</small></span><span class="accordion-icon">${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span></button>${expanded ? `<div class="accordion-panel">
     ${reviewBlock("主题主回答", question.extractedAnswer || question.candidateAnswer)}
     ${(question.followUpTurns || []).length ? `<div class="review-block"><h4>追问对主题评分的影响</h4><div class="follow-up-review-list">${question.followUpTurns.map((turn, index) => `<div class="follow-up-review"><div><strong>追问 ${index + 1}：${escapeHtml(turn.interviewerQuestion)}</strong><span class="tag follow-up-impact">${escapeHtml(turn.followUpImpact || "待判断")}</span></div><p>${escapeHtml(turn.candidateAnswer || "未识别到回答")}</p></div>`).join("")}</div></div>` : ""}
     ${reviewBlock("AI 诊断", question.diagnosis)}
@@ -832,6 +968,141 @@ function renderQuestionReview(question) {
     <div class="review-block"><h4>证据来源</h4><div class="source-list">${(question.evidenceRefs || []).map(renderEvidenceRef).join("")}</div></div>
     ${renderStar(question.starRewrite || {})}
   </div>` : ""}</div>`;
+}
+
+function renderQuestionReviewV2(question, index = 0) {
+  const expanded = state.expandedQuestionId === question.id;
+  const score = Number(question.scores?.overall || 0);
+  const scoreClass = score >= 8 ? "strong" : score >= 6 ? "steady" : "attention";
+  const followUpCount = (question.followUpTurns || []).length;
+  const catalog = buildQuestionEvidenceCatalog(question);
+  return `<div class="accordion-item ${expanded ? "expanded" : ""}">
+    <button class="accordion-button" data-expand="${question.id}" aria-expanded="${expanded}">
+      <span class="question-review-index">${String(index + 1).padStart(2, "0")}</span>
+      <span class="question-review-copy"><strong>${escapeHtml(question.interviewerQuestion)}</strong><span class="meta-row"><span class="question-type-label">${escapeHtml(question.questionType)}</span>${followUpCount ? `<span>${followUpCount} 个追问</span>` : ""}</span></span>
+      <span class="question-review-score ${scoreClass}"><strong>${score.toFixed(1)}</strong><small>/10</small></span>
+      <span class="accordion-icon">${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span>
+    </button>
+    ${expanded ? `<div class="accordion-panel question-review-panel">${renderQuestionReviewTabs(question, catalog)}${renderQuestionReviewTabContent(question, catalog)}</div>` : ""}
+  </div>`;
+}
+
+function renderQuestionReviewTabs(question, catalog) {
+  const tabs = [
+    ["summary", "复盘摘要"],
+    ["scores", "评分依据"],
+    ["rewrite", "优化回答"],
+    ["evidence", `证据引用 ${catalog.items.length}`]
+  ];
+  return `<div class="question-review-tabs" role="tablist" aria-label="逐题复盘视图">${tabs.map(([key, label]) => `<button type="button" role="tab" class="question-review-tab ${state.questionReviewTab === key ? "active" : ""}" data-question-tab="${key}" aria-selected="${state.questionReviewTab === key}">${label}</button>`).join("")}</div>`;
+}
+
+function renderQuestionReviewTabContent(question, catalog) {
+  if (state.questionReviewTab === "scores") return renderQuestionScoreTab(question, catalog);
+  if (state.questionReviewTab === "evidence") return renderQuestionEvidenceTab(question, catalog);
+  if (state.questionReviewTab === "rewrite") return renderQuestionRewriteTab(question);
+  return renderQuestionSummaryTab(question);
+}
+
+function renderQuestionSummaryTab(question) {
+  const score = Number(question.scores?.overall || 0);
+  const level = score >= 8.5 ? "优秀" : score >= 7 ? "良好" : score >= 6 ? "合格" : "需要加强";
+  const answer = question.extractedAnswer || question.candidateAnswer || "暂无主回答";
+  const strengths = Array.isArray(question.strengths) ? question.strengths : [];
+  const weaknesses = Array.isArray(question.weaknesses) ? question.weaknesses : [];
+  const followUps = Array.isArray(question.followUpTurns) ? question.followUpTurns : [];
+  return `<div class="question-tab-panel summary-tab-panel" role="tabpanel">
+    <section class="question-verdict"><div><span>综合评价</span><strong>${level} · ${score.toFixed(1)}</strong></div><p>${escapeHtml(compactReportText(question.diagnosis || "暂无综合诊断", 220))}</p></section>
+    <div class="question-insight-grid">
+      ${renderQuestionInsightList("回答亮点", strengths, "strength")}
+      ${renderQuestionInsightList("需要加强", weaknesses, "improvement")}
+    </div>
+    <details class="question-reading-details"><summary><span>主回答原文</span><span>查看完整内容 ${renderLucideIcon("chevron-down")}</span></summary><p>${escapeHtml(answer)}</p></details>
+    ${followUps.length ? `<section class="question-followups-summary"><div class="question-subheading"><strong>追问记录</strong><span>${followUps.length} 条</span></div><div class="question-followup-list">${followUps.map((turn, followUpIndex) => `<details class="question-followup-row"><summary><span><small>追问 ${followUpIndex + 1}</small><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问")}</strong></span><span class="follow-up-impact">${escapeHtml(turn.followUpImpact || "待判断")}</span></summary><p>${escapeHtml(turn.candidateAnswer || "未识别到回答")}</p></details>`).join("")}</div></section>` : ""}
+    <details class="question-diagnosis-details"><summary>查看完整 Agent 诊断</summary><p>${escapeHtml(question.diagnosis || "暂无综合诊断")}</p>${question.roleFitDiagnosis?.summary ? `<div><strong>岗位匹配</strong><p>${escapeHtml(question.roleFitDiagnosis.summary)}</p></div>` : ""}</details>
+  </div>`;
+}
+
+function renderQuestionInsightList(title, items, type) {
+  const rows = items.length ? items.slice(0, 3) : [type === "strength" ? "暂无单独归纳的回答亮点" : "暂无需要单独列出的改进项"];
+  return `<section class="question-insight ${type}"><h4>${title}</h4><ul>${rows.map(item => `<li title="${escapeHtml(item)}"><span>${type === "strength" ? "✓" : "•"}</span><p>${escapeHtml(item)}</p></li>`).join("")}</ul></section>`;
+}
+
+function renderQuestionScoreTab(question, catalog) {
+  const rows = Array.isArray(question.scoreEvidence) ? question.scoreEvidence : [];
+  return `<div class="question-tab-panel" role="tabpanel"><div class="dimension-score-list">${rows.map(item => {
+    const refs = [...new Set((item.evidenceIds || []).map(id => catalog.idToLabel.get(id)).filter(Boolean))];
+    return `<div class="dimension-score-row"><span class="dimension-name">${escapeHtml(SCORE_LABELS[item.dimension] || item.dimension)}</span><span class="dimension-result"><strong>${Number(item.score || 0).toFixed(1)}</strong><small>${escapeHtml(item.level || "待判断")}</small></span><p>${escapeHtml(item.rationale || "暂无评分理由")}</p><span class="dimension-evidence-links">${refs.length ? refs.map(label => `<button type="button" data-question-tab="evidence" data-evidence-link="${label}">${label}</button>`).join("") : `<small>无直接引用</small>`}</span></div>`;
+  }).join("")}</div></div>`;
+}
+
+function buildQuestionEvidenceCatalog(question) {
+  const seen = new Map();
+  const items = [];
+  (question.evidenceRefs || []).forEach(ref => {
+    const key = [ref.sourceType || "unknown", ref.locator || "", String(ref.quote || "").trim()].join("|");
+    let item = seen.get(key);
+    if (!item) {
+      item = { ...ref, label: `E${items.length + 1}`, evidenceIds: [], usedBy: [] };
+      seen.set(key, item);
+      items.push(item);
+    }
+    if (ref.id) item.evidenceIds.push(ref.id);
+  });
+  const idToLabel = new Map();
+  items.forEach(item => item.evidenceIds.forEach(id => idToLabel.set(id, item.label)));
+  (question.scoreEvidence || []).forEach(scoreItem => {
+    (scoreItem.evidenceIds || []).forEach(id => {
+      const label = idToLabel.get(id);
+      const item = items.find(candidate => candidate.label === label);
+      const dimension = SCORE_LABELS[scoreItem.dimension] || scoreItem.dimension;
+      if (item && !item.usedBy.includes(dimension)) item.usedBy.push(dimension);
+    });
+  });
+  return { items, idToLabel };
+}
+
+function renderQuestionEvidenceTab(question, catalog) {
+  const sourceLabels = { transcript: "面试原文", resume: "简历", job_description: "岗位 JD", knowledge: "本地知识库", web: "联网来源" };
+  const sourceOrder = ["transcript", "resume", "job_description", "knowledge", "web"];
+  const groups = new Map();
+  catalog.items.forEach(item => {
+    const key = item.sourceType || "unknown";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  const orderedGroups = [...groups.entries()].sort(([a], [b]) => {
+    const left = sourceOrder.indexOf(a);
+    const right = sourceOrder.indexOf(b);
+    return (left < 0 ? 99 : left) - (right < 0 ? 99 : right);
+  });
+  const verifiedCount = catalog.items.filter(item => item.verified).length;
+  return `<div class="question-tab-panel" role="tabpanel"><div class="evidence-overview"><strong>${catalog.items.length} 条证据引用</strong><span>${verifiedCount === catalog.items.length ? "全部可回查" : `${verifiedCount} 条已回查`}</span></div><div class="evidence-source-groups">${orderedGroups.map(([sourceType, items], groupIndex) => `<details class="evidence-source-group" ${groupIndex === 0 ? "open" : ""}><summary><span>${escapeHtml(sourceLabels[sourceType] || sourceType)}</span><span>${items.length} 条 ${renderLucideIcon("chevron-down")}</span></summary><div>${items.map(item => renderCompactEvidenceRef(item, sourceLabels[sourceType] || sourceType)).join("")}</div></details>`).join("")}</div></div>`;
+}
+
+function renderCompactEvidenceRef(item, sourceLabel) {
+  const highlighted = state.questionEvidenceFocus === item.label;
+  return `<article class="compact-evidence-ref ${highlighted ? "highlighted" : ""}" data-evidence-ref="${item.label}"><div class="compact-evidence-heading"><span>${item.label}</span><strong>${escapeHtml(sourceLabel)}</strong><small>${item.verified ? "已回查" : "待核验"}</small></div><blockquote>${escapeHtml(item.quote || "暂无引用内容")}</blockquote><div class="compact-evidence-meta"><span>${escapeHtml(item.locator || "未记录位置")}</span>${item.usedBy.length ? `<span>用于：${escapeHtml(item.usedBy.join("、"))}</span>` : ""}</div></article>`;
+}
+
+function renderQuestionRewriteTab(question) {
+  const star = question.starRewrite || {};
+  const missing = Array.isArray(star.missingInformation) ? star.missingInformation : [];
+  return `<div class="question-tab-panel" role="tabpanel"><section class="optimized-answer"><span>优化后回答</span><p>${escapeHtml(star.fullAnswer || "暂无优化回答")}</p></section><details class="star-details"><summary>查看 STAR 拆解 ${renderLucideIcon("chevron-down")}</summary><div class="star-breakdown-list">${[["S", "情境", star.situation], ["T", "任务", star.task], ["A", "行动", star.action], ["R", "结果", star.result]].map(([letter, label, value]) => `<div><span>${letter}</span><strong>${label}</strong><p>${escapeHtml(value || "暂无")}</p></div>`).join("")}</div>${missing.length ? `<div class="rewrite-missing"><strong>仍待补充</strong><ul>${missing.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : ""}</details></div>`;
+}
+
+function compactReportText(value, limit = 220) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit).trim()}…` : text;
+}
+
+function renderAuditSection(interview) {
+  const notes = Array.isArray(interview.auditNotes) ? interview.auditNotes.filter(Boolean) : [];
+  const revisions = Number(interview.auditRevisionCount || 0);
+  const hasWarnings = notes.some(note => /无法|失败|占位|缺少|警告|冲突|未通过/.test(String(note)));
+  const statusTitle = hasWarnings ? "审计完成，包含系统说明" : "证据与结构检查已完成";
+  const statusText = hasWarnings ? "详细技术记录已收起，不影响报告主体阅读。" : "引用、评分与改写结果已进入 Reflection 审计记录。";
+  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">REFLECTION AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">修订 ${revisions} 次</span></div><div class="audit-summary ${hasWarnings ? "warning" : ""}">${renderLucideIcon(hasWarnings ? "triangle-alert" : "circle-check")}<div><strong>${statusTitle}</strong><p>${statusText}</p></div></div>${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(note)}</li>`).join("")}</ol></details>` : ""}</section>`;
 }
 
 function reviewBlock(title, content) {
@@ -848,11 +1119,191 @@ function renderStar(star) {
 }
 
 function renderTrendsPage() {
-  return `<section class="page"><div class="page-header"><div><span class="eyebrow">GROWTH MEMORY</span><h1 class="page-title">成长趋势</h1><p class="page-desc">跨多次面试观察五维变化和重复薄弱项。</p></div></div>${state.trends.length ? `<div class="trend-list">${state.trends.map(renderTrend).join("")}</div>` : `<div class="surface empty"><div class="empty-title">还没有成长快照</div><p>完成一次 Agent 复盘后，这里会生成本地趋势。</p><button class="button" data-nav="#/new">新建复盘</button></div>`}</section>`;
+  const selectedCount = state.selectedTrendIds.length;
+  const allSelected = state.trends.length > 0 && selectedCount === state.trends.length;
+  const bulkToolbar = state.trends.length ? `<div class="trend-bulk-toolbar">
+    <label class="trend-select-all"><input id="selectAllTrends" type="checkbox" ${allSelected ? "checked" : ""}><span>全选</span></label>
+    <button class="button trend-bulk-delete" id="deleteSelectedTrends" type="button" ${selectedCount ? "" : "disabled"}>${renderLucideIcon("trash-2")}<span>删除所选${selectedCount ? ` ${selectedCount}` : ""}</span></button>
+  </div>` : "";
+  const toolbar = `<div class="trend-page-actions"><button class="button" id="openTrendImport" type="button">${renderLucideIcon("plus")}<span>添加面试记录</span></button>${bulkToolbar}</div>`;
+  return `<section class="page"><div class="page-header"><div><span class="eyebrow">GROWTH MEMORY</span><h1 class="page-title">成长趋势</h1><p class="page-desc">跨多次面试观察五维变化和重复薄弱项。</p></div>${toolbar}</div>${state.trends.length ? `<div class="trend-list">${state.trends.map(renderTrend).join("")}</div>` : `<div class="surface empty"><div class="empty-title">还没有成长记录</div><p>从已完成的面试复盘中选择记录，加入后即可观察评分变化。</p><button class="button secondary" data-nav="#/new">新建复盘</button></div>`}${renderTrendImportDialog()}</section>`;
+}
+
+function renderTrendImportDialog() {
+  if (!state.trendImportDialogOpen) return "";
+  const selectedCount = state.selectedTrendCandidateIds.length;
+  let content = `<div class="trend-import-empty">没有可添加的面试记录</div>`;
+  if (state.trendImportLoading) {
+    content = `<div class="trend-import-empty">正在读取已完成的面试记录...</div>`;
+  } else if (state.trendCandidates.length) {
+    content = `<div class="trend-import-list">${state.trendCandidates.map(item => {
+      const added = Boolean(item.alreadyAdded);
+      const selected = state.selectedTrendCandidateIds.includes(item.interviewId);
+      const identity = `${item.company || "未填写公司"} · ${item.position || "未填写岗位"}`;
+      return `<label class="trend-import-row ${added ? "added" : ""}">
+        <input type="checkbox" data-select-trend-candidate="${escapeHtml(item.interviewId)}" ${selected ? "checked" : ""} ${added ? "disabled" : ""}>
+        <span class="trend-import-identity"><strong>${escapeHtml(identity)}</strong><small class="trend-import-meta"><span>面试 ${escapeHtml(formatDateOnly(item.interviewDate, "未填写日期"))}</span>${item.round ? `<span>${escapeHtml(item.round)}</span>` : ""}<span>报告生成 ${escapeHtml(formatDateMinute(item.completedAt, "未知时间"))}</span></small></span>
+        ${added ? `<span class="trend-import-state">已添加</span>` : `<span class="trend-import-score">${Number(item.scores?.overall || 0).toFixed(1)}</span>`}
+      </label>`;
+    }).join("")}</div>`;
+  }
+  return `<dialog class="review-dialog trend-import-dialog" id="trendImportDialog" aria-labelledby="trendImportTitle">
+    <div class="review-dialog-header"><h2 id="trendImportTitle">添加面试记录</h2><button type="button" class="icon-button" data-close-trend-import aria-label="关闭">${renderLucideIcon("x")}</button></div>
+    <div class="review-dialog-body"><p class="trend-import-description">仅显示已完成复盘且具有有效评分的记录。</p>${content}</div>
+    <div class="review-dialog-footer"><button type="button" class="button ghost" data-close-trend-import>取消</button><button type="button" class="button" id="importSelectedTrends" ${selectedCount && !state.trendImportLoading ? "" : "disabled"}>添加${selectedCount ? ` ${selectedCount} 场` : ""}</button></div>
+  </dialog>`;
 }
 
 function renderTrend(item) {
-  return `<div class="surface trend-item"><div class="trend-heading"><div><strong>${escapeHtml(item.company || "未填写公司")} · ${escapeHtml(item.position || "未填写岗位")}</strong><span>${escapeHtml(item.interview_date || "")}</span></div><span class="overall-score compact">${Number(item.scores?.overall || 0).toFixed(1)}</span></div><div class="mini-scores">${Object.entries(SCORE_LABELS).filter(([key]) => key !== "overall").map(([key, label]) => `<div><span>${label}</span><strong>${Number(item.scores?.[key] || 0).toFixed(1)}</strong></div>`).join("")}</div><div class="weak-row">重点提升：${(item.weakDimensions || []).map(key => SCORE_LABELS[key] || key).join("、")}</div></div>`;
+  const interviewDate = formatDateOnly(item.interview_date, "未填写日期");
+  const reportGeneratedAt = item.report_generated_at || item.created_at;
+  const reviewDate = formatDateMinute(reportGeneratedAt, "未知时间");
+  const selected = state.selectedTrendIds.includes(item.id);
+  const identity = `${item.company || "未填写公司"} · ${item.position || "未填写岗位"}`;
+  return `<div class="surface trend-item ${selected ? "selected" : ""}" data-trend-item="${escapeHtml(item.id)}">
+    <div class="trend-heading">
+      <label class="trend-select"><input type="checkbox" data-select-trend="${escapeHtml(item.id)}" ${selected ? "checked" : ""} aria-label="选择 ${escapeHtml(identity)} 的成长记录"></label>
+      <div class="trend-identity">
+        <strong>${escapeHtml(item.company || "未填写公司")} · ${escapeHtml(item.position || "未填写岗位")}</strong>
+        <span class="trend-dates"><time datetime="${escapeHtml(item.interview_date || "")}">面试 ${escapeHtml(interviewDate)}</time><span aria-hidden="true">·</span><time datetime="${escapeHtml(reportGeneratedAt || "")}">报告生成 ${escapeHtml(reviewDate)}</time></span>
+      </div>
+      <div class="trend-heading-actions">
+        <span class="overall-score compact" aria-label="综合评分 ${Number(item.scores?.overall || 0).toFixed(1)}">${Number(item.scores?.overall || 0).toFixed(1)}</span>
+        <button class="icon-button danger-icon trend-delete" type="button" data-delete-trend="${escapeHtml(item.id)}" aria-label="删除成长记录" data-tooltip="删除成长记录">${renderLucideIcon("trash-2")}</button>
+      </div>
+    </div>
+    <div class="mini-scores">${Object.entries(SCORE_LABELS).filter(([key]) => key !== "overall").map(([key, label]) => `<div><span>${label}</span><strong>${Number(item.scores?.[key] || 0).toFixed(1)}</strong></div>`).join("")}</div>
+    <div class="weak-row">重点提升：${(item.weakDimensions || []).map(key => SCORE_LABELS[key] || key).join("、") || "暂无"}</div>
+  </div>`;
+}
+
+function bindTrendsPage() {
+  document.querySelector("#openTrendImport")?.addEventListener("click", openTrendImportDialog);
+  document.querySelectorAll("[data-close-trend-import]").forEach(button => button.addEventListener("click", closeTrendImportDialog));
+  const importDialog = document.querySelector("#trendImportDialog");
+  importDialog?.addEventListener("cancel", event => { event.preventDefault(); closeTrendImportDialog(); });
+  importDialog?.addEventListener("close", () => { state.trendImportDialogOpen = false; });
+  document.querySelectorAll("[data-select-trend-candidate]").forEach(input => input.addEventListener("change", () => {
+    const selected = new Set(state.selectedTrendCandidateIds);
+    if (input.checked) selected.add(input.dataset.selectTrendCandidate);
+    else selected.delete(input.dataset.selectTrendCandidate);
+    state.selectedTrendCandidateIds = [...selected];
+    render();
+  }));
+  document.querySelector("#importSelectedTrends")?.addEventListener("click", importSelectedTrends);
+  const selectAll = document.querySelector("#selectAllTrends");
+  if (selectAll) {
+    selectAll.indeterminate = state.selectedTrendIds.length > 0 && state.selectedTrendIds.length < state.trends.length;
+    selectAll.addEventListener("change", event => {
+      state.selectedTrendIds = event.target.checked ? state.trends.map(item => item.id) : [];
+      render();
+    });
+  }
+  document.querySelectorAll("[data-select-trend]").forEach(input => input.addEventListener("change", () => {
+    const selected = new Set(state.selectedTrendIds);
+    if (input.checked) selected.add(input.dataset.selectTrend);
+    else selected.delete(input.dataset.selectTrend);
+    state.selectedTrendIds = [...selected];
+    render();
+  }));
+  document.querySelector("#deleteSelectedTrends")?.addEventListener("click", deleteSelectedTrends);
+  document.querySelectorAll("[data-delete-trend]").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("确定从成长趋势中删除这条记录吗？原始面试材料和复盘报告不会被删除。")) return;
+    button.disabled = true;
+    try {
+      await api(`/api/v1/profile/trends/${button.dataset.deleteTrend}`, { method: "DELETE" });
+      state.trends = state.trends.filter(item => item.id !== button.dataset.deleteTrend);
+      state.selectedTrendIds = state.selectedTrendIds.filter(id => id !== button.dataset.deleteTrend);
+      toast("成长记录已删除");
+      render();
+    } catch (error) {
+      button.disabled = false;
+      setError(readableError(error));
+    }
+  }));
+}
+
+async function openTrendImportDialog() {
+  state.error = "";
+  state.trendImportDialogOpen = true;
+  state.trendImportLoading = true;
+  state.selectedTrendCandidateIds = [];
+  render();
+  try {
+    const result = await api("/api/v1/profile/trends/candidates");
+    state.trendCandidates = visibleTrendCandidates(result.candidates || []);
+  } catch (error) {
+    state.trendImportDialogOpen = false;
+    setError(readableError(error));
+    return;
+  } finally {
+    state.trendImportLoading = false;
+  }
+  render();
+}
+
+function closeTrendImportDialog() {
+  state.trendImportDialogOpen = false;
+  state.selectedTrendCandidateIds = [];
+  document.querySelector("#trendImportDialog")?.close();
+  render();
+}
+
+async function importSelectedTrends() {
+  const interviewIds = [...state.selectedTrendCandidateIds];
+  if (!interviewIds.length) return;
+  state.trendImportLoading = true;
+  render();
+  try {
+    const result = await api("/api/v1/profile/trends/import", { method: "POST", body: { interviewIds } });
+    const [trends, candidates] = await Promise.all([
+      api("/api/v1/profile/trends"), api("/api/v1/profile/trends/candidates")
+    ]);
+    state.trends = trends.snapshots || [];
+    state.trendCandidates = visibleTrendCandidates(candidates.candidates || []);
+    state.selectedTrendCandidateIds = [];
+    state.trendImportDialogOpen = false;
+    toast(result.addedCount ? `已添加 ${result.addedCount} 场面试记录` : "所选面试已在成长趋势中");
+  } catch (error) {
+    setError(readableError(error));
+  } finally {
+    state.trendImportLoading = false;
+  }
+  render();
+}
+
+function visibleTrendCandidates(candidates) {
+  const existingRecordIds = new Set(state.records.map(record => record.id));
+  return candidates
+    .filter(item => existingRecordIds.has(item.interviewId))
+    .sort((left, right) => {
+      const leftDate = String(left.interviewDate || "");
+      const rightDate = String(right.interviewDate || "");
+      if (leftDate && !rightDate) return -1;
+      if (!leftDate && rightDate) return 1;
+      const interviewDateOrder = rightDate.localeCompare(leftDate);
+      if (interviewDateOrder) return interviewDateOrder;
+      return String(right.completedAt || "").localeCompare(String(left.completedAt || ""));
+    });
+}
+
+async function deleteSelectedTrends() {
+  const snapshotIds = state.selectedTrendIds.filter(id => state.trends.some(item => item.id === id));
+  if (!snapshotIds.length) return;
+  if (!confirm(`确定删除所选 ${snapshotIds.length} 条成长记录吗？原始面试材料和复盘报告不会被删除。`)) return;
+  const button = document.querySelector("#deleteSelectedTrends");
+  if (button) button.disabled = true;
+  try {
+    const result = await api("/api/v1/profile/trends/delete-batch", { method: "POST", body: { snapshotIds } });
+    const deletedIds = new Set(snapshotIds);
+    state.trends = state.trends.filter(item => !deletedIds.has(item.id));
+    state.selectedTrendIds = [];
+    toast(`已删除 ${result.deletedCount || snapshotIds.length} 条成长记录`);
+    render();
+  } catch (error) {
+    if (button) button.disabled = false;
+    setError(readableError(error));
+  }
 }
 
 function renderSteps(active) {
@@ -872,11 +1323,14 @@ function renderMissing() {
 function bindCommonEvents() {
   document.querySelectorAll("[data-nav]").forEach(button => button.addEventListener("click", () => { location.hash = button.dataset.nav; }));
   document.querySelectorAll("[data-delete]").forEach(button => button.addEventListener("click", async () => {
-    if (!confirm("将删除本机中的面试材料、音频、题卡和报告，确定继续吗？")) return;
+    if (!confirm("将删除本机中的面试材料、音频、题卡、报告和对应的成长趋势记录，确定继续吗？")) return;
     try {
       await api(`/api/v1/interviews/${button.dataset.delete}`, { method: "DELETE" });
       state.records = state.records.filter(item => item.id !== button.dataset.delete);
+      state.trends = state.trends.filter(item => item.interview_id !== button.dataset.delete);
+      state.selectedTrendIds = state.selectedTrendIds.filter(id => state.trends.some(item => item.id === id));
       persistRecords();
+      toast("面试记录及对应成长趋势已删除");
       render();
     } catch (error) {
       setError(readableError(error));
@@ -889,6 +1343,7 @@ function bindRouteEvents() {
   if (state.route.name === "parse") bindParsePage();
   if (state.route.name === "run") bindRunPage();
   if (state.route.name === "review") bindReviewPage();
+  if (state.route.name === "trends") bindTrendsPage();
 }
 
 function bindNewPage() {
@@ -1057,14 +1512,22 @@ function bindParsePage() {
     const topic = record?.topics?.find(item => item.id === event.currentTarget.dataset.id);
     if (!topic) return;
     const data = new FormData(event.currentTarget);
-    topic.title = String(data.get("topicTitle") || topic.title).trim();
-    topic.mainTurn.topicTitle = topic.title;
-    topic.mainTurn.questionType = String(data.get("questionType") || "其他");
+    const nextTitle = String(data.get("topicTitle") || topic.title).trim();
+    const nextQuestionType = String(data.get("questionType") || "其他");
+    const metadataChanged = nextTitle !== topic.title || nextQuestionType !== topic.mainTurn.questionType;
+    let contentChanged = false;
+    if (metadataChanged) {
+      topic.title = nextTitle;
+      topic.mainTurn.topicTitle = nextTitle;
+      topic.mainTurn.questionType = nextQuestionType;
+    }
     event.currentTarget.querySelectorAll("[data-turn-editor]").forEach(editor => {
       const turn = findQuestion(record, editor.dataset.turnEditor);
       if (!turn) return;
       const question = editor.querySelector('[data-edit-field="question"]')?.value.trim() || "";
       const answer = editor.querySelector('[data-edit-field="answer"]')?.value.trim() || "";
+      if (question === String(turn.interviewerQuestion || "").trim() && answer === String(turn.candidateAnswer || "").trim()) return;
+      contentChanged = true;
       turn.editedQuestion = question === turn.extractedQuestion ? "" : question;
       turn.editedAnswer = answer === turn.extractedAnswer ? "" : answer;
       turn.interviewerQuestion = question;
@@ -1073,9 +1536,17 @@ function bindParsePage() {
       turn.needsConfirmation = !question;
       turn.confirmed = false;
     });
+    if (!metadataChanged && !contentChanged) {
+      state.editingTurnId = null;
+      toast(record.report ? "内容未发生变化，原复盘报告仍可使用" : "内容未发生变化");
+      render();
+      return;
+    }
+    if (metadataChanged) [topic.mainTurn, ...topic.followUps].forEach(turn => { turn.confirmed = false; });
     topic.reviewStatus = "unchecked";
     record.updatedAt = new Date().toISOString();
     syncFlatQuestions(record);
+    markReportEditDirty(record);
     saveRecord(record);
     state.editingTurnId = null;
     toast("修改已保存，请重新确认本主题");
@@ -1104,6 +1575,17 @@ function bindParsePage() {
   document.querySelector("[data-cancel-merge]")?.addEventListener("click", () => document.querySelector(".topic-merge")?.removeAttribute("open"));
   document.querySelector("#mergeTopic")?.addEventListener("click", mergeSelectedTopic);
   document.querySelectorAll("[data-seek]").forEach(button => button.addEventListener("click", () => seekAudio(button.dataset.seek)));
+  document.querySelectorAll("[data-toggle-boundary]").forEach(button => button.addEventListener("click", () => {
+    state.structureEditingSegmentId = state.structureEditingSegmentId === button.dataset.toggleBoundary ? null : button.dataset.toggleBoundary;
+    render();
+  }));
+  document.querySelectorAll("[data-split-boundary]").forEach(button => button.addEventListener("click", () => {
+    const mode = button.closest(".source-boundary-editor")?.querySelector("[data-split-mode]")?.value || "preserve";
+    splitSourceSegment(button.dataset.segmentId, button.dataset.afterAtom, button.dataset.turnId, mode);
+  }));
+  document.querySelectorAll("[data-merge-previous]").forEach(button => button.addEventListener("click", () => mergeSourceSegments(button.dataset.previousId, button.dataset.segmentId)));
+  document.querySelectorAll("[data-segment-role]").forEach(select => select.addEventListener("change", () => updateSourceRole(select.dataset.segmentId, select.value)));
+  document.querySelectorAll("[data-source-assignment]").forEach(select => select.addEventListener("change", () => reassignSourceSegment(select.dataset.turnId, select.dataset.segmentId, select.value)));
   document.querySelectorAll('input[name="reviewMode"]').forEach(input => input.addEventListener("change", event => {
     state.reviewMode = event.currentTarget.value;
     state.error = "";
@@ -1115,6 +1597,12 @@ function bindParsePage() {
     render();
   });
   document.querySelector("#openReviewDialog")?.addEventListener("click", openReviewDialog);
+  document.querySelector("#returnToReport")?.addEventListener("click", () => {
+    const record = currentRecord();
+    if (!record?.report) return;
+    if (state.editingTurnId && !confirm("当前编辑内容尚未保存，确定返回复盘报告吗？")) return;
+    location.hash = `#/review/${record.id}`;
+  });
   document.querySelectorAll("[data-close-review-dialog]").forEach(button => button.addEventListener("click", closeReviewDialog));
   document.querySelector("[data-continue-review]")?.addEventListener("click", () => {
     closeReviewDialog();
@@ -1144,14 +1632,27 @@ function updateTopicMetadata(changes) {
   const record = currentRecord();
   const topic = record?.topics?.find(item => item.id === state.selectedQuestionId);
   if (!topic) return;
+  let changed = false;
   if (changes.title != null) {
-    topic.title = String(changes.title || topic.title).trim();
-    topic.mainTurn.topicTitle = topic.title;
+    const nextTitle = String(changes.title || topic.title).trim();
+    if (nextTitle !== topic.title) {
+      topic.title = nextTitle;
+      topic.mainTurn.topicTitle = nextTitle;
+      changed = true;
+    }
   }
-  if (changes.questionType != null) topic.mainTurn.questionType = String(changes.questionType || "其他");
+  if (changes.questionType != null) {
+    const nextQuestionType = String(changes.questionType || "其他");
+    if (nextQuestionType !== topic.mainTurn.questionType) {
+      topic.mainTurn.questionType = nextQuestionType;
+      changed = true;
+    }
+  }
+  if (!changed) return;
   [topic.mainTurn, ...topic.followUps].forEach(turn => { turn.confirmed = false; });
   topic.reviewStatus = "unchecked";
   syncFlatQuestions(record);
+  markReportEditDirty(record);
   saveRecord(record);
   render();
 }
@@ -1234,6 +1735,7 @@ function confirmCurrentTopic() {
   });
   topic.reviewStatus = "confirmed";
   syncFlatQuestions(record);
+  markReportEditDirty(record);
   saveRecord(record);
   state.error = "";
   const index = record.topics.indexOf(topic);
@@ -1268,6 +1770,10 @@ function locatePendingItem() {
 async function startAgentRun() {
   const record = currentRecord();
   if (!record?.questions?.length) return;
+  if (state.route.params.from === "report" && !record.reportEditDirty) {
+    setError("题卡内容没有变化，无需重新生成复盘报告");
+    return;
+  }
   const allTopicsReviewed = record.topics?.every(topicIsReviewed);
   const reviewMode = allTopicsReviewed ? "full" : "quick";
   if (reviewMode === "quick" && !state.acknowledgeUnreviewed) {
@@ -1308,6 +1814,8 @@ async function startAgentRun() {
     record.reviewMode = reviewMode;
     record.status = "reviewing";
     record.phase = "queued";
+    record.runError = "";
+    record.failureCode = "";
     record.updatedAt = new Date().toISOString();
     saveRecord(record);
     state.loading = false;
@@ -1320,8 +1828,9 @@ async function startAgentRun() {
 }
 
 async function loadParseResult(record) {
-  const result = await api(`/api/v1/interviews/${record.id}/segments`);
+  const result = await api(`/api/v1/interviews/${record.id}/segments?includeAtoms=true`);
   record.segments = result.segments || [];
+  record.atoms = result.atoms || [];
   record.topics = (result.topics || []).map(topic => ({
     ...topic,
     mainTurn: normalizeQuestionRecord(topic.mainTurn),
@@ -1329,7 +1838,7 @@ async function loadParseResult(record) {
   }));
   record.audio = result.audio || null;
   record.unresolvedCount = Number(result.unresolvedCount || 0);
-  record.status = "waiting_confirmation";
+  record.status = record.report && !record.reportEditDirty ? "completed" : "waiting_confirmation";
   record.phase = "completed";
   record.parseError = "";
   syncFlatQuestions(record);
@@ -1395,6 +1904,12 @@ function syncFlatQuestions(record) {
   record.questionCount = record.topics?.length || 0;
 }
 
+function markReportEditDirty(record) {
+  if (!record?.report) return;
+  record.reportEditDirty = true;
+  record.status = "waiting_confirmation";
+}
+
 function splitFollowUp(questionId) {
   const record = currentRecord();
   const source = record?.topics?.find(topic => topic.followUps.some(item => item.id === questionId));
@@ -1409,6 +1924,7 @@ function splitFollowUp(questionId) {
   record.topics.sort((a, b) => a.mainTurn.order - b.mainTurn.order);
   state.selectedQuestionId = turn.id;
   syncFlatQuestions(record);
+  markReportEditDirty(record);
   saveRecord(record);
   toast("追问已拆为独立主题，旧报告将在保存后失效");
   render();
@@ -1436,6 +1952,7 @@ function mergeSelectedTopic() {
   state.selectedQuestionId = target.id;
   record.updatedAt = new Date().toISOString();
   syncFlatQuestions(record);
+  markReportEditDirty(record);
   saveRecord(record);
   render();
   toast("主题已合并", {
@@ -1447,6 +1964,7 @@ function mergeSelectedTopic() {
       state.selectedQuestionId = previousSelectedId;
       latest.updatedAt = new Date().toISOString();
       syncFlatQuestions(latest);
+      markReportEditDirty(latest);
       saveRecord(latest);
       render();
       toast("已撤销主题合并");
@@ -1460,6 +1978,111 @@ function seekAudio(value) {
   if (!audio || !Number.isFinite(seconds)) return;
   audio.currentTime = Math.max(0, seconds);
   audio.play().catch(() => {});
+}
+
+async function splitSourceSegment(segmentId, afterAtomId, turnId, mode = "preserve") {
+  const record = currentRecord();
+  if (!record || !segmentId || !afterAtomId) return;
+  state.loading = true;
+  try {
+    const body = { afterAtomId };
+    if (mode === "question_answer") {
+      body.turnId = turnId;
+      body.leftAssignment = "question";
+      body.rightAssignment = "answer";
+    }
+    const result = await api(`/api/v1/interviews/${record.id}/segments/${segmentId}/split`, {
+      method: "POST", body
+    });
+    applyStructureResult(record, result);
+    toast(mode === "question_answer" ? "已拆成问题和回答，请检查内容" : "话轮已拆分，相关题卡需要重新确认");
+  } catch (error) {
+    setError(readableError(error));
+  } finally {
+    state.loading = false;
+  }
+}
+
+async function mergeSourceSegments(previousId, segmentId) {
+  const record = currentRecord();
+  if (!record || !previousId || !segmentId) return;
+  state.loading = true;
+  try {
+    const result = await api(`/api/v1/interviews/${record.id}/segments/merge`, {
+      method: "POST", body: { segmentIds: [previousId, segmentId] }
+    });
+    applyStructureResult(record, result);
+    toast("相邻话轮已合并，相关题卡需要重新确认");
+  } catch (error) {
+    setError(readableError(error));
+  } finally {
+    state.loading = false;
+  }
+}
+
+async function updateSourceRole(segmentId, speakerRole) {
+  const record = currentRecord();
+  if (!record || !segmentId) return;
+  try {
+    const result = await api(`/api/v1/interviews/${record.id}/segments`, {
+      method: "PATCH", body: { segments: [{ id: segmentId, speakerRole, needsConfirmation: speakerRole === "unknown" }] }
+    });
+    record.segments = result.segments || record.segments;
+    record.unresolvedCount = Number(result.unresolvedCount || 0);
+    markReportEditDirty(record);
+    if (!record.report) record.status = "waiting_confirmation";
+    saveRecord(record);
+    toast("说话人已更新");
+    render();
+  } catch (error) {
+    setError(readableError(error));
+  }
+}
+
+async function reassignSourceSegment(turnId, segmentId, assignment) {
+  const record = currentRecord();
+  const turn = findQuestion(record, turnId);
+  if (!record || !turn || !segmentId) return;
+  turn.questionSegmentIds = (turn.questionSegmentIds || []).filter(id => id !== segmentId);
+  turn.answerSegmentIds = (turn.answerSegmentIds || []).filter(id => id !== segmentId);
+  if (assignment === "question") turn.questionSegmentIds.push(segmentId);
+  if (assignment === "answer") turn.answerSegmentIds.push(segmentId);
+  const order = new Map((record.segments || []).map(item => [item.id, item.ordinal]));
+  turn.questionSegmentIds.sort((left, right) => (order.get(left) || 0) - (order.get(right) || 0));
+  turn.answerSegmentIds.sort((left, right) => (order.get(left) || 0) - (order.get(right) || 0));
+  turn.confirmed = false;
+  turn.provenanceStatus = "edited";
+  turn.confirmationReasons = (turn.confirmationReasons || []).filter(reason => !["QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS", "ANSWER_MISSING", "REFERENCE_VALIDATION_FAILED"].includes(reason.code));
+  turn.needsConfirmation = !turn.questionSegmentIds.length || Boolean(turn.confirmationReasons.length);
+  syncFlatQuestions(record);
+  try {
+    await api(`/api/v1/interviews/${record.id}/questions`, { method: "PATCH", body: { questions: record.questions } });
+    await loadParseResult(record);
+    markReportEditDirty(record);
+    if (!record.report) record.status = "waiting_confirmation";
+    saveRecord(record);
+    toast("问答归属已更新，请重新确认主题");
+    render();
+  } catch (error) {
+    setError(readableError(error));
+  }
+}
+
+function applyStructureResult(record, result) {
+  record.segments = result.segments || [];
+  record.atoms = result.atoms || record.atoms || [];
+  record.topics = (result.topics || []).map(topic => ({
+    ...topic,
+    mainTurn: normalizeQuestionRecord(topic.mainTurn),
+    followUps: (topic.followUps || []).map(normalizeQuestionRecord)
+  }));
+  record.unresolvedCount = Number(result.unresolvedCount || 0);
+  markReportEditDirty(record);
+  if (!record.report) record.status = "waiting_confirmation";
+  state.structureEditingSegmentId = null;
+  syncFlatQuestions(record);
+  saveRecord(record);
+  render();
 }
 
 function bindRunPage() {
@@ -1483,6 +2106,15 @@ function connectEventSource() {
     if (type === "AUDIT_COMPLETED") {
       record.runProgress ||= {};
       record.runProgress.auditRound = Number(item.data.round || 0);
+      record.runProgress.checkpoint ||= {};
+      if (item.data.accepted) record.runProgress.checkpoint.auditAccepted = true;
+    }
+    if (type === "RUN_RESUMED") {
+      record.status = "reviewing";
+      record.phase = "resuming";
+      record.runError = "";
+      record.failureCode = "";
+      state.error = "";
     }
     if (type === "TOPIC_REVISION_COMPLETED") {
       record.runProgress ||= {};
@@ -1496,10 +2128,20 @@ function connectEventSource() {
     }
     if (type === "RUN_FAILED") {
       record.status = "failed";
-      record.phase = "failed";
+      record.phase = item.data.phase || record.phase || "failed";
       record.failureCode = item.data.code || "AGENT_FAILED";
       record.runError = item.data.message || "Agent 执行失败";
       closeEventSource();
+      try {
+        const latest = await api(`/api/v1/runs/${record.runId}`);
+        record.phase = latest.phase || record.phase;
+        record.runProgress = latest.progress || record.runProgress || {};
+        record.runError = latest.error || record.runError;
+        record.failureCode = latest.failure_code || record.failureCode;
+        record.agentArtifacts = latest.artifacts || record.agentArtifacts || [];
+      } catch (error) {
+        console.warn("Unable to refresh failed Agent run state.", error);
+      }
     }
     if (type === "RUN_FINISHED") {
       record.status = "completed";
@@ -1531,6 +2173,9 @@ async function resumeRun() {
     await api(`/api/v1/runs/${record.runId}/resume`, { method: "POST" });
     record.status = "reviewing";
     record.phase = "resuming";
+    record.runError = "";
+    record.failureCode = "";
+    state.error = "";
     saveRecord(record);
     render();
   } catch (error) {
@@ -1564,16 +2209,37 @@ async function loadReport(record) {
   record.actions = report.actions || [];
   record.status = "completed";
   record.questionCount = report.questions.length;
+  record.reportEditDirty = false;
   record.updatedAt = new Date().toISOString();
   saveRecord(record);
 }
 
 function bindReviewPage() {
-  document.querySelectorAll("[data-expand]").forEach(button => button.addEventListener("click", () => { state.expandedQuestionId = state.expandedQuestionId === button.dataset.expand ? null : button.dataset.expand; render(); }));
+  document.querySelector("#editReportCards")?.addEventListener("click", () => {
+    const record = currentRecord();
+    if (!record?.report) return;
+    if (typeof record.reportEditDirty !== "boolean") record.reportEditDirty = false;
+    saveRecord(record);
+    location.hash = `#/parse/${record.id}?from=report`;
+  });
+  document.querySelectorAll("[data-expand]").forEach(button => button.addEventListener("click", () => {
+    const nextId = state.expandedQuestionId === button.dataset.expand ? null : button.dataset.expand;
+    state.expandedQuestionId = nextId;
+    if (nextId) state.questionReviewTab = "summary";
+    state.questionEvidenceFocus = "";
+    render();
+  }));
+  document.querySelectorAll("[data-question-tab]").forEach(button => button.addEventListener("click", () => {
+    state.questionReviewTab = button.dataset.questionTab;
+    state.questionEvidenceFocus = button.dataset.evidenceLink || "";
+    render();
+    if (state.questionEvidenceFocus) requestAnimationFrame(() => document.querySelector(`[data-evidence-ref="${state.questionEvidenceFocus}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+  }));
   document.querySelectorAll("[data-action]").forEach(input => input.addEventListener("change", () => {
     const record = currentRecord();
     const action = record?.report?.actions?.find(item => item.id === input.dataset.action);
     if (action) action.completed = input.checked;
+    input.closest(".action-item")?.classList.toggle("done", input.checked);
     saveRecord(record);
   }));
   document.querySelector("#exportReport")?.addEventListener("click", exportReport);
@@ -1660,6 +2326,37 @@ function formatTime(value) {
   if (!value) return "--";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDateOnly(value, fallback = "--") {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10) || fallback;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatDateTime(value, fallback = "--") {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ").slice(0, 19) || fallback;
+  const day = formatDateOnly(value, fallback);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatDateMinute(value, fallback = "--") {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ").slice(0, 16) || fallback;
+  const day = formatDateOnly(value, fallback);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${day} ${hours}:${minutes}`;
 }
 
 function formatDuration(value) {

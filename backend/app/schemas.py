@@ -55,10 +55,15 @@ class QuestionCard(APIModel):
     edited_answer: str = Field(default="", alias="editedAnswer")
     topic_title: str = Field(default="", alias="topicTitle")
     needs_confirmation: bool = Field(default=False, alias="needsConfirmation")
-    provenance_status: Literal["source", "edited", "legacy"] = Field(default="source", alias="provenanceStatus")
+    provenance_status: Literal["source", "edited", "legacy", "conflict", "partial", "unverified", "fallback"] = Field(default="source", alias="provenanceStatus")
     follow_up_impact: str = Field(default="", alias="followUpImpact")
     question_segment_ids: list[str] = Field(default_factory=list, alias="questionSegmentIds")
     answer_segment_ids: list[str] = Field(default_factory=list, alias="answerSegmentIds")
+    confidence_score: float = Field(default=75, ge=0, le=100, alias="confidenceScore")
+    raw_confidence_score: float = Field(default=75, ge=0, le=100, alias="rawConfidenceScore")
+    confidence_details: dict[str, Any] = Field(default_factory=dict, alias="confidenceDetails")
+    confirmation_reasons: list[dict[str, Any]] = Field(default_factory=list, alias="confirmationReasons")
+    parse_method: str = Field(default="legacy", alias="parseMethod")
 
 
 class QuestionPatch(APIModel):
@@ -79,6 +84,17 @@ class TranscriptSegmentUpdate(APIModel):
 
 class TranscriptSegmentPatch(APIModel):
     segments: list[TranscriptSegmentUpdate]
+
+
+class TranscriptSegmentSplitRequest(StrictModel):
+    after_atom_id: str = Field(alias="afterAtomId")
+    turn_id: str | None = Field(default=None, alias="turnId")
+    left_assignment: Literal["question", "answer", "none"] | None = Field(default=None, alias="leftAssignment")
+    right_assignment: Literal["question", "answer", "none"] | None = Field(default=None, alias="rightAssignment")
+
+
+class TranscriptSegmentMergeRequest(StrictModel):
+    segment_ids: list[str] = Field(min_length=2, alias="segmentIds")
 
 
 class InterviewImport(APIModel):
@@ -235,6 +251,14 @@ class ReviewRunCreate(APIModel):
     review_mode: Literal["full", "quick"] = Field(default="full", alias="reviewMode")
     acknowledge_unreviewed: bool = Field(default=False, alias="acknowledgeUnreviewed")
     acknowledge_unresolved: bool = Field(default=False, alias="acknowledgeUnresolved")
+
+
+class GrowthSnapshotDeleteBatch(APIModel):
+    snapshot_ids: list[str] = Field(min_length=1, max_length=1000, alias="snapshotIds")
+
+
+class GrowthSnapshotImportBatch(APIModel):
+    interview_ids: list[str] = Field(min_length=1, max_length=1000, alias="interviewIds")
 
 
 class RunEvent(APIModel):

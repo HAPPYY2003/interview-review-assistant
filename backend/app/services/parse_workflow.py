@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from backend.app.agents.runtime import HelloAgentsRuntime
 from backend.app.config import Settings
 from backend.app.database import Database
@@ -14,13 +16,24 @@ from backend.app.services.audio import DeepgramTranscriptionProvider, deepgram_s
 from backend.app.services.evidence import infer_topic_title, normalize_question_type
 from backend.app.services.transcript import (
     build_question_cards,
-    chunk_segments,
-    confidence_label,
     map_speaker_roles,
-    merge_worker_cards,
-    segment_text,
     validate_question_cards,
     validate_segments,
+)
+from backend.app.services.transcript_structure import (
+    ConfidenceAssessment,
+    ConfirmationReasonCode,
+    QuestionTurnBatch,
+    TranscriptProfile,
+    UtteranceBatch,
+    atomize_text,
+    atoms_from_audio_segments,
+    calculate_turn_confidence,
+    chunk_atoms,
+    chunk_utterances,
+    fallback_utterances,
+    profile_transcript,
+    utterances_from_submission,
 )
 from backend.app.tools.parse_tools import build_parse_tools
 
@@ -38,6 +51,9 @@ class ParsePipelineContext:
         self.artifact_dir = self.settings.data_dir / "parse-runs" / self.parse_run_id
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.inspection: dict[str, Any] | None = None
+        self.raw_source = ""
+        self.profile: TranscriptProfile | None = None
+        self.atoms: list[dict[str, Any]] = []
         self.segments: list[dict[str, Any]] = []
         self.questions: list[dict[str, Any]] = []
         self.validation_issues: list[dict[str, str]] = []
@@ -70,17 +86,34 @@ class ParsePipelineContext:
         self.inspect()
         if not self.is_audio:
             text = self.material.get("text") or self.interview.get("raw_transcript", "")
-            self.segments = self._scope_segment_ids(segment_text(text))
-            return {"artifactId": self.parse_run_id, "segmentCount": len(self.segments), "provider": "text"}
+            self.raw_source = text
+            self.profile = profile_transcript(text)
+            self.atoms = self._scope_atom_ids(atomize_text(text, self.profile))
+            self.segments = self._scope_segment_ids(fallback_utterances(self.atoms, self.profile, text))
+            self._write_json("profile.json", self.profile.as_dict())
+            self._write_json("atoms.json", self.atoms)
+            return {
+                "artifactId": self.parse_run_id, "segmentCount": len(self.segments), "atomCount": len(self.atoms),
+                "provider": "text", "profile": self.profile.as_dict(),
+            }
 
         self.workflow.phase(self.parse_run_id, "TRANSCRIBING", "正在通过 Deepgram 生成时间戳和说话人片段")
         provider = DeepgramTranscriptionProvider(self.settings)
         payload, retries = provider.transcribe(self.workflow.material_path(self.material), self.inspection.get("mimeType", "application/octet-stream"))
         self._write_json("deepgram.json", payload)
-        self.segments = self._scope_segment_ids(deepgram_segments(payload))
+        provider_segments = deepgram_segments(payload)
+        map_speaker_roles(provider_segments)
+        self.profile, self.atoms = atoms_from_audio_segments(provider_segments, payload)
+        self.atoms = self._scope_atom_ids(self.atoms)
+        self.segments = self._scope_segment_ids(self._audio_utterances(provider_segments))
+        self._write_json("profile.json", self.profile.as_dict())
+        self._write_json("atoms.json", self.atoms)
         self.db.update_parse_run(self.parse_run_id, retry_count=retries, artifact_id=self.parse_run_id)
         self.workflow.tool_event(self.parse_run_id, "DeepgramTranscription", {"segmentCount": len(self.segments), "retryCount": retries})
-        return {"artifactId": self.parse_run_id, "segmentCount": len(self.segments), "provider": "deepgram", "retryCount": retries}
+        return {
+            "artifactId": self.parse_run_id, "segmentCount": len(self.segments), "atomCount": len(self.atoms),
+            "provider": "deepgram", "retryCount": retries, "profile": self.profile.as_dict(),
+        }
 
     def validate(self) -> dict[str, Any]:
         if not self.segments:
@@ -96,11 +129,12 @@ class ParsePipelineContext:
         self.workflow.tool_event(
             self.parse_run_id,
             "TranscriptValidation",
-            {"segmentCount": len(self.segments), "issueCount": len(validation.issues), "blockingIssueCount": blocking, "averageConfidence": validation.average_confidence},
+            {"segmentCount": len(self.segments), "atomCount": len(self.atoms), "issueCount": len(validation.issues), "blockingIssueCount": blocking, "averageConfidence": validation.average_confidence},
         )
         return {
             "artifactId": self.parse_run_id,
             "segmentCount": len(self.segments),
+            "atomCount": len(self.atoms),
             "issueCount": len(validation.issues),
             "blockingIssueCount": blocking,
             "averageConfidence": validation.average_confidence,
@@ -111,40 +145,37 @@ class ParsePipelineContext:
             self.validate()
         if any(item["severity"] == "blocking" for item in self.validation_issues):
             raise ValueError("转写片段存在阻塞问题，无法继续拆题")
-        self.workflow.phase(self.parse_run_id, "STRUCTURING", "正在分块识别主问题、回答和追问关系")
-        chunks = chunk_segments(self.segments)
+        self.workflow.phase(self.parse_run_id, "STRUCTURING", "正在恢复话轮并识别主问题、回答和追问关系")
         cards: list[dict[str, Any]] = []
+        agent_error = ""
         if self.settings.real_agent_enabled:
-            worker_results = []
-            role_overrides = []
-            for chunk in chunks:
-                result = self.runtime.run_parse_worker(chunk)
-                if result:
-                    role_overrides.extend(result.get("role_overrides", []))
-                    worker_results.append(self._worker_cards(result.get("question_cards", []), chunk))
-            self._apply_role_overrides(role_overrides)
-            cards = merge_worker_cards(worker_results)
+            try:
+                agent_segments = self._build_agent_utterances()
+                if agent_segments:
+                    self.segments = agent_segments
+                cards = self._build_agent_cards()
+            except (ValueError, ValidationError, TypeError) as exc:
+                agent_error = str(exc)
+                self.workflow.tool_event(self.parse_run_id, "StructuredSubmissionRejected", {"message": agent_error[:180]})
         if not cards:
-            cards = build_question_cards(self.segments)
+            cards = self._fallback_cards(force_confirmation=bool(self.settings.real_agent_enabled))
         errors = validate_question_cards(cards, self.segments)
-        if errors and self.settings.real_agent_enabled:
-            retry_results = []
-            for chunk in chunks:
-                result = self.runtime.run_parse_worker(chunk)
-                if result:
-                    retry_results.append(self._worker_cards(result.get("question_cards", []), chunk))
-            retried = merge_worker_cards(retry_results)
-            if retried and not validate_question_cards(retried, self.segments):
-                cards = retried
-                errors = []
         if errors:
-            cards = build_question_cards(self.segments)
-            for card in cards:
-                card["needsConfirmation"] = True
+            cards = self._fallback_cards(force_confirmation=True)
+            errors = validate_question_cards(cards, self.segments)
         self.questions = cards
+        self._write_json("segments.json", self.segments)
         self._write_json("questions.json", cards)
-        self.workflow.tool_event(self.parse_run_id, "TranscriptStructuring", {"chunkCount": len(chunks), "questionCount": len(cards), "validationErrors": len(errors)})
-        return {"artifactId": self.parse_run_id, "chunkCount": len(chunks), "questionCount": len(cards), "validationErrors": errors[:10]}
+        atom_chunks = len(chunk_atoms(self.atoms)) if self.profile and self.profile.profile_type == "raw_stream" else 1
+        dialogue_chunks = len(chunk_utterances(self.segments))
+        self.workflow.tool_event(self.parse_run_id, "TranscriptStructuring", {
+            "atomChunkCount": atom_chunks, "dialogueChunkCount": dialogue_chunks, "questionCount": len(cards),
+            "validationErrors": len(errors), "agentFallback": bool(agent_error),
+        })
+        return {
+            "artifactId": self.parse_run_id, "atomChunkCount": atom_chunks, "dialogueChunkCount": dialogue_chunks,
+            "questionCount": len(cards), "validationErrors": errors[:10], "agentFallback": bool(agent_error),
+        }
 
     def submit(self) -> dict[str, Any]:
         if not self.questions:
@@ -156,68 +187,214 @@ class ParsePipelineContext:
         self.workflow.tool_event(self.parse_run_id, "SubmitQuestionCards", {"accepted": self.accepted, "questionCount": len(self.questions), "errorCount": len(errors)})
         return data
 
-    def _worker_cards(self, payloads: list[dict[str, Any]], chunk: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        segment_map = {item["id"]: item for item in chunk}
-        cards: list[dict[str, Any]] = []
-        roots_by_segment: dict[str, dict[str, str]] = {}
-        for index, payload in enumerate(payloads, 1):
-            q_ids = [item for item in payload.get("question_segment_ids", []) if item in segment_map]
-            a_ids = [item for item in payload.get("answer_segment_ids", []) if item in segment_map]
-            if not q_ids:
+    def _build_agent_utterances(self) -> list[dict[str, Any]]:
+        if not self.profile or not self.atoms:
+            return []
+        chunks = chunk_atoms(self.atoms) if self.profile.profile_type == "raw_stream" else [self.atoms]
+        unique: dict[tuple[str, ...], dict[str, Any]] = {}
+        atom_order = {item["id"]: item["ordinal"] for item in self.atoms}
+        for chunk_index, chunk in enumerate(chunks, 1):
+            core_start = chunk[min(24, len(chunk) - 1)]["id"] if self.profile.profile_type == "raw_stream" and chunk_index > 1 else chunk[0]["id"]
+            first_payload = self.runtime.run_utterance_worker(chunk, "boundary_first", core_start)
+            if not first_payload:
                 continue
+            selected_payload, unresolved = first_payload, False
+            if self.profile.profile_type == "raw_stream":
+                second_payload = self.runtime.run_utterance_worker(chunk, "speaker_first", core_start)
+                if second_payload and self._utterance_signature(first_payload) != self._utterance_signature(second_payload):
+                    audit = self.runtime.run_parse_auditor(first_payload, second_payload) or {}
+                    selection = audit.get("selected")
+                    selected_payload = second_payload if selection == "speaker_first" else first_payload
+                    unresolved = selection not in {"boundary_first", "speaker_first"}
+            batch = UtteranceBatch.model_validate(selected_payload)
+            self._validate_assessment_atoms(batch.model_dump(mode="json"), {item["id"] for item in chunk})
+            converted = utterances_from_submission(batch, chunk, self.raw_source, self.profile)
+            for utterance in converted:
+                if atom_order.get(utterance["atomIds"][0], 0) < atom_order.get(core_start, 0):
+                    continue
+                signature = tuple(utterance["atomIds"])
+                if unresolved:
+                    self._append_reason(utterance, ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT, "chunk", 0, signature)
+                existing = unique.get(signature)
+                if existing and (existing.get("speakerRole") != utterance.get("speakerRole") or existing.get("rawText") != utterance.get("rawText")):
+                    self._append_reason(existing, ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT, "chunk", 0, signature)
+                elif not existing:
+                    unique[signature] = utterance
+        result = sorted(unique.values(), key=lambda item: atom_order.get(item["atomIds"][0], 10**9))
+        covered = {atom_id for item in result for atom_id in item.get("atomIds", [])}
+        usable = {item["id"] for item in self.atoms if str(item.get("rawText", "")).strip()}
+        if not result or len(covered) / max(1, len(usable)) < 0.8:
+            raise ValueError("UTTERANCE_COVERAGE_TOO_LOW")
+        for index, item in enumerate(result, 1):
+            item["id"] = f"{self.material_id}:U{index:04d}"
+            item["ordinal"] = index
+        return result
+
+    def _build_agent_cards(self) -> list[dict[str, Any]]:
+        utterance_map = {item["id"]: item for item in self.segments}
+        atom_ids = {item["id"] for item in self.atoms}
+        submissions: dict[tuple[str, ...], Any] = {}
+        conflicts: set[tuple[str, ...]] = set()
+        for chunk in chunk_utterances(self.segments):
+            payload = None
+            last_error: Exception | None = None
+            for _ in range(2):
+                try:
+                    payload = self.runtime.run_dialogue_worker(chunk)
+                    if not payload:
+                        raise ValueError("EMPTY_DIALOGUE_SUBMISSION")
+                    batch = QuestionTurnBatch.model_validate(payload)
+                    self._validate_assessment_atoms(batch.model_dump(mode="json"), atom_ids)
+                    allowed = {item["id"] for item in chunk}
+                    for turn in batch.question_turns:
+                        if any(item not in allowed for item in [*turn.question_utterance_ids, *turn.answer_utterance_ids]):
+                            raise ValueError("DIALOGUE_UNKNOWN_UTTERANCE")
+                    for turn in batch.question_turns:
+                        signature = tuple(turn.question_utterance_ids)
+                        existing = submissions.get(signature)
+                        if existing and existing.model_dump() != turn.model_dump():
+                            conflicts.add(signature)
+                        else:
+                            submissions.setdefault(signature, turn)
+                    last_error = None
+                    break
+                except (ValidationError, ValueError) as exc:
+                    last_error = exc
+            if last_error:
+                raise last_error
+        ordered = sorted(submissions.items(), key=lambda item: utterance_map[item[0][0]]["ordinal"])
+        cards: list[dict[str, Any]] = []
+        roots_by_anchor: dict[str, dict[str, Any]] = {}
+        for signature, turn in ordered:
+            q_segments = [utterance_map[item] for item in turn.question_utterance_ids]
+            a_segments = [utterance_map[item] for item in turn.answer_utterance_ids]
+            question_text = "\n".join(item["rawText"] for item in q_segments).strip()
+            answer_text = "\n".join(item["rawText"] for item in a_segments).strip()
+            speaker = self._speaker_assessment([*q_segments, *a_segments])
+            assessments = {
+                "speaker": speaker,
+                "questionBoundary": turn.question_boundary_assessment,
+                "answerBoundary": turn.answer_boundary_assessment,
+                "qaPairing": turn.qa_pairing_assessment,
+                "questionType": turn.question_type_assessment,
+                "topicGrouping": turn.topic_grouping_assessment,
+            }
+            if turn.follow_up_assessment:
+                assessments["followUp"] = turn.follow_up_assessment
+            hard_reasons = []
+            if not answer_text:
+                hard_reasons.append(ConfirmationReasonCode.ANSWER_MISSING)
+            if signature in conflicts or any(self._has_reason(item, ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT) for item in [*q_segments, *a_segments]):
+                hard_reasons.append(ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT)
+            parent = roots_by_anchor.get(turn.parent_question_anchor or "")
+            is_follow_up = turn.turn_type == "follow_up" and bool(parent)
+            if turn.turn_type == "follow_up" and not parent:
+                hard_reasons.append(ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN)
+            confidence = calculate_turn_confidence(turn.turn_type, assessments, self.profile.source_quality, hard_reasons=hard_reasons)
             question_id = str(uuid.uuid4())
-            parent_segment = str(payload.get("parent_question_segment_id") or "")
-            parent = roots_by_segment.get(parent_segment)
-            parent_id = parent.get("id") if parent else None
-            is_follow_up = bool(payload.get("is_follow_up")) and bool(parent_id)
-            question_text = "\n".join(segment_map[item]["rawText"] for item in q_ids)
-            answer_text = "\n".join(segment_map[item]["rawText"] for item in a_ids)
-            confidence_value = payload.get("confidence", 0.7)
-            needs_confirmation = bool(payload.get("needs_confirmation")) or not a_ids
-            if confidence_value in {"high", "medium", "low"}:
-                confidence = "medium" if needs_confirmation and confidence_value == "high" else confidence_value
-            else:
-                confidence = confidence_label(float(confidence_value), needs_confirmation=needs_confirmation)
-            question_type = normalize_question_type(payload.get("question_type"), question_text)
-            topic_title = roots_by_segment.get(parent_segment, {}).get("title") if is_follow_up else infer_topic_title(question_text, question_type)
+            topic_title = parent["title"] if is_follow_up else turn.topic_title or infer_topic_title(question_text, turn.question_type)
             card = {
-                "id": question_id,
-                "order": segment_map[q_ids[0]]["ordinal"],
-                "interviewerQuestion": question_text,
-                "candidateAnswer": answer_text,
-                "questionType": question_type,
-                "confidence": confidence,
-                "initialDiagnosis": [],
-                "confirmed": False,
-                "version": 1,
-                "topicRootId": parent_id if is_follow_up else question_id,
-                "parentQuestionId": parent_id if is_follow_up else None,
-                "turnType": "follow_up" if is_follow_up else "main",
-                "extractedQuestion": question_text,
-                "extractedAnswer": answer_text,
-                "editedQuestion": "",
-                "editedAnswer": "",
-                "topicTitle": topic_title,
-                "needsConfirmation": needs_confirmation,
-                "provenanceStatus": "source",
-                "followUpImpact": "",
-                "questionSegmentIds": q_ids,
-                "answerSegmentIds": a_ids,
+                "id": question_id, "order": q_segments[0]["ordinal"], "interviewerQuestion": question_text,
+                "candidateAnswer": answer_text, "questionType": normalize_question_type(turn.question_type, question_text),
+                "initialDiagnosis": [], "confirmed": False, "version": 1,
+                "topicRootId": parent["id"] if is_follow_up else question_id,
+                "parentQuestionId": parent["id"] if is_follow_up else None,
+                "turnType": "follow_up" if is_follow_up else "main", "extractedQuestion": question_text,
+                "extractedAnswer": answer_text, "editedQuestion": "", "editedAnswer": "", "topicTitle": topic_title,
+                "provenanceStatus": "conflict" if hard_reasons else "source", "followUpImpact": "",
+                "questionSegmentIds": list(turn.question_utterance_ids), "answerSegmentIds": list(turn.answer_utterance_ids),
+                "parseMethod": "agent", **confidence,
             }
             cards.append(card)
             if not is_follow_up:
-                roots_by_segment[q_ids[0]] = {"id": question_id, "title": topic_title}
+                roots_by_anchor[turn.question_utterance_ids[0]] = {"id": question_id, "title": topic_title}
         return cards
 
-    def _apply_role_overrides(self, overrides: list[dict[str, Any]]) -> None:
-        allowed = {"interviewer", "candidate", "system_noise", "unknown"}
-        by_id = {item["id"]: item for item in self.segments}
-        for override in overrides:
-            segment = by_id.get(str(override.get("segment_id", "")))
-            role = str(override.get("speaker_role", ""))
-            if segment and role in allowed:
-                segment["speakerRole"] = role
-                segment["needsConfirmation"] = role == "unknown"
+    def _fallback_cards(self, force_confirmation: bool = False) -> list[dict[str, Any]]:
+        cards = build_question_cards(self.segments)
+        segment_map = {item["id"]: item for item in self.segments}
+        for card in cards:
+            q_segments = [segment_map[item] for item in card.get("questionSegmentIds", []) if item in segment_map]
+            a_segments = [segment_map[item] for item in card.get("answerSegmentIds", []) if item in segment_map]
+            atom_refs = [atom_id for item in [*q_segments, *a_segments] for atom_id in item.get("atomIds", [])]
+            speaker = self._speaker_assessment([*q_segments, *a_segments])
+            boundary_score = min((round(float(item.get("confidence", 0)) * 100) for item in [*q_segments, *a_segments]), default=50)
+            boundary_code = ConfirmationReasonCode.QUESTION_BOUNDARY_UNCERTAIN if boundary_score < 80 else None
+            answer_code = ConfirmationReasonCode.ANSWER_BOUNDARY_UNCERTAIN if boundary_score < 80 else None
+            qa_score = 92 if a_segments and all(item.get("speakerRole") != "unknown" for item in [*q_segments, *a_segments]) else 68 if a_segments else 40
+            assessments = {
+                "speaker": speaker,
+                "questionBoundary": self._assessment(boundary_score, boundary_code, atom_refs),
+                "answerBoundary": self._assessment(boundary_score if a_segments else 40, answer_code if a_segments else ConfirmationReasonCode.ANSWER_MISSING, atom_refs),
+                "qaPairing": self._assessment(qa_score, None if qa_score >= 80 else ConfirmationReasonCode.QA_PAIRING_AMBIGUOUS, atom_refs),
+                "questionType": self._assessment(86, None, atom_refs),
+                "topicGrouping": self._assessment(86, None, atom_refs),
+            }
+            if card.get("turnType") == "follow_up":
+                clear_parent = bool(self.profile and self.profile.profile_type == "labeled_lines" and card.get("parentQuestionId"))
+                assessments["followUp"] = self._assessment(
+                    86 if clear_parent else 72,
+                    None if clear_parent else ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN,
+                    atom_refs,
+                )
+            hard = []
+            if not a_segments:
+                hard.append(ConfirmationReasonCode.ANSWER_MISSING)
+            if force_confirmation:
+                hard.append(ConfirmationReasonCode.REFERENCE_VALIDATION_FAILED)
+            confidence = calculate_turn_confidence(card.get("turnType", "main"), assessments, self.profile.source_quality if self.profile else 50, hard_reasons=hard)
+            card.update(confidence)
+            card["parseMethod"] = "fallback" if force_confirmation else "deterministic"
+            card["provenanceStatus"] = "fallback" if force_confirmation else card.get("provenanceStatus", "source")
+        return cards
+
+    @staticmethod
+    def _assessment(score: int, code: ConfirmationReasonCode | None, atom_ids: list[str]) -> ConfidenceAssessment:
+        return ConfidenceAssessment(score=score, reason_codes=[code] if code else [], evidence_atom_ids=atom_ids if code else [], summary="")
+
+    def _speaker_assessment(self, segments: list[dict[str, Any]]) -> ConfidenceAssessment:
+        if not segments:
+            return self._assessment(40, ConfirmationReasonCode.SPEAKER_ROLE_UNCERTAIN, [item["id"] for item in self.atoms[:1]])
+        candidates = []
+        for segment in segments:
+            payload = (segment.get("confidenceDetails") or {}).get("speaker")
+            if payload:
+                try:
+                    candidates.append(ConfidenceAssessment.model_validate(payload))
+                    continue
+                except ValidationError:
+                    pass
+            atom_ids = segment.get("atomIds", [])
+            score = round(float(segment.get("speakerConfidence") or 0.55) * 100)
+            code = ConfirmationReasonCode.SPEAKER_ROLE_UNCERTAIN if score < 80 or segment.get("speakerRole") == "unknown" else None
+            candidates.append(self._assessment(score, code, atom_ids))
+        return min(candidates, key=lambda item: item.score)
+
+    @staticmethod
+    def _validate_assessment_atoms(payload: Any, allowed: set[str]) -> None:
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key == "evidence_atom_ids" and any(item not in allowed for item in value):
+                    raise ValueError("ASSESSMENT_UNKNOWN_ATOM")
+                ParsePipelineContext._validate_assessment_atoms(value, allowed)
+        elif isinstance(payload, list):
+            for item in payload:
+                ParsePipelineContext._validate_assessment_atoms(item, allowed)
+
+    @staticmethod
+    def _utterance_signature(payload: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple((tuple(item.get("atom_ids", [])), item.get("speaker_role")) for item in payload.get("utterances", []))
+
+    @staticmethod
+    def _has_reason(item: dict[str, Any], code: ConfirmationReasonCode) -> bool:
+        return any(reason.get("code") == code.value for reason in item.get("confirmationReasons", []))
+
+    @staticmethod
+    def _append_reason(item: dict[str, Any], code: ConfirmationReasonCode, dimension: str, score: int, atom_ids: Any) -> None:
+        reasons = item.setdefault("confirmationReasons", [])
+        if not any(reason.get("code") == code.value for reason in reasons):
+            reasons.append({"code": code.value, "label": "分块结果冲突", "dimension": dimension, "score": score, "evidenceAtomIds": list(atom_ids), "impact": 10000, "summary": ""})
+        item["needsConfirmation"] = True
 
     def _write_json(self, filename: str, payload: Any) -> None:
         (self.artifact_dir / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -227,6 +404,33 @@ class ParsePipelineContext:
             local_id = str(segment["id"])
             segment["id"] = f"{self.material_id}:{local_id}"
         return segments
+
+    def _scope_atom_ids(self, atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for atom in atoms:
+            atom["id"] = f"{self.material_id}:{atom['id']}"
+        return atoms
+
+    def _audio_utterances(self, provider_segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_group: dict[int, list[str]] = {}
+        for atom in self.atoms:
+            by_group.setdefault(int(atom.get("groupId", atom.get("ordinal", 0))), []).append(atom["id"])
+        result = []
+        for index, source in enumerate(provider_segments, 1):
+            item = dict(source)
+            atom_ids = by_group.get(index, [])
+            score = round(float(source.get("confidence", 0)) * 100)
+            reasons = []
+            if source.get("speakerRole") == "unknown":
+                reasons.append({"code": "SPEAKER_ROLE_UNCERTAIN", "label": "说话人身份不明确", "dimension": "speaker", "score": round(float(source.get("speakerConfidence") or 0) * 100), "evidenceAtomIds": atom_ids, "impact": 45, "summary": ""})
+            if score < 75:
+                reasons.append({"code": "SOURCE_QUALITY_LOW", "label": "原始文稿结构较弱", "dimension": "sourceQuality", "score": score, "evidenceAtomIds": atom_ids, "impact": 100 - score, "summary": "音频转写片段置信度较低"})
+            item.update({
+                "atomIds": atom_ids, "confidenceDetails": {"sourceQuality": score},
+                "confirmationReasons": reasons, "needsConfirmation": bool(reasons or source.get("needsConfirmation")),
+                "parseMethod": "deepgram",
+            })
+            result.append(item)
+        return result
 
 
 class ParseWorkflow:
@@ -257,13 +461,16 @@ class ParseWorkflow:
             if not context.accepted:
                 raise ValueError("候选题卡未通过最终校验")
 
-            questions = self.db.commit_parse_result(interview["id"], material["id"], context.segments, context.questions)
+            questions = self.db.commit_parse_result(interview["id"], material["id"], context.atoms, context.segments, context.questions)
             if context.is_audio:
                 transcript = self._render_transcript(context.segments)
                 self.db.update_interview(interview["id"], raw_transcript=transcript)
             unresolved = len(self.db.unresolved_segments(interview["id"])) + sum(item.get("needsConfirmation", False) for item in questions)
             metrics = {
                 "durationSeconds": round(time.perf_counter() - started, 3),
+                "profileType": context.profile.profile_type if context.profile else "unknown",
+                "sourceQuality": context.profile.source_quality if context.profile else 0,
+                "atomCount": len(context.atoms),
                 "segmentCount": len(context.segments),
                 "questionCount": len(questions),
                 "topicCount": len(self.db.get_question_topics(interview["id"])),

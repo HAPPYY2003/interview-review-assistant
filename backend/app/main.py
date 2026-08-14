@@ -5,18 +5,30 @@ import json
 import shutil
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import settings
-from backend.app.database import Database
-from backend.app.schemas import ConfirmQuestionsRequest, InterviewCreate, InterviewImport, MaterialText, QuestionPatch, ReviewRunCreate, TranscriptSegmentPatch
+from backend.app.database import ActiveAgentRunError, Database
+from backend.app.schemas import (
+    ConfirmQuestionsRequest,
+    GrowthSnapshotDeleteBatch,
+    GrowthSnapshotImportBatch,
+    InterviewCreate,
+    InterviewImport,
+    MaterialText,
+    QuestionPatch,
+    ReviewRunCreate,
+    TranscriptSegmentMergeRequest,
+    TranscriptSegmentPatch,
+    TranscriptSegmentSplitRequest,
+)
 from backend.app.services.audio import AudioInspectionError, inspect_audio
 from backend.app.services.document_parser import DocumentParseError, DocumentParser
 from backend.app.services.evidence import EvidenceReviewService
@@ -38,6 +50,8 @@ background_tasks: set[asyncio.Task[Any]] = set()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize()
+    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=settings.agent_task_timeout + 30)).isoformat()
+    database.fail_stale_runs(stale_before)
     yield
     for task in list(background_tasks):
         if not task.done():
@@ -271,11 +285,12 @@ async def stream_parse_events(run_id: str, last_event_id: str | None = Header(de
 
 
 @app.get("/api/v1/interviews/{interview_id}/segments")
-def get_interview_segments(interview_id: str) -> dict[str, Any]:
+def get_interview_segments(interview_id: str, include_atoms: bool = Query(default=False, alias="includeAtoms")) -> dict[str, Any]:
     get_interview_or_404(interview_id)
     audio = database.latest_material(interview_id, ["transcript_audio"])
     return {
         "segments": database.get_segments(interview_id),
+        "atoms": database.get_atoms(interview_id) if include_atoms else [],
         "topics": database.get_question_topics(interview_id),
         "unresolvedCount": len(database.unresolved_segments(interview_id)),
         "audio": {
@@ -295,10 +310,73 @@ def patch_interview_segments(interview_id: str, payload: TranscriptSegmentPatch)
     return {"segments": segments, "unresolvedCount": len(database.unresolved_segments(interview_id)), "invalidatedPreviousReport": True}
 
 
+@app.post("/api/v1/interviews/{interview_id}/segments/{segment_id}/split")
+def split_interview_segment(interview_id: str, segment_id: str, payload: TranscriptSegmentSplitRequest) -> dict[str, Any]:
+    get_interview_or_404(interview_id)
+    try:
+        segments = database.split_segment(
+            interview_id,
+            segment_id,
+            payload.after_atom_id,
+            question_id=payload.turn_id,
+            left_assignment=payload.left_assignment,
+            right_assignment=payload.right_assignment,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="原文话轮不存在")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    database.update_interview(interview_id, status="WAITING_CONFIRMATION", latest_run_id=None)
+    return {
+        "segments": segments, "atoms": database.get_atoms(interview_id), "topics": database.get_question_topics(interview_id),
+        "unresolvedCount": len(database.unresolved_segments(interview_id)), "invalidatedPreviousReport": True,
+    }
+
+
+@app.post("/api/v1/interviews/{interview_id}/segments/merge")
+def merge_interview_segments(interview_id: str, payload: TranscriptSegmentMergeRequest) -> dict[str, Any]:
+    get_interview_or_404(interview_id)
+    try:
+        segments = database.merge_segments(interview_id, payload.segment_ids)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="原文话轮不存在")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    database.update_interview(interview_id, status="WAITING_CONFIRMATION", latest_run_id=None)
+    return {
+        "segments": segments, "atoms": database.get_atoms(interview_id), "topics": database.get_question_topics(interview_id),
+        "unresolvedCount": len(database.unresolved_segments(interview_id)), "invalidatedPreviousReport": True,
+    }
+
+
 @app.patch("/api/v1/interviews/{interview_id}/questions")
 def patch_questions(interview_id: str, payload: QuestionPatch) -> dict[str, Any]:
     get_interview_or_404(interview_id)
-    questions = database.replace_questions(interview_id, [item.model_dump(by_alias=True) for item in payload.questions])
+    segment_map = {item["id"]: item for item in database.get_segments(interview_id)}
+    prepared = []
+    for model in payload.questions:
+        item = model.model_dump(by_alias=True)
+        question_ids = item.get("questionSegmentIds", [])
+        answer_ids = item.get("answerSegmentIds", [])
+        overlap = set(question_ids) & set(answer_ids)
+        if overlap:
+            raise HTTPException(status_code=422, detail=f"同一话轮不能同时归属问题和回答：{next(iter(overlap))}")
+        missing = [segment_id for segment_id in [*question_ids, *answer_ids] if segment_id not in segment_map]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"题卡引用了不存在的话轮：{missing[0]}")
+        item["extractedQuestion"] = "\n".join(segment_map[segment_id]["rawText"] for segment_id in question_ids).strip()
+        item["extractedAnswer"] = "\n".join(segment_map[segment_id]["rawText"] for segment_id in answer_ids).strip()
+        if not item.get("editedQuestion"):
+            item["interviewerQuestion"] = item["extractedQuestion"]
+        if not item.get("editedAnswer"):
+            item["candidateAnswer"] = item["extractedAnswer"]
+        resolved_codes = {"QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS", "ANSWER_MISSING", "REFERENCE_VALIDATION_FAILED"}
+        item["confirmationReasons"] = [reason for reason in item.get("confirmationReasons", []) if reason.get("code") not in resolved_codes]
+        item["needsConfirmation"] = False if item.get("confirmed") else bool(item["confirmationReasons"] or not item.get("interviewerQuestion"))
+        if item.get("editedQuestion") or item.get("editedAnswer") or question_ids or answer_ids:
+            item["provenanceStatus"] = "edited"
+        prepared.append(item)
+    questions = database.replace_questions(interview_id, prepared)
     database.update_interview(interview_id, status="WAITING_CONFIRMATION", latest_run_id=None)
     return {"questions": questions, "invalidatedPreviousReport": True}
 
@@ -353,9 +431,16 @@ async def create_review_run(interview_id: str, payload: ReviewRunCreate | None =
     if settings.agent_runtime == "helloagents" and not settings.real_agent_enabled:
         raise HTTPException(status_code=503, detail="真实 Agent 模式缺少可用模型配置；系统不会自动切换为 Fixture")
     agent_mode = "fixture" if settings.agent_runtime == "fixture" else "helloagents"
-    run = database.create_run(interview_id, enable_web, review_mode, agent_mode=agent_mode, input_digest=workflow.input_digest(interview_id))
-    _schedule_run(run["id"])
-    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "reviewMode": review_mode, "agentMode": agent_mode, "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
+    try:
+        run = database.create_run(interview_id, enable_web, review_mode, agent_mode=agent_mode, input_digest=workflow.input_digest(interview_id))
+    except ActiveAgentRunError as exc:
+        active_interview = database.get_interview(exc.interview_id) or {}
+        label = " · ".join(part for part in (active_interview.get("company", ""), active_interview.get("position", "")) if part)
+        detail = f"已有另一场真实 Agent 复盘正在运行{f'（{label}）' if label else ''}，请等待其完成后再开始。"
+        raise HTTPException(status_code=409, detail=detail, headers={"X-Active-Run-ID": exc.run_id}) from exc
+    if not run.get("reused"):
+        _schedule_run(run["id"])
+    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "reviewMode": run["review_mode"], "agentMode": run["agent_mode"], "reused": bool(run.get("reused")), "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
 
 
 @app.get("/api/v1/runs/{run_id}")
@@ -454,6 +539,31 @@ def get_report(interview_id: str) -> dict[str, Any]:
 def get_trends() -> dict[str, Any]:
     snapshots = database.get_growth_trends()
     return {"snapshots": snapshots, "count": len(snapshots)}
+
+
+@app.get("/api/v1/profile/trends/candidates")
+def get_trend_candidates() -> dict[str, Any]:
+    candidates = database.get_growth_candidates()
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+@app.post("/api/v1/profile/trends/import")
+def import_trends(payload: GrowthSnapshotImportBatch) -> dict[str, Any]:
+    return database.import_growth_snapshots(payload.interview_ids)
+
+
+@app.post("/api/v1/profile/trends/delete-batch")
+def delete_trends_batch(payload: GrowthSnapshotDeleteBatch) -> dict[str, int]:
+    snapshot_ids = list(dict.fromkeys(payload.snapshot_ids))
+    deleted_count = database.delete_growth_snapshots(snapshot_ids)
+    return {"requestedCount": len(snapshot_ids), "deletedCount": deleted_count}
+
+
+@app.delete("/api/v1/profile/trends/{snapshot_id}")
+def delete_trend(snapshot_id: str) -> dict[str, bool]:
+    if not database.delete_growth_snapshot(snapshot_id):
+        raise HTTPException(status_code=404, detail="成长记录不存在")
+    return {"deleted": True}
 
 
 # Compatibility API used by the original V2 frontend while the v1 workflow is adopted.

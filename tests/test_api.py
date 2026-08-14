@@ -92,6 +92,42 @@ def test_v1_api_end_to_end_and_sse_contract():
         assert report.json()["interview"]["latestAIMetadata"]["provider"] == "Fixture"
         assert report.json()["artifacts"]
 
+        candidates = client.get("/api/v1/profile/trends/candidates")
+        assert candidates.status_code == 200
+        candidate = next(
+            item for item in candidates.json()["candidates"]
+            if item["interviewId"] == interview_id
+        )
+        assert candidate["alreadyAdded"] is False
+        assert candidate["scores"]["overall"] > 0
+
+        imported = client.post(
+            "/api/v1/profile/trends/import",
+            json={"interviewIds": [interview_id]},
+        )
+        assert imported.status_code == 200
+        assert imported.json()["addedCount"] == 1
+
+        duplicate = client.post(
+            "/api/v1/profile/trends/import",
+            json={"interviewIds": [interview_id]},
+        )
+        assert duplicate.status_code == 200
+        assert duplicate.json()["alreadyExistsCount"] == 1
+        matching_snapshots = [
+            item for item in client.get("/api/v1/profile/trends").json()["snapshots"]
+            if item["interview_id"] == interview_id
+        ]
+        assert len(matching_snapshots) == 1
+        generated_at = report.json()["interview"]["latestAIMetadata"]["generatedAt"]
+        assert matching_snapshots[0]["report_generated_at"] == candidate["completedAt"]
+        assert matching_snapshots[0]["report_generated_at"] == generated_at
+        updated_candidate = next(
+            item for item in client.get("/api/v1/profile/trends/candidates").json()["candidates"]
+            if item["interviewId"] == interview_id
+        )
+        assert updated_candidate["alreadyAdded"] is True
+
         events = client.get(f"/api/v1/runs/{run_id}/events")
         assert events.status_code == 200
         assert "event: RUN_FINISHED" in events.text
@@ -148,6 +184,59 @@ def test_quick_review_preserves_unconfirmed_question_state():
         assert topics[0]["mainTurn"]["confirmed"] is False
         report = client.get(f"/api/v1/interviews/{interview_id}/report").json()
         assert report["interview"]["reviewMode"] == "quick"
+
+
+def test_reassigning_the_only_answer_segment_clears_stale_extracted_answer():
+    interview_id = f"reassign-{uuid.uuid4()}"
+    transcript = "面试官：请介绍项目。\n候选人：我负责推荐策略优化。"
+    with TestClient(app) as client:
+        assert client.post("/api/v1/interviews", json={"id": interview_id, "rawTranscript": transcript}).status_code == 201
+        parsed = client.post(f"/api/v1/interviews/{interview_id}/parse").json()
+        for _ in range(80):
+            run = client.get(f"/api/v1/parse-runs/{parsed['parseRunId']}").json()
+            if run["status"] in {"COMPLETED", "FAILED"}:
+                break
+            time.sleep(0.05)
+        assert run["status"] == "COMPLETED"
+        turn = client.get(f"/api/v1/interviews/{interview_id}/segments").json()["topics"][0]["mainTurn"]
+        turn["questionSegmentIds"] = [*turn["questionSegmentIds"], *turn["answerSegmentIds"]]
+        turn["answerSegmentIds"] = []
+
+        patched = client.patch(f"/api/v1/interviews/{interview_id}/questions", json={"questions": [turn]})
+
+        assert patched.status_code == 200
+        updated = patched.json()["questions"][0]
+        assert updated["extractedAnswer"] == ""
+        assert updated["candidateAnswer"] == ""
+
+
+def test_parse_api_supports_all_transcript_shapes_and_returns_atoms():
+    samples = {
+        "labeled_lines": "面试官：请介绍项目。\n候选人：我负责推荐策略优化。",
+        "unlabeled_lines": "请介绍项目？\n我负责推荐策略优化。",
+        "punctuated_stream": "请介绍项目？我负责推荐策略优化。最终点击率提升12%。",
+        "raw_stream": "请介绍项目我负责推荐策略优化最后点击率提升百分之十二",
+    }
+    with TestClient(app) as client:
+        for expected_profile, transcript in samples.items():
+            interview_id = f"shape-{expected_profile}-{uuid.uuid4()}"
+            assert client.post("/api/v1/interviews", json={"id": interview_id, "rawTranscript": transcript}).status_code == 201
+            parsed = client.post(f"/api/v1/interviews/{interview_id}/parse").json()
+            run = {}
+            for _ in range(80):
+                run = client.get(f"/api/v1/parse-runs/{parsed['parseRunId']}").json()
+                if run["status"] in {"COMPLETED", "FAILED"}:
+                    break
+                time.sleep(0.05)
+            assert run["status"] == "COMPLETED"
+            assert run["metrics"]["profileType"] == expected_profile
+            result = client.get(f"/api/v1/interviews/{interview_id}/segments?includeAtoms=true").json()
+            assert result["atoms"]
+            assert result["topics"]
+            if expected_profile == "raw_stream":
+                turn = result["topics"][0]["mainTurn"]
+                assert turn["needsConfirmation"] is True
+                assert any(item["code"] == "SOURCE_QUALITY_LOW" for item in turn["confirmationReasons"])
 
 
 def test_audio_upload_playback_and_confirmation_gate():
@@ -235,3 +324,79 @@ def test_failed_agent_run_only_falls_back_after_explicit_request():
         report = client.get(f"/api/v1/interviews/{interview_id}/report").json()
         assert report["interview"]["latestAIMetadata"]["provider"] == "DeterministicFallback"
         assert report["interview"]["degraded"] is True
+
+
+def test_growth_snapshot_delete_keeps_interview_record():
+    interview_id = f"trend-delete-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "interview_date": "2026-08-03",
+        })
+        run = database.create_run(interview_id, agent_mode="fixture")
+        database.save_growth_snapshot(
+            interview_id,
+            run["id"],
+            {"overall": 7.2, "relevance": 7.5, "structure": 6.0, "evidence": 7.5, "depth": 7.5, "roleFit": 7.5},
+            ["structure"],
+            [],
+        )
+        snapshot = next(
+            item for item in client.get("/api/v1/profile/trends").json()["snapshots"]
+            if item["interview_id"] == interview_id
+        )
+        assert snapshot["created_at"]
+
+        deleted = client.delete(f"/api/v1/profile/trends/{snapshot['id']}")
+
+        assert deleted.status_code == 200
+        assert deleted.json() == {"deleted": True}
+        assert database.get_interview(interview_id) is not None
+        assert all(
+            item["id"] != snapshot["id"]
+            for item in client.get("/api/v1/profile/trends").json()["snapshots"]
+        )
+        assert client.delete(f"/api/v1/profile/trends/{snapshot['id']}").status_code == 404
+
+        for overall in (6.8, 8.0):
+            database.save_growth_snapshot(
+                interview_id,
+                run["id"],
+                {"overall": overall, "relevance": 7.5, "structure": 6.0, "evidence": 7.5, "depth": 7.5, "roleFit": 7.5},
+                ["structure"],
+                [],
+            )
+        snapshot_ids = [
+            item["id"]
+            for item in client.get("/api/v1/profile/trends").json()["snapshots"]
+            if item["interview_id"] == interview_id
+        ]
+        batch_deleted = client.post(
+            "/api/v1/profile/trends/delete-batch",
+            json={"snapshotIds": snapshot_ids},
+        )
+
+        assert batch_deleted.status_code == 200
+        assert batch_deleted.json() == {"requestedCount": 2, "deletedCount": 2}
+        assert database.get_interview(interview_id) is not None
+        assert not any(
+            item["interview_id"] == interview_id
+            for item in client.get("/api/v1/profile/trends").json()["snapshots"]
+        )
+
+        database.save_growth_snapshot(
+            interview_id,
+            run["id"],
+            {"overall": 7.6, "relevance": 7.5, "structure": 7.5, "evidence": 7.5, "depth": 7.5, "roleFit": 7.5},
+            [],
+            [],
+        )
+        assert client.delete(f"/api/v1/interviews/{interview_id}").status_code == 200
+        with database.connect() as connection:
+            remaining_snapshots = connection.execute(
+                "SELECT COUNT(*) FROM growth_snapshots WHERE interview_id=?",
+                (interview_id,),
+            ).fetchone()[0]
+        assert remaining_snapshots == 0

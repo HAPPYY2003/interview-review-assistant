@@ -247,6 +247,8 @@ def validate_question_cards(cards: list[dict[str, Any]], segments: Iterable[dict
         if missing:
             errors.append(f"{card['id']}:missing_segments")
             continue
+        if set(question_ids) & set(answer_ids):
+            errors.append(f"{card['id']}:segment_role_conflict")
         q_order = [segment_map[item]["ordinal"] for item in question_ids]
         a_order = [segment_map[item]["ordinal"] for item in answer_ids]
         if a_order and q_order and min(a_order) <= max(q_order):

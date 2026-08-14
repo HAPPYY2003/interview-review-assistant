@@ -63,8 +63,13 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     assert all(isinstance(tool, Tool) for tool in tools)
 
     lookup = next(tool for tool in tools if tool.name == "EvidenceLookup")
-    transcript = lookup.run({"source_type": "transcript", "query": "20%"}).data["matches"][0]
-    job = lookup.run({"source_type": "job_description", "query": "实验设计"}).data["matches"][0]
+    transcript_response = lookup.run({"source_type": "transcript", "query": "20%"})
+    transcript = transcript_response.data["matches"][0]
+    job_response = lookup.run({"source_type": "job_description", "query": "实验设计"})
+    job = job_response.data["matches"][0]
+    assert transcript["id"] in transcript_response.text
+    assert job["id"] in job_response.text
+    assert "evidenceId" in transcript_response.text
     score = next(tool for tool in tools if tool.name == "Score").run({"levels_json": json.dumps({name: "合格" for name in ("relevance", "structure", "evidence", "depth", "roleFit")}, ensure_ascii=False)})
     assert score.data["overall"] == 6.0
 
@@ -87,6 +92,19 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     growth_submit.run({"plan_json": json.dumps(_growth_submission("topic-1"), ensure_ascii=False)})
     assert len(growth_submit.last_submission["actionItems"]) == 7
 
+    _, flat_submit = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
+    flat_response = flat_submit.run({
+        "summary": "本场复盘需要提升表达结构。",
+        "next_focus": "下一场重点说明决策依据。",
+        "risks_text": "表达结构不足|||回答层次需要更清晰|||medium|||topic-1",
+        **{
+            f"day_{day}": f"第 {day} 天训练|||完成一次结构化口述|||structure|||{'high' if day <= 2 else 'medium'}|||三分钟内完整表达"
+            for day in range(1, 8)
+        },
+    })
+    assert flat_response.status.value == "success"
+    assert len(flat_submit.last_submission["actionItems"]) == 7
+
 
 def test_supervisor_registers_task_and_new_domain_tools(settings_factory):
     from backend.app.agents.runtime import HelloAgentsRuntime
@@ -102,6 +120,17 @@ def test_supervisor_registers_task_and_new_domain_tools(settings_factory):
     names = set(registry.list_tools())
     assert {"KnowledgeSearch", "EvidenceLookup", "Score", "WebVerify", "SubmitTopicReview", "Task"}.issubset(names)
     assert supervisor.__class__.__name__ == "PlanSolveAgent"
+
+
+def test_growth_planner_uses_fixed_product_workflow():
+    from backend.app.agents.runtime import FixedGrowthPlanner
+
+    steps = FixedGrowthPlanner().plan("ignored")
+
+    assert len(steps) == 3
+    assert "GetAuditedReview" in steps[0]
+    assert "GetGrowthHistory" in steps[1]
+    assert "SubmitPlan" in steps[2]
 
 
 def test_agent_runtime_reconfigures_windows_streams_to_utf8(monkeypatch, settings_factory):
@@ -121,3 +150,33 @@ def test_agent_runtime_reconfigures_windows_streams_to_utf8(monkeypatch, setting
     HelloAgentsRuntime(settings_factory()).configure_environment()
     assert stdout.calls == [{"encoding": "utf-8", "errors": "backslashreplace"}]
     assert stderr.calls == [{"encoding": "utf-8", "errors": "backslashreplace"}]
+
+
+def test_utterance_worker_builds_payload_from_atoms(monkeypatch, settings_factory):
+    from backend.app.agents.runtime import HelloAgentsRuntime
+
+    captured = {}
+
+    class FakeSimpleAgent:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, prompt):
+            captured["prompt"] = prompt
+            return '{"utterances": []}'
+
+    runtime = HelloAgentsRuntime(settings_factory())
+    runtime.available = True
+    runtime.SimpleAgent = FakeSimpleAgent
+    runtime.HelloAgentsLLM = lambda: object()
+    monkeypatch.setattr(runtime, "configure_environment", lambda: None)
+    monkeypatch.setattr(runtime, "_config", lambda: {})
+
+    result = runtime.run_utterance_worker(
+        [{"id": "atom-1", "rawText": "请介绍一下项目。", "speakerRole": "interviewer"}],
+        "boundary_first",
+        "atom-1",
+    )
+
+    assert result == {"utterances": []}
+    assert '"atom_id": "atom-1"' in captured["prompt"]

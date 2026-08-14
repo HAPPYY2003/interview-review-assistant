@@ -32,6 +32,8 @@ class Settings:
     llm_api_key: str = os.getenv("LLM_API_KEY", "").strip()
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
     llm_timeout: int = int(os.getenv("LLM_TIMEOUT", "90"))
+    agent_task_timeout: int = int(os.getenv("AGENT_TASK_TIMEOUT", "180"))
+    agent_heartbeat_interval: int = int(os.getenv("AGENT_HEARTBEAT_INTERVAL", "10"))
     asr_provider: str = os.getenv("ASR_PROVIDER", "deepgram").strip().lower()
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "").strip()
     deepgram_model: str = os.getenv("DEEPGRAM_MODEL", "nova-3").strip()
