@@ -226,3 +226,98 @@ def test_two_stage_agent_contract_drives_cards_but_local_engine_sets_confidence(
     assert questions[0]["confidence"] == "high"
     assert questions[0]["needsConfirmation"] is False
     assert questions[0]["confirmationReasons"] == []
+
+
+def test_dialogue_contract_drift_is_sanitized_without_lowering_high_confidence(settings_factory):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "面试官：请介绍项目。\n候选人：我负责推荐策略优化。"
+    interview = database.create_interview({"id": "agent-contract-drift", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+
+    class ContractDriftRuntime:
+        def run_parse_agent(self, *_args, **_kwargs):
+            return SimpleNamespace(text="scheduled")
+
+        def run_utterance_worker(self, atoms, _strategy, _core_start):
+            return {
+                "utterances": [{
+                    "atom_ids": [atom["id"]],
+                    "speaker_role": atom["speakerRole"],
+                    "speaker_assessment": {"score": 96, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+                    "boundary_assessment": {"score": 96, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+                } for atom in atoms]
+            }
+
+        def run_dialogue_worker(self, utterances):
+            positive_reason = ["only_one_interpretation"]
+            return {
+                "question_turns": [{
+                    "question_utterance_ids": [utterances[0]["id"]],
+                    "answer_utterance_ids": [utterances[1]["id"]],
+                    "turn_type": "main_question", "parent_question_anchor": None,
+                    "question_type": "���", "topic_title": "���",
+                    "question_boundary_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                    "answer_boundary_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                    "qa_pairing_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                    "follow_up_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                    "question_type_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                    "topic_grouping_assessment": {"score": 95, "reason_codes": positive_reason, "evidence_atom_ids": [], "summary": "���"},
+                }]
+            }
+
+        def run_parse_auditor(self, *_args):
+            return {"selected": "boundary_first", "summary": ""}
+
+    workflow = ParseWorkflow(database, settings)
+    workflow.runtime = ContractDriftRuntime()
+    workflow.execute(run["id"])
+
+    question = database.get_questions(interview["id"])[0]
+    assert question["parseMethod"] == "agent"
+    assert question["confidence"] == "high"
+    assert question["needsConfirmation"] is False
+    assert question["questionType"] == "项目经历"
+    assert "�" not in question["topicTitle"]
+
+
+def test_invalid_agent_payload_uses_source_based_fallback_confidence(settings_factory):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "面试官：请介绍项目。\n候选人：我负责推荐策略优化。"
+    interview = database.create_interview({"id": "agent-fallback-confidence", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+
+    class InvalidRuntime:
+        def run_parse_agent(self, *_args, **_kwargs):
+            return SimpleNamespace(text="scheduled")
+
+        def run_utterance_worker(self, atoms, _strategy, _core_start):
+            return {
+                "utterances": [{
+                    "atom_ids": [atom["id"]],
+                    "speaker_role": atom["speakerRole"],
+                    "speaker_assessment": {"score": 96, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+                    "boundary_assessment": {"score": 96, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+                } for atom in atoms]
+            }
+
+        def run_dialogue_worker(self, _utterances):
+            return {"question_turns": "invalid"}
+
+        def run_parse_auditor(self, *_args):
+            return {"selected": "boundary_first", "summary": ""}
+
+    workflow = ParseWorkflow(database, settings)
+    workflow.runtime = InvalidRuntime()
+    workflow.execute(run["id"])
+
+    question = database.get_questions(interview["id"])[0]
+    assert question["parseMethod"] == "deterministic"
+    assert question["confidence"] == "high"
+    assert question["needsConfirmation"] is False
+    assert all(item["code"] != "REFERENCE_VALIDATION_FAILED" for item in question["confirmationReasons"])

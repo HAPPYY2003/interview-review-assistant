@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 RunStatus = Literal["DRAFT", "PARSING", "WAITING_CONFIRMATION", "REVIEWING", "AUDITING", "COMPLETED", "FAILED", "CANCELLED"]
@@ -15,6 +15,22 @@ class APIModel(BaseModel):
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+def _normalize_string_list(value: Any) -> Any:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return value
+
+
+def _normalize_joined_text(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "；".join(item.strip() for item in value if item.strip())
+    return value
 
 
 class InterviewCreate(APIModel):
@@ -151,6 +167,11 @@ class RoleFitSubmission(StrictModel):
     missing_requirements: list[str] = Field(default_factory=list, alias="missingRequirements")
     uncertainty: str = ""
 
+    @field_validator("missing_requirements", mode="before")
+    @classmethod
+    def normalize_missing_requirements(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
+
 
 class StarRewriteSubmission(StrictModel):
     situation: str
@@ -161,6 +182,74 @@ class StarRewriteSubmission(StrictModel):
     evidence_ids: list[str] = Field(min_length=1, alias="evidenceIds")
     missing_information: list[str] = Field(default_factory=list, alias="missingInformation")
 
+    @field_validator("missing_information", mode="before")
+    @classmethod
+    def normalize_missing_information(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
+
+
+class AnswerLogicStep(StrictModel):
+    order: int = Field(ge=1, le=12)
+    label: str = Field(min_length=1, max_length=40)
+    content: str = Field(min_length=2, max_length=500)
+    evidence_ids: list[str] = Field(min_length=1, alias="evidenceIds")
+
+
+class AnswerLogicSubmission(StrictModel):
+    summary: str = Field(min_length=2, max_length=600)
+    steps: list[AnswerLogicStep] = Field(min_length=1, max_length=12)
+    gaps: list[EvidenceClaim] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_step_order(self) -> "AnswerLogicSubmission":
+        if [item.order for item in self.steps] != list(range(1, len(self.steps) + 1)):
+            raise ValueError("answerLogic.steps 必须从 1 开始连续编号")
+        return self
+
+
+class InterviewerSignalSubmission(StrictModel):
+    turn_id: str = Field(alias="turnId")
+    type: Literal[
+        "request_detail", "verify_contribution", "verify_data", "check_depth",
+        "challenge_consistency", "explicit_approval", "possible_topic_end", "unclear",
+    ]
+    interpretation: str = Field(min_length=2, max_length=500)
+    confidence: Literal["high", "medium", "low"]
+    evidence_ids: list[str] = Field(min_length=1, alias="evidenceIds")
+
+
+class FrameworkSectionSubmission(StrictModel):
+    key: str = Field(min_length=1, max_length=30)
+    label: str = Field(min_length=1, max_length=40)
+    guidance: str = Field(min_length=2, max_length=400)
+    draft: str = Field(min_length=2, max_length=1000)
+    evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
+
+
+class AnswerFrameworkSubmission(StrictModel):
+    type: Literal["STAR", "PREP", "THREE_W", "FIT_EVIDENCE_MOTIVATION", "DIRECT", "CUSTOM"]
+    name: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=2, max_length=500)
+    sections: list[FrameworkSectionSubmission] = Field(min_length=2, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_custom_framework(self) -> "AnswerFrameworkSubmission":
+        if self.type == "CUSTOM" and len(self.sections) < 2:
+            raise ValueError("CUSTOM 框架至少需要两个结构段")
+        return self
+
+
+class RecommendedAnswerSubmission(StrictModel):
+    framework: AnswerFrameworkSubmission
+    full_answer: str = Field(min_length=2, max_length=4000, alias="fullAnswer")
+    evidence_ids: list[str] = Field(min_length=1, alias="evidenceIds")
+    missing_information: list[str] = Field(default_factory=list, max_length=10, alias="missingInformation")
+
+    @field_validator("missing_information", mode="before")
+    @classmethod
+    def normalize_missing_information(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
+
 
 class TopicReviewSubmission(StrictModel):
     topic_id: str = Field(alias="topicId")
@@ -169,13 +258,26 @@ class TopicReviewSubmission(StrictModel):
     dimensions: list[DimensionAssessment] = Field(min_length=5, max_length=5)
     strengths: list[EvidenceClaim] = Field(default_factory=list)
     weaknesses: list[EvidenceClaim] = Field(default_factory=list)
+    answer_logic: AnswerLogicSubmission = Field(alias="answerLogic")
+    interviewer_signals: list[InterviewerSignalSubmission] = Field(default_factory=list, max_length=12, alias="interviewerSignals")
+    recommended_answer: RecommendedAnswerSubmission = Field(alias="recommendedAnswer")
     suggested_structure: str = Field(default="", alias="suggestedStructure", max_length=800)
-    star_rewrite: StarRewriteSubmission = Field(alias="starRewrite")
+    star_rewrite: StarRewriteSubmission | None = Field(default=None, alias="starRewrite")
     knowledge_to_prepare: list[str] = Field(default_factory=list, alias="knowledgeToPrepare")
     role_fit: RoleFitSubmission = Field(alias="roleFit")
     follow_up_assessments: list[FollowUpAssessment] = Field(default_factory=list, alias="followUpAssessments")
     uncertainties: list[str] = Field(default_factory=list)
     revision_summary: str = Field(default="", alias="revisionSummary", max_length=500)
+
+    @field_validator("suggested_structure", mode="before")
+    @classmethod
+    def normalize_suggested_structure(cls, value: Any) -> Any:
+        return _normalize_joined_text(value)
+
+    @field_validator("knowledge_to_prepare", "uncertainties", mode="before")
+    @classmethod
+    def normalize_legacy_string_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> "TopicReviewSubmission":
@@ -188,7 +290,11 @@ class TopicReviewSubmission(StrictModel):
 
 class AuditFinding(StrictModel):
     topic_id: str = Field(alias="topicId")
-    code: Literal["invalid_reference", "unsupported_claim", "score_conflict", "missing_follow_up", "contradiction", "invented_rewrite", "other"]
+    code: Literal[
+        "invalid_reference", "unsupported_claim", "score_conflict", "missing_follow_up",
+        "contradiction", "invented_rewrite", "incomplete_logic", "invalid_signal",
+        "unsuitable_framework", "other",
+    ]
     severity: Literal["critical", "warning"]
     field: str = ""
     message: str = Field(min_length=2, max_length=600)
@@ -216,25 +322,81 @@ class RiskSubmission(StrictModel):
     topic_ids: list[str] = Field(min_length=1, alias="topicIds")
 
 
-class ActionItemSubmission(StrictModel):
-    day: int = Field(ge=1, le=7)
+class EvaluationPointSubmission(StrictModel):
+    text: str = Field(min_length=2, max_length=400)
+    topic_ids: list[str] = Field(min_length=1, alias="topicIds")
+
+
+class OverallEvaluationSubmission(StrictModel):
+    summary: str = Field(min_length=2, max_length=1200)
+    competitiveness: str = Field(min_length=2, max_length=800)
+    strengths: list[EvaluationPointSubmission] = Field(default_factory=list, max_length=3)
+    risks: list[EvaluationPointSubmission] = Field(default_factory=list, max_length=3)
+    next_focus: str = Field(min_length=2, max_length=500, alias="nextFocus")
+
+
+class CapabilityGapSubmission(StrictModel):
+    id: str = Field(pattern=r"^gap-[A-Za-z0-9_-]+$")
+    category: Literal["hard_skill", "soft_skill", "domain_knowledge", "method_tool", "case_material"]
     title: str = Field(min_length=2, max_length=100)
     description: str = Field(min_length=2, max_length=600)
+    impact: str = Field(min_length=2, max_length=500)
+    priority: Literal["high", "medium"]
+    topic_ids: list[str] = Field(min_length=1, alias="topicIds")
+    evidence_ids: list[str] = Field(min_length=1, alias="evidenceIds")
+    learning_items: list[str] = Field(default_factory=list, max_length=5, alias="learningItems")
+    preparation_items: list[str] = Field(default_factory=list, max_length=5, alias="preparationItems")
+
+    @model_validator(mode="after")
+    def validate_actions(self) -> "CapabilityGapSubmission":
+        if not self.learning_items and not self.preparation_items:
+            raise ValueError("能力缺口至少需要一个学习项或准备项")
+        return self
+
+
+class ActionItemSubmission(StrictModel):
+    order: int = Field(ge=1, le=7)
+    title: str = Field(min_length=2, max_length=100)
+    description: str = Field(min_length=2, max_length=600)
+    type: Literal["learning", "preparation"]
+    gap_ids: list[str] = Field(min_length=1, alias="gapIds")
     dimension: DimensionName
     priority: Literal["high", "medium"]
     success_criterion: str = Field(min_length=2, max_length=300, alias="successCriterion")
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_action_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "order" not in normalized and "day" in normalized:
+            normalized["order"] = normalized["day"]
+        normalized.pop("day", None)
+        normalized.pop("deliverable", None)
+        return normalized
+
 
 class GrowthPlanSubmission(StrictModel):
-    summary: str = Field(min_length=2, max_length=1200)
-    top_risks: list[RiskSubmission] = Field(default_factory=list, max_length=3, alias="topRisks")
-    next_focus: str = Field(min_length=2, max_length=500, alias="nextFocus")
-    action_items: list[ActionItemSubmission] = Field(min_length=7, max_length=7, alias="actionItems")
+    overall_evaluation: OverallEvaluationSubmission = Field(alias="overallEvaluation")
+    capability_gaps: list[CapabilityGapSubmission] = Field(min_length=1, max_length=5, alias="capabilityGaps")
+    action_items: list[ActionItemSubmission] = Field(min_length=3, max_length=7, alias="actionItems")
 
     @model_validator(mode="after")
-    def validate_days(self) -> "GrowthPlanSubmission":
-        if {item.day for item in self.action_items} != set(range(1, 8)):
-            raise ValueError("七天计划必须完整包含第 1 到第 7 天")
+    def validate_actions(self) -> "GrowthPlanSubmission":
+        expected_order = set(range(1, len(self.action_items) + 1))
+        if {item.order for item in self.action_items} != expected_order:
+            raise ValueError("行动项 order 必须从 1 开始连续编号且不能重复")
+        gap_ids = [item.id for item in self.capability_gaps]
+        if len(gap_ids) != len(set(gap_ids)):
+            raise ValueError("capabilityGaps.id 不能重复")
+        known_gaps = set(gap_ids)
+        referenced = {gap_id for item in self.action_items for gap_id in item.gap_ids}
+        if referenced - known_gaps:
+            raise ValueError("actionItems 包含未知 gapId")
+        high_priority = {item.id for item in self.capability_gaps if item.priority == "high"}
+        if high_priority - referenced:
+            raise ValueError("每个高优先级缺口至少需要一个行动项")
         return self
 
 

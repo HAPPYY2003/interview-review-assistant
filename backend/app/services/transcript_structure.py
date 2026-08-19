@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - requirements include jieba
     jieba = None
 
 
-QUESTION_TYPES = ("项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他")
+QUESTION_TYPES = ("自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他")
 SPEAKER_PATTERN = re.compile(
     r"^(?:(?P<time>\[[^\]]+\]|(?:\d{1,2}:){1,2}\d{2})\s*)?"
     r"(?P<label>面试官|采访者|interviewer|问|q|候选人|求职者|candidate|答|a)\s*[:：]\s*(?P<text>.*)$",
@@ -97,7 +97,7 @@ class QuestionTurnSubmission(StrictModel):
     answer_utterance_ids: list[str] = Field(default_factory=list)
     turn_type: Literal["main", "follow_up"] = "main"
     parent_question_anchor: str | None = None
-    question_type: Literal["项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"]
+    question_type: Literal["自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"]
     topic_title: str = Field(min_length=1, max_length=40)
     question_boundary_assessment: ConfidenceAssessment
     answer_boundary_assessment: ConfidenceAssessment

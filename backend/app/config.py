@@ -18,7 +18,7 @@ def _bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     root_dir: Path = ROOT_DIR
-    data_dir: Path = ROOT_DIR / "data"
+    data_dir: Path = Path(os.getenv("OFFER_RADAR_DATA_DIR", str(ROOT_DIR / "data")))
     knowledge_dir: Path = ROOT_DIR / "knowledge"
     frontend_dir: Path = ROOT_DIR / "frontend"
     app_env: str = os.getenv("APP_ENV", "development")

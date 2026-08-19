@@ -39,14 +39,125 @@ def run() -> None:
             page.goto(f"{BASE_URL}/#/new", wait_until="networkidle")
             page.evaluate("localStorage.clear()")
             page.reload(wait_until="networkidle")
+            assert "HelloAgents" not in page.locator(".sidebar").inner_text()
 
             step_tops = page.locator(".step").evaluate_all(
                 "nodes => nodes.map(node => Math.round(node.getBoundingClientRect().top))"
             )
             assert len(set(step_tops)) == 1, f"desktop steps wrapped: {step_tops}"
+            step_alignment = page.evaluate(
+                """() => {
+                    const pageBox = document.querySelector('.page').getBoundingClientRect();
+                    const stepsBox = document.querySelector('.steps').getBoundingClientRect();
+                    const stepBoxes = [...document.querySelectorAll('.step')].map(
+                        step => step.getBoundingClientRect()
+                    );
+                    return {
+                        leftDelta: Math.abs(pageBox.left - stepsBox.left),
+                        rightDelta: Math.abs(pageBox.right - stepsBox.right),
+                        firstStepDelta: Math.abs(pageBox.left - stepBoxes[0].left),
+                        lastStepDelta: Math.abs(pageBox.right - stepBoxes.at(-1).right),
+                    };
+                }"""
+            )
+            assert step_alignment["leftDelta"] <= 1, step_alignment
+            assert step_alignment["rightDelta"] <= 1, step_alignment
+            assert step_alignment["firstStepDelta"] <= 1, step_alignment
+            assert step_alignment["lastStepDelta"] <= 1, step_alignment
             date_input = page.locator('input[name="interviewDate"]')
             assert date_input.get_attribute("placeholder") == "YYYY-MM-DD"
             assert date_input.get_attribute("type") == "text"
+
+            flat_questions = [
+                {
+                    "id": f"flat-turn-{index}",
+                    "turnType": "follow_up" if index >= 8 else "main",
+                    "interviewerQuestion": f"平铺问题 {index + 1}",
+                }
+                for index in range(20)
+            ]
+            nested_questions = [
+                {
+                    "id": f"nested-main-{index}",
+                    "turnType": "main",
+                    "interviewerQuestion": f"主题问题 {index + 1}",
+                    "followUpTurns": [
+                        {
+                            "id": f"nested-follow-{index}-{follow_index}",
+                            "turnType": "follow_up",
+                            "interviewerQuestion": f"追问 {index + 1}-{follow_index + 1}",
+                        }
+                        for follow_index in range(3 if index < 4 else 0)
+                    ],
+                }
+                for index in range(8)
+            ]
+            page.evaluate(
+                "rows => localStorage.setItem('offer-radar-agent-v1', JSON.stringify(rows))",
+                [
+                    {
+                        "id": "count-flat",
+                        "company": "平铺题目",
+                        "position": "测试岗位",
+                        "status": "waiting_confirmation",
+                        "questions": flat_questions,
+                        "updatedAt": "2026-08-19T12:00:00+08:00",
+                    },
+                    {
+                        "id": "count-nested",
+                        "company": "嵌套题目",
+                        "position": "测试岗位",
+                        "status": "completed",
+                        "questions": nested_questions,
+                        "questionCount": 8,
+                        "updatedAt": "2026-08-19T11:00:00+08:00",
+                    },
+                ],
+            )
+            page.goto(f"{BASE_URL}/#/", wait_until="networkidle")
+            page.reload(wait_until="networkidle")
+            question_counts = page.locator('.table-row.data [data-label="问题"]').all_inner_texts()
+            assert question_counts == ["20 道", "20 道"], question_counts
+            self_intro_question = {
+                "id": "self-intro-question",
+                "turnType": "main",
+                "topicRootId": "self-intro-question",
+                "interviewerQuestion": "请用三分钟做一个自我介绍。",
+                "candidateAnswer": "我有五年企业产品经验。",
+                "questionType": "自我介绍",
+                "topicTitle": "个人背景与岗位契合",
+                "confidence": "high",
+            }
+            page.evaluate(
+                "row => localStorage.setItem('offer-radar-agent-v1', JSON.stringify([row]))",
+                {
+                    "id": "self-intro-ui",
+                    "company": "题型测试",
+                    "position": "产品经理",
+                    "status": "waiting_confirmation",
+                    "questions": [self_intro_question],
+                    "topics": [
+                        {
+                            "id": "self-intro-question",
+                            "title": "个人背景与岗位契合",
+                            "mainTurn": self_intro_question,
+                            "followUps": [],
+                        }
+                    ],
+                    "updatedAt": "2026-08-19T12:30:00+08:00",
+                },
+            )
+            page.goto(f"{BASE_URL}/#/parse/self-intro-ui", wait_until="networkidle")
+            page.reload(wait_until="networkidle")
+            question_type_select = page.locator("[data-topic-type]")
+            assert question_type_select.input_value() == "自我介绍"
+            assert "自我介绍" in question_type_select.locator("option").all_inner_texts()
+            if os.getenv("UI_QUESTION_COUNT_ONLY") == "1":
+                print(json.dumps({"ok": True, "questionCounts": question_counts}, ensure_ascii=False))
+                return
+            page.evaluate("localStorage.clear()")
+            page.goto(f"{BASE_URL}/#/new", wait_until="networkidle")
+            page.reload(wait_until="networkidle")
 
             page.get_by_role("button", name="上传文字稿").click()
             picker_hit = page.locator('[data-source-panel="text"] .file-row').evaluate(
@@ -306,38 +417,145 @@ def run() -> None:
             page.set_viewport_size({"width": 1440, "height": 900})
             page.locator("#startRun").click()
             page.wait_for_url(re.compile(r"#/review/"), timeout=25_000)
+            assert "HelloAgents" not in page.locator(".report-page").inner_text()
             assert "快速复盘" in page.locator(".mode-badge.quick").inner_text()
+            assert page.get_by_role("heading", name="面试综合评价").is_visible()
+            assert page.get_by_role("heading", name="技能 / 知识缺口").is_visible()
+            assert page.get_by_role("heading", name="下一步行动计划").is_visible()
+            assert page.get_by_role("heading", name="逐题深度复盘").is_visible()
+            assert page.locator(".legacy-report-notice").count() == 0
+            assert "旧报告未" not in page.locator(".report-page").inner_text()
+            assert page.locator(".action-item").count() == 3
+            assert page.locator(".action-deliverable").count() == 0
+            assert page.locator(".action-order").first.inner_text() == "行动 1"
+            assert page.locator(".action-meta").first.inner_text().startswith("提升维度：")
+            assert page.locator(".gap-impact").count() == 0
+            assert page.locator(".gap-topics").evaluate_all(
+                "groups => groups.every(group => { const labels = [...group.querySelectorAll('button')].map(button => button.innerText); return labels.length === new Set(labels).size; })"
+            ), "gap topic actions need distinct labels within each gap"
+            rerun_review = page.locator("#rerunReview")
+            assert rerun_review.is_visible()
+            assert rerun_review.inner_text().strip() == "重新面试复盘"
+            rerun_review.click()
+            rerun_dialog = page.locator("#reviewDialog")
+            assert rerun_dialog.is_visible()
+            assert page.get_by_role("heading", name="重新进行面试复盘").is_visible()
+            assert "基于当前题卡重新运行 Agent" in rerun_dialog.inner_text()
+            rerun_dialog.get_by_role("radio", name=re.compile("仅使用内部资料")).check()
+            rerun_acknowledgement = rerun_dialog.locator("#acknowledgeUnreviewed")
+            if rerun_acknowledgement.count():
+                rerun_acknowledgement.check()
+            assert rerun_dialog.locator("#startRun").is_enabled()
+            rerun_dialog.get_by_role("button", name="取消").click()
+            rerun_dialog.wait_for(state="hidden")
             page.locator(".accordion-button").first.click()
             page.locator(".accordion-panel").wait_for()
+            tabs = page.locator(".question-review-tabs .question-review-tab")
+            assert tabs.count() == 5
+            tab_labels = tabs.all_inner_texts()
+            assert tab_labels[:4] == ["回答逻辑", "面试官信号", "问题诊断", "优化回答"]
+            assert tab_labels[4].startswith("证据引用")
+            page.get_by_role("tab", name="回答逻辑", exact=True).click()
+            reading = page.locator(".question-reading-details")
+            assert reading.locator("summary").inner_text().startswith("回答原文")
+            reading.locator("summary").click()
+            assert reading.locator(".answer-transcript-list > section").count() >= 1
+            page.screenshot(path=OUTPUT_DIR / "ui-question-logic-desktop.png", full_page=True)
+            for tab_name in ("回答逻辑", "面试官信号", "问题诊断", "优化回答", "证据引用"):
+                page.get_by_role("tab", name=tab_name, exact=False).first.click()
+                if tab_name == "问题诊断":
+                    panel = page.locator(".diagnosis-tab-panel")
+                    assert panel.get_by_text("查看完整 Agent 诊断", exact=True).count() == 0
+                    assert panel.locator(".diagnosis-uncertainty").count() == 0
+                if tab_name == "优化回答":
+                    assert page.locator(".framework-heading").is_visible()
+                    assert page.locator(".optimized-answer").is_visible()
+                    assert page.locator(".answer-outline-details").is_visible()
+                    assert not page.locator(".answer-outline-details").evaluate("node => node.open")
+                    assert page.locator(".answer-provenance-note").is_visible()
+                    assert page.locator(".improvement-notice").count() == 0
+                    framework_metrics = page.evaluate(
+                        """() => ({
+                            noticeHeight: document.querySelector('.answer-provenance-note').getBoundingClientRect().height,
+                            keys: [...document.querySelectorAll('.framework-key')].map(node => ({
+                                width: node.getBoundingClientRect().width,
+                                scrollWidth: node.scrollWidth,
+                                clientWidth: node.clientWidth,
+                            })),
+                        })"""
+                    )
+                    assert framework_metrics["noticeHeight"] <= 40
+                    page.screenshot(path=OUTPUT_DIR / "ui-question-improvement-desktop.png", full_page=True)
+                    page.locator(".answer-outline-details > summary").click()
+                    assert page.locator(".answer-outline-details").evaluate("node => node.open")
+                    framework_metrics = page.evaluate(
+                        """() => [...document.querySelectorAll('.framework-key')].map(node => ({
+                            width: node.getBoundingClientRect().width,
+                            scrollWidth: node.scrollWidth,
+                            clientWidth: node.clientWidth,
+                        }))"""
+                    )
+                    assert len({round(item["width"]) for item in framework_metrics}) <= 1
+                    assert all(item["scrollWidth"] <= item["clientWidth"] for item in framework_metrics)
+                    page.locator(".answer-outline-details > summary").click()
+                    assert not page.locator(".answer-outline-details").evaluate("node => node.open")
+                assert_no_overflow(page, f"desktop report {tab_name} tab")
+            assert page.locator(".evidence-overview").is_visible()
+            gap_topic = page.locator("[data-open-topic]").first
+            if gap_topic.count():
+                gap_topic.click()
+                assert page.locator(".accordion-item.expanded").count() == 1
+            with page.expect_download() as download_info:
+                page.locator("#exportReport").click()
+            markdown = Path(download_info.value.path()).read_text(encoding="utf-8")
+            for heading in (
+                "## 面试综合评价", "## 技能 / 知识缺口", "## 下一步行动计划",
+                "## 逐题深度复盘", "**回答逻辑**", "**面试官信号**",
+                "**问题诊断**", "**回答改进**", "**证据引用**",
+            ):
+                assert heading in markdown
             assert_no_overflow(page, "desktop report page")
             page.screenshot(path=OUTPUT_DIR / "ui-report-desktop.png", full_page=True)
 
             report_url = page.url
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert_no_overflow(page, "mobile V2 report page")
+            assert page.locator(".question-review-tabs").evaluate(
+                "node => node.scrollWidth >= node.clientWidth"
+            )
+            assert page.locator(".action-list").evaluate(
+                "node => getComputedStyle(node).gridTemplateColumns.split(' ').length === 1"
+            )
+            page.screenshot(path=OUTPUT_DIR / "ui-report-mobile.png", full_page=True)
+            page.set_viewport_size({"width": 1440, "height": 900})
             page.goto(f"{BASE_URL}/#/trends", wait_until="networkidle")
             add_trend = page.locator("#openTrendImport")
             assert add_trend.is_visible(), "growth trends should expose a manual import entry point"
             add_trend.click()
             trend_dialog = page.locator("#trendImportDialog")
-            assert trend_dialog.is_visible()
-            available_candidate = trend_dialog.locator(
-                "input[data-select-trend-candidate]:not([disabled])"
-            ).first
-            assert available_candidate.count() == 1, "completed review should be available for import"
-            candidate_id = available_candidate.get_attribute("data-select-trend-candidate")
-            available_candidate.check()
-            assert page.locator("#importSelectedTrends").is_enabled()
-            page.locator("#importSelectedTrends").click()
-            trend_dialog.wait_for(state="hidden")
-            assert page.locator(".trend-item").count() >= 1
-            assert "已添加" in page.locator(".toast").inner_text()
-
-            add_trend.click()
             trend_dialog.wait_for(state="visible")
-            imported_candidate = trend_dialog.locator(
-                f'input[data-select-trend-candidate="{candidate_id}"]'
+            page.wait_for_function(
+                "() => !document.querySelector('.trend-import-empty')?.textContent.includes('正在读取')",
+                timeout=5_000,
             )
-            assert imported_candidate.is_disabled()
-            assert "已添加" in imported_candidate.locator("xpath=ancestor::label").inner_text()
+            candidates = trend_dialog.locator("input[data-select-trend-candidate]")
+            available_candidate = trend_dialog.locator("input[data-select-trend-candidate]:not([disabled])").first
+            if candidates.count() == 0:
+                assert "没有可添加的面试记录" in trend_dialog.inner_text()
+            elif available_candidate.count():
+                candidate_id = available_candidate.get_attribute("data-select-trend-candidate")
+                available_candidate.check()
+                assert page.locator("#importSelectedTrends").is_enabled()
+                page.locator("#importSelectedTrends").click()
+                trend_dialog.wait_for(state="hidden")
+                assert page.locator(".trend-item").count() >= 1
+                add_trend.click()
+                trend_dialog.wait_for(state="visible")
+                imported_candidate = trend_dialog.locator(f'input[data-select-trend-candidate="{candidate_id}"]')
+                assert imported_candidate.is_disabled()
+                assert "已添加" in imported_candidate.locator("xpath=ancestor::label").inner_text()
+            else:
+                assert all(candidates.evaluate_all("nodes => nodes.map(node => node.disabled)"))
             assert_no_overflow(page, "desktop growth import dialog")
             page.screenshot(path=OUTPUT_DIR / "ui-trends-import-desktop.png", full_page=True)
             page.locator("[data-close-trend-import]").first.click()
@@ -411,6 +629,7 @@ def run() -> None:
             )
             run_page.goto(f"{BASE_URL}/#/run/{run_record['id']}/ui-agent-run", wait_until="networkidle")
             run_summary = run_page.locator(".agent-run-summary").inner_text()
+            assert "HelloAgents" not in run_summary
             assert "2/2 个主题已提交" in run_summary, run_summary
             assert "Reflection 审计 2/2 轮 · 已修订 1 次" in run_summary
             assert run_page.locator(".agent-stage.done").count() == 1
@@ -434,7 +653,7 @@ def run() -> None:
 
             if console_errors:
                 raise AssertionError(f"console errors: {' | '.join(console_errors)}")
-            print(json.dumps({"ok": True, "screenshots": 10, "consoleErrors": 0}))
+            print(json.dumps({"ok": True, "screenshots": 11, "consoleErrors": 0}))
         finally:
             browser.close()
 

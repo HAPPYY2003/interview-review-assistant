@@ -1,0 +1,22 @@
+{
+  "company": "字节跳动",
+  "position": "AI 产品经理 - 飞书多维表格",
+  "round": "业务终面（模拟）",
+  "interviewDate": "2026-08-18",
+  "reviewGoal": "重点检查企业 AI 产品判断、Agent 工作流设计、效果评估、权限安全、增长商业化和跨团队推动能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "expectedParse": {
+    "questionAnswerRounds": 20,
+    "labeledMinimumQuestions": 20,
+    "unlabeledMinimumQuestions": 20,
+    "unlabeledNeedsConfirmation": true
+  },
+  "expectedFocus": [
+    "候选人能否区分 Agent 与确定性工作流，并按照风险分级选择方案",
+    "评估体系是否同时覆盖模型效果、任务成功、业务价值、成本和安全",
+    "指标提升是否有对照、口径和样本量说明，是否存在过度归因",
+    "是否具备企业权限、多租户隔离、提示注入和人工确认意识",
+    "能否将产品能力转化为激活、复用、付费和续约路径"
+  ]
+}

@@ -5,7 +5,7 @@ import wave
 
 from fastapi.testclient import TestClient
 
-from backend.app.main import app, database, review_service, workflow
+from backend.app.main import app, database, review_service, settings, workflow
 
 
 def _wav_bytes() -> bytes:
@@ -33,7 +33,9 @@ def test_v1_api_end_to_end_and_sse_contract():
         "rawTranscript": "面试官：请介绍一个项目。\n候选人：我推动四轮实验，点击率提升 12.6%。",
     }
     with TestClient(app) as client:
-        assert client.get("/api/health").status_code == 200
+        health = client.get("/api/health")
+        assert health.status_code == 200
+        assert health.json()["reportSchemaVersion"] == 2
         created = client.post("/api/v1/interviews", json=payload)
         assert created.status_code == 201
 
@@ -69,6 +71,7 @@ def test_v1_api_end_to_end_and_sse_contract():
 
         started = client.post(f"/api/v1/interviews/{interview_id}/review-runs", json={"enableWebVerify": False})
         assert started.status_code == 202
+        assert started.json()["reportSchemaVersion"] == 2
         run_id = started.json()["id"]
 
         run = {}
@@ -88,7 +91,15 @@ def test_v1_api_end_to_end_and_sse_contract():
         report = client.get(f"/api/v1/interviews/{interview_id}/report")
         assert report.status_code == 200
         assert report.json()["status"] == "COMPLETED"
+        assert report.json()["reportSchemaVersion"] == 2
         assert report.json()["questions"][0]["evidenceRefs"]
+        assert report.json()["questions"][0]["answerLogic"]["steps"]
+        assert report.json()["questions"][0]["recommendedAnswer"]["framework"]["type"]
+        assert report.json()["interview"]["overallEvaluation"]["score"] == report.json()["interview"]["overallScores"]["overall"]
+        assert report.json()["interview"]["capabilityGaps"]
+        assert len(report.json()["actions"]) == 3
+        assert all(item["gapIds"] and item["successCriterion"] for item in report.json()["actions"])
+        assert all("deliverable" not in item for item in report.json()["actions"])
         assert report.json()["interview"]["latestAIMetadata"]["provider"] == "Fixture"
         assert report.json()["artifacts"]
 
@@ -132,6 +143,10 @@ def test_v1_api_end_to_end_and_sse_contract():
         assert events.status_code == 200
         assert "event: RUN_FINISHED" in events.text
         assert "THINKING" not in events.text
+        last_event_id = run["events"][-1]["id"]
+        resumed_events = client.get(f"/api/v1/runs/{run_id}/events?after={last_event_id - 1}")
+        assert f"id: {last_event_id}\n" in resumed_events.text
+        assert f"id: {last_event_id - 1}\n" not in resumed_events.text
 
 
 def test_quick_review_preserves_unconfirmed_question_state():
@@ -208,6 +223,34 @@ def test_reassigning_the_only_answer_segment_clears_stale_extracted_answer():
         updated = patched.json()["questions"][0]
         assert updated["extractedAnswer"] == ""
         assert updated["candidateAnswer"] == ""
+
+
+def test_question_patch_preserves_legacy_text_and_rejects_empty_question():
+    interview_id = f"legacy-question-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        assert client.post("/api/v1/interviews", json={"id": interview_id}).status_code == 201
+        legacy = {
+            "id": f"legacy-topic-{uuid.uuid4()}",
+            "interviewerQuestion": "请介绍一个项目。",
+            "candidateAnswer": "我负责推荐策略优化。",
+            "questionType": "项目经历",
+        }
+
+        patched = client.patch(
+            f"/api/v1/interviews/{interview_id}/questions",
+            json={"questions": [legacy]},
+        )
+
+        assert patched.status_code == 200
+        assert patched.json()["questions"][0]["interviewerQuestion"] == "请介绍一个项目。"
+        legacy["interviewerQuestion"] = ""
+        legacy["candidateAnswer"] = ""
+        rejected = client.patch(
+            f"/api/v1/interviews/{interview_id}/questions",
+            json={"questions": [legacy]},
+        )
+        assert rejected.status_code == 422
+        assert "问题原文不能为空" in rejected.json()["detail"]
 
 
 def test_parse_api_supports_all_transcript_shapes_and_returns_atoms():
@@ -322,8 +365,103 @@ def test_failed_agent_run_only_falls_back_after_explicit_request():
         assert any(event["type"] == "FALLBACK_REQUESTED" for event in completed["events"])
 
         report = client.get(f"/api/v1/interviews/{interview_id}/report").json()
+        assert report["reportSchemaVersion"] == 2
+        assert report["interview"]["capabilityGaps"]
+        assert len(report["actions"]) == 3
         assert report["interview"]["latestAIMetadata"]["provider"] == "DeterministicFallback"
         assert report["interview"]["degraded"] is True
+
+
+def test_report_can_target_completed_run_when_a_newer_run_failed():
+    interview_id = f"report-run-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        interview = database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "raw_transcript": "面试官：请介绍一个项目。\n候选人：我负责实验设计并推动上线。",
+        })
+        database.replace_questions(interview_id, review_service.parse_transcript(interview["raw_transcript"]))
+        database.confirm_questions(interview_id)
+        completed_run = database.create_run(
+            interview_id,
+            agent_mode="fixture",
+            input_digest=workflow.input_digest(interview_id),
+        )
+        workflow.execute(completed_run["id"])
+        newer_run = database.create_run(
+            interview_id,
+            agent_mode="fixture",
+            input_digest=workflow.input_digest(interview_id),
+        )
+        database.update_run(newer_run["id"], status="FAILED", phase="growth_plan", error="测试失败", failure_code="TEST_FAILURE")
+
+        latest_report = client.get(f"/api/v1/interviews/{interview_id}/report")
+        targeted_report = client.get(
+            f"/api/v1/interviews/{interview_id}/report",
+            params={"runId": completed_run["id"]},
+        )
+
+        assert latest_report.json()["status"] == "FAILED"
+        assert targeted_report.status_code == 200
+        assert targeted_report.json()["status"] == "COMPLETED"
+        assert targeted_report.json()["run"]["id"] == completed_run["id"]
+
+
+def test_delete_interview_removes_database_rows_and_private_artifacts():
+    interview_id = f"delete-all-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "raw_transcript": "面试官：请介绍项目。\n候选人：我负责推荐策略。",
+        })
+        upload_dir = settings.data_dir / "uploads" / interview_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_file = upload_dir / "interview.txt"
+        upload_file.write_text("private transcript", encoding="utf-8")
+        material = database.add_material(
+            interview_id,
+            "transcript",
+            "private transcript",
+            "interview.txt",
+            storage_path=str(upload_file),
+        )
+        parse_run = database.create_parse_run(interview_id, material["id"], "text")
+        review_run = database.create_run(interview_id, agent_mode="fixture")
+        database.replace_questions(interview_id, [{
+            "id": f"question-{uuid.uuid4()}",
+            "order": 1,
+            "interviewerQuestion": "请介绍项目。",
+            "candidateAnswer": "我负责推荐策略。",
+            "questionType": "项目经历",
+        }])
+        database.save_growth_snapshot(interview_id, review_run["id"], {"overall": 7.0}, [], [])
+
+        parse_artifact = settings.data_dir / "parse-runs" / parse_run["id"]
+        parse_artifact.mkdir(parents=True, exist_ok=True)
+        (parse_artifact / "questions.json").write_text("private", encoding="utf-8")
+        trace_file = settings.data_dir / "traces" / "trace-delete-test.jsonl"
+        trace_file.write_text(f'{{"interview_id":"{interview_id}"}}', encoding="utf-8")
+        session_file = settings.data_dir / "sessions" / "session-delete-test.json"
+        session_file.write_text(f'{{"run_id":"{review_run["id"]}"}}', encoding="utf-8")
+
+        deleted = client.delete(f"/api/v1/interviews/{interview_id}")
+
+        assert deleted.status_code == 200
+        assert deleted.json() == {"deleted": True}
+        assert not upload_dir.exists()
+        assert not parse_artifact.exists()
+        assert not trace_file.exists()
+        assert not session_file.exists()
+        with database.connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM interviews WHERE id=?", (interview_id,)).fetchone()[0] == 0
+            for table in ("materials", "question_cards", "parse_runs", "review_runs", "growth_snapshots"):
+                assert connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE interview_id=?",
+                    (interview_id,),
+                ).fetchone()[0] == 0
 
 
 def test_growth_snapshot_delete_keeps_interview_record():
@@ -400,3 +538,33 @@ def test_growth_snapshot_delete_keeps_interview_record():
                 (interview_id,),
             ).fetchone()[0]
         assert remaining_snapshots == 0
+
+
+def test_growth_snapshot_tracks_latest_review_score():
+    interview_id = f"trend-sync-{uuid.uuid4()}"
+    database.create_interview({"id": interview_id, "company": "星河科技", "position": "产品经理"})
+    first_run = database.create_run(interview_id, agent_mode="fixture")
+    database.update_run(first_run["id"], status="COMPLETED", phase="completed")
+    database.save_growth_snapshot(
+        interview_id,
+        first_run["id"],
+        {"overall": 5.2, "relevance": 6.0, "structure": 4.0, "evidence": 5.0, "depth": 5.0, "roleFit": 6.0},
+        ["structure", "evidence"],
+        [],
+    )
+
+    latest_run = database.create_run(interview_id, agent_mode="fixture")
+    latest_scores = {
+        "overall": 7.4,
+        "relevance": 7.5,
+        "structure": 7.0,
+        "evidence": 7.5,
+        "depth": 7.5,
+        "roleFit": 7.5,
+    }
+
+    assert database.sync_growth_snapshot(interview_id, latest_run["id"], latest_scores, []) == 1
+    snapshot = next(item for item in database.get_growth_trends() if item["interview_id"] == interview_id)
+    assert snapshot["run_id"] == latest_run["id"]
+    assert snapshot["scores"] == latest_scores
+    assert snapshot["weakDimensions"] == ["structure", "relevance"]

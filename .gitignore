@@ -9,12 +9,14 @@ __pycache__/
 htmlcov/
 data/offer_radar.db
 data/offer_radar.db-*
+data/*.db
 data/uploads/
 data/sessions/
 data/traces/
 data/parse-runs/
 data/*.log
 server.*.log
+server-*.log
 data/ui-*.png
 node_modules/
 playwright-report/

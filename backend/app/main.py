@@ -34,7 +34,7 @@ from backend.app.services.document_parser import DocumentParseError, DocumentPar
 from backend.app.services.evidence import EvidenceReviewService
 from backend.app.services.knowledge import KnowledgeBase
 from backend.app.services.parse_workflow import ParseWorkflow
-from backend.app.services.workflow import ReviewWorkflow
+from backend.app.services.workflow import REPORT_SCHEMA_VERSION, ReviewWorkflow
 
 
 settings.ensure_directories()
@@ -58,7 +58,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="Offer Radar Agent", version="0.2.1", lifespan=lifespan)
+app = FastAPI(title="Offer Radar Agent", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
@@ -89,10 +89,50 @@ def get_parse_run_or_404(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="未找到解析任务") from exc
 
 
+def resolve_material_path(stored_path: str) -> Path:
+    path = Path(stored_path)
+    return path.resolve() if path.is_absolute() else (settings.root_dir / path).resolve()
+
+
+def serialize_material_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(settings.root_dir.resolve())).replace("\\", "/")
+    except ValueError:
+        return str(resolved)
+
+
+def remove_agent_files_for_identifiers(root: Path, identifiers: list[str]) -> int:
+    """Remove session/trace files that contain identifiers owned by one interview."""
+    if not root.exists() or not identifiers:
+        return 0
+    resolved_root = root.resolve()
+    removed = 0
+    for candidate in list(resolved_root.rglob("*")):
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved_root not in resolved.parents:
+            continue
+        matched = any(identifier in candidate.name for identifier in identifiers)
+        if not matched:
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            matched = any(identifier in content for identifier in identifiers)
+        if matched:
+            candidate.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "appVersion": app.version,
+        "reportSchemaVersion": REPORT_SCHEMA_VERSION,
         "runtime": "helloagents" if settings.real_agent_enabled else "fixture",
         "demoMode": settings.demo_mode,
         "knowledgeChunks": len(knowledge.documents),
@@ -117,17 +157,18 @@ def list_interviews() -> list[dict[str, Any]]:
 @app.delete("/api/v1/interviews/{interview_id}")
 def delete_interview(interview_id: str) -> dict[str, bool]:
     get_interview_or_404(interview_id)
-    parse_run_ids = database.get_parse_run_ids(interview_id)
-    paths = database.delete_interview(interview_id)
-    for stored_path in paths:
-        candidate = (settings.root_dir / stored_path).resolve()
+    cleanup = database.delete_interview(interview_id)
+    for stored_path in cleanup["storagePaths"]:
+        candidate = resolve_material_path(stored_path)
         uploads = (settings.data_dir / "uploads").resolve()
         if uploads in candidate.parents:
             candidate.unlink(missing_ok=True)
     upload_dir = settings.data_dir / "uploads" / interview_id
     shutil.rmtree(upload_dir, ignore_errors=True)
-    for parse_run_id in parse_run_ids:
+    for parse_run_id in cleanup["parseRunIds"]:
         shutil.rmtree(settings.data_dir / "parse-runs" / parse_run_id, ignore_errors=True)
+    remove_agent_files_for_identifiers(settings.data_dir / "sessions", cleanup["identifiers"])
+    remove_agent_files_for_identifiers(settings.data_dir / "traces", cleanup["identifiers"])
     return {"deleted": True}
 
 
@@ -167,7 +208,7 @@ async def upload_material(
                         raise AudioInspectionError("音频超过 200MB 限制")
                     handle.write(chunk)
             inspection = inspect_audio(target, file.filename or "", settings)
-            relative_path = str(target.relative_to(settings.root_dir)).replace("\\", "/")
+            relative_path = serialize_material_path(target)
             return database.add_material(
                 interview_id,
                 material_type,
@@ -203,7 +244,7 @@ def get_material_content(material_id: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="未找到材料") from exc
     if material["material_type"] != "transcript_audio" or not material.get("storage_path"):
         raise HTTPException(status_code=404, detail="该材料没有可回放音频")
-    candidate = (settings.root_dir / material["storage_path"]).resolve()
+    candidate = resolve_material_path(material["storage_path"])
     uploads = (settings.data_dir / "uploads").resolve()
     if uploads not in candidate.parents or not candidate.is_file():
         raise HTTPException(status_code=404, detail="音频文件不存在")
@@ -364,12 +405,22 @@ def patch_questions(interview_id: str, payload: QuestionPatch) -> dict[str, Any]
         missing = [segment_id for segment_id in [*question_ids, *answer_ids] if segment_id not in segment_map]
         if missing:
             raise HTTPException(status_code=422, detail=f"题卡引用了不存在的话轮：{missing[0]}")
-        item["extractedQuestion"] = "\n".join(segment_map[segment_id]["rawText"] for segment_id in question_ids).strip()
-        item["extractedAnswer"] = "\n".join(segment_map[segment_id]["rawText"] for segment_id in answer_ids).strip()
+        item["extractedQuestion"] = (
+            "\n".join(segment_map[segment_id]["rawText"] for segment_id in question_ids).strip()
+            if question_ids else str(item.get("extractedQuestion") or item.get("interviewerQuestion") or "").strip()
+        )
+        item["extractedAnswer"] = (
+            "\n".join(segment_map[segment_id]["rawText"] for segment_id in answer_ids).strip()
+            if answer_ids else (
+                "" if question_ids else str(item.get("extractedAnswer") or item.get("candidateAnswer") or "").strip()
+            )
+        )
         if not item.get("editedQuestion"):
             item["interviewerQuestion"] = item["extractedQuestion"]
         if not item.get("editedAnswer"):
             item["candidateAnswer"] = item["extractedAnswer"]
+        if not str(item.get("interviewerQuestion", "")).strip():
+            raise HTTPException(status_code=422, detail="题卡问题原文不能为空，请返回解析结果重新分配问题片段")
         resolved_codes = {"QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS", "ANSWER_MISSING", "REFERENCE_VALIDATION_FAILED"}
         item["confirmationReasons"] = [reason for reason in item.get("confirmationReasons", []) if reason.get("code") not in resolved_codes]
         item["needsConfirmation"] = False if item.get("confirmed") else bool(item["confirmationReasons"] or not item.get("interviewerQuestion"))
@@ -417,6 +468,8 @@ async def create_review_run(interview_id: str, payload: ReviewRunCreate | None =
     questions = database.get_questions(interview_id)
     if not questions:
         raise HTTPException(status_code=409, detail="没有可复盘的问题")
+    if any(not str(item.get("interviewerQuestion", "")).strip() for item in questions):
+        raise HTTPException(status_code=409, detail="存在问题原文为空的题卡，请返回人工校对页修复后再复盘")
     review_mode = payload.review_mode if payload else "full"
     unconfirmed = [item for item in questions if not item["confirmed"]]
     unresolved = database.unresolved_segments(interview_id) or [item for item in questions if item.get("needsConfirmation")]
@@ -440,7 +493,7 @@ async def create_review_run(interview_id: str, payload: ReviewRunCreate | None =
         raise HTTPException(status_code=409, detail=detail, headers={"X-Active-Run-ID": exc.run_id}) from exc
     if not run.get("reused"):
         _schedule_run(run["id"])
-    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "reviewMode": run["review_mode"], "agentMode": run["agent_mode"], "reused": bool(run.get("reused")), "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
+    return {"id": run["id"], "interviewId": interview_id, "status": run["status"], "reviewMode": run["review_mode"], "agentMode": run["agent_mode"], "reportSchemaVersion": REPORT_SCHEMA_VERSION, "reused": bool(run.get("reused")), "eventsUrl": f"/api/v1/runs/{run['id']}/events"}
 
 
 @app.get("/api/v1/runs/{run_id}")
@@ -462,12 +515,16 @@ def get_run(run_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/v1/runs/{run_id}/events")
-async def stream_run_events(run_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")) -> StreamingResponse:
+async def stream_run_events(
+    run_id: str,
+    after: int = 0,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+) -> StreamingResponse:
     get_run_or_404(run_id)
     try:
-        cursor = int(last_event_id or 0)
+        cursor = max(int(last_event_id or 0), max(0, int(after)))
     except ValueError:
-        cursor = 0
+        cursor = max(0, int(after))
 
     async def generate():
         nonlocal cursor
@@ -527,10 +584,10 @@ async def fallback_run(run_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/v1/interviews/{interview_id}/report")
-def get_report(interview_id: str) -> dict[str, Any]:
+def get_report(interview_id: str, run_id: str | None = Query(default=None, alias="runId")) -> dict[str, Any]:
     get_interview_or_404(interview_id)
     try:
-        return workflow.report(interview_id)
+        return workflow.report(interview_id, run_id=run_id)
     except KeyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

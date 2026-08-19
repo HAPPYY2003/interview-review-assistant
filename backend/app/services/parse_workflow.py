@@ -13,7 +13,7 @@ from backend.app.agents.runtime import HelloAgentsRuntime
 from backend.app.config import Settings
 from backend.app.database import Database
 from backend.app.services.audio import DeepgramTranscriptionProvider, deepgram_segments, inspect_audio
-from backend.app.services.evidence import infer_topic_title, normalize_question_type
+from backend.app.services.evidence import QUESTION_TYPES, infer_topic_title, normalize_question_type
 from backend.app.services.transcript import (
     build_question_cards,
     map_speaker_roles,
@@ -36,6 +36,38 @@ from backend.app.services.transcript_structure import (
     utterances_from_submission,
 )
 from backend.app.tools.parse_tools import build_parse_tools
+
+
+ASSESSMENT_REASON_RULES = {
+    "question_boundary_assessment": (
+        {ConfirmationReasonCode.QUESTION_BOUNDARY_UNCERTAIN, ConfirmationReasonCode.SOURCE_QUALITY_LOW},
+        ConfirmationReasonCode.QUESTION_BOUNDARY_UNCERTAIN,
+    ),
+    "answer_boundary_assessment": (
+        {
+            ConfirmationReasonCode.ANSWER_BOUNDARY_UNCERTAIN,
+            ConfirmationReasonCode.ANSWER_MISSING,
+            ConfirmationReasonCode.SOURCE_QUALITY_LOW,
+        },
+        ConfirmationReasonCode.ANSWER_BOUNDARY_UNCERTAIN,
+    ),
+    "qa_pairing_assessment": (
+        {ConfirmationReasonCode.QA_PAIRING_AMBIGUOUS, ConfirmationReasonCode.ANSWER_MISSING},
+        ConfirmationReasonCode.QA_PAIRING_AMBIGUOUS,
+    ),
+    "follow_up_assessment": (
+        {ConfirmationReasonCode.MAIN_FOLLOWUP_UNCERTAIN, ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN},
+        ConfirmationReasonCode.MAIN_FOLLOWUP_UNCERTAIN,
+    ),
+    "question_type_assessment": (
+        {ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN},
+        ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN,
+    ),
+    "topic_grouping_assessment": (
+        {ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN},
+        ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN,
+    ),
+}
 
 
 class ParsePipelineContext:
@@ -158,7 +190,10 @@ class ParsePipelineContext:
                 agent_error = str(exc)
                 self.workflow.tool_event(self.parse_run_id, "StructuredSubmissionRejected", {"message": agent_error[:180]})
         if not cards:
-            cards = self._fallback_cards(force_confirmation=bool(self.settings.real_agent_enabled))
+            # A malformed Agent payload is not evidence that the source references
+            # are invalid. Let the deterministic parser derive confidence from the
+            # actual transcript quality and boundaries.
+            cards = self._fallback_cards()
         errors = validate_question_cards(cards, self.segments)
         if errors:
             cards = self._fallback_cards(force_confirmation=True)
@@ -243,6 +278,7 @@ class ParsePipelineContext:
                     payload = self.runtime.run_dialogue_worker(chunk)
                     if not payload:
                         raise ValueError("EMPTY_DIALOGUE_SUBMISSION")
+                    payload = self._sanitize_dialogue_payload(payload, chunk)
                     batch = QuestionTurnBatch.model_validate(payload)
                     self._validate_assessment_atoms(batch.model_dump(mode="json"), atom_ids)
                     allowed = {item["id"] for item in chunk}
@@ -309,6 +345,106 @@ class ParsePipelineContext:
             if not is_follow_up:
                 roots_by_anchor[turn.question_utterance_ids[0]] = {"id": question_id, "title": topic_title}
         return cards
+
+    def _sanitize_dialogue_payload(self, payload: dict[str, Any], utterances: list[dict[str, Any]]) -> dict[str, Any]:
+        """Normalize common LLM contract drift without changing source boundaries."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("question_turns"), list):
+            return payload
+
+        utterance_map = {item["id"]: item for item in utterances}
+        allowed_atom_ids = {atom_id for item in utterances for atom_id in item.get("atomIds", [])}
+        sanitized_turns = []
+        for source_turn in payload["question_turns"]:
+            if not isinstance(source_turn, dict):
+                sanitized_turns.append(source_turn)
+                continue
+            turn = dict(source_turn)
+            turn_type = str(turn.get("turn_type") or "main").strip().lower()
+            turn["turn_type"] = "follow_up" if turn_type in {"follow_up", "followup", "follow-up"} else "main"
+
+            question_ids = [item for item in turn.get("question_utterance_ids", []) if item in utterance_map]
+            answer_ids = [item for item in turn.get("answer_utterance_ids", []) if item in utterance_map]
+            question_atoms = [atom_id for item in question_ids for atom_id in utterance_map[item].get("atomIds", [])]
+            answer_atoms = [atom_id for item in answer_ids for atom_id in utterance_map[item].get("atomIds", [])]
+            question_text = "\n".join(utterance_map[item].get("rawText", "") for item in question_ids).strip()
+
+            question_type = normalize_question_type(turn.get("question_type"), question_text)
+            turn["question_type"] = question_type if question_type in QUESTION_TYPES else "其他"
+            topic_title = str(turn.get("topic_title") or "").strip()
+            if not topic_title or "\ufffd" in topic_title or len(topic_title) > 40:
+                topic_title = infer_topic_title(question_text, turn["question_type"])
+            turn["topic_title"] = topic_title[:40]
+
+            evidence_defaults = {
+                "question_boundary_assessment": question_atoms,
+                "answer_boundary_assessment": answer_atoms or question_atoms,
+                "qa_pairing_assessment": [*question_atoms, *answer_atoms],
+                "follow_up_assessment": question_atoms,
+                "question_type_assessment": question_atoms,
+                "topic_grouping_assessment": [*question_atoms, *answer_atoms],
+            }
+            for field, (allowed_reasons, default_reason) in ASSESSMENT_REASON_RULES.items():
+                assessment = turn.get(field)
+                if field == "follow_up_assessment" and turn["turn_type"] == "main":
+                    turn[field] = None
+                    continue
+                if not isinstance(assessment, dict):
+                    if field != "follow_up_assessment":
+                        continue
+                    assessment = {"score": 60, "reason_codes": [], "evidence_atom_ids": [], "summary": ""}
+                turn[field] = self._sanitize_assessment(
+                    assessment,
+                    allowed_reasons,
+                    default_reason,
+                    evidence_defaults[field],
+                    allowed_atom_ids,
+                )
+            sanitized_turns.append(turn)
+        return {**payload, "question_turns": sanitized_turns}
+
+    @staticmethod
+    def _sanitize_assessment(
+        assessment: dict[str, Any],
+        allowed_reasons: set[ConfirmationReasonCode],
+        default_reason: ConfirmationReasonCode,
+        fallback_atom_ids: list[str],
+        allowed_atom_ids: set[str],
+    ) -> dict[str, Any]:
+        data = dict(assessment)
+        try:
+            score = max(0, min(100, round(float(data.get("score", 50)))))
+        except (TypeError, ValueError):
+            score = 50
+
+        raw_reasons = data.get("reason_codes") if isinstance(data.get("reason_codes"), list) else []
+        reasons: list[ConfirmationReasonCode] = []
+        for raw_reason in raw_reasons:
+            try:
+                reason = ConfirmationReasonCode(raw_reason)
+            except ValueError:
+                continue
+            if reason in allowed_reasons and reason not in reasons:
+                reasons.append(reason)
+
+        # reason_codes describe uncertainty only. Some compatible models emit
+        # positive labels such as "only_one_interpretation" for high scores.
+        if score >= 85:
+            reasons = []
+        elif not reasons and (score < 80 or raw_reasons):
+            reasons = [default_reason]
+
+        evidence = [item for item in data.get("evidence_atom_ids", []) if item in allowed_atom_ids]
+        if reasons and not evidence:
+            evidence = list(dict.fromkeys(item for item in fallback_atom_ids if item in allowed_atom_ids))
+        summary = str(data.get("summary") or "").strip()
+        if "\ufffd" in summary:
+            summary = ""
+        return {
+            "score": score,
+            "reason_codes": [item.value for item in reasons],
+            "evidence_atom_ids": evidence,
+            "summary": summary[:120],
+        }
 
     def _fallback_cards(self, force_confirmation: bool = False) -> list[dict[str, Any]]:
         cards = build_question_cards(self.segments)
@@ -490,7 +626,8 @@ class ParseWorkflow:
         self.db.append_parse_event(run_id, "PARSE_TOOL_FINISHED", {"tool": tool, **data})
 
     def material_path(self, material: dict[str, Any]) -> Path:
-        candidate = (self.settings.root_dir / material.get("storage_path", "")).resolve()
+        stored_path = Path(material.get("storage_path", ""))
+        candidate = stored_path.resolve() if stored_path.is_absolute() else (self.settings.root_dir / stored_path).resolve()
         uploads = (self.settings.data_dir / "uploads").resolve()
         if uploads not in candidate.parents:
             raise ValueError("材料路径不在受控上传目录")

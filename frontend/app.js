@@ -1,21 +1,31 @@
 import {
   buildMarkdownReport,
+  countQuestionTurns,
+  GAP_CATEGORY_LABELS,
   modeLabel,
   normalizeInterviewRecord,
   normalizeQuestionRecord,
+  normalizeReportRecord,
+  SIGNAL_TYPE_LABELS,
   SCORE_LABELS
 } from "./data-model.js";
 
 const app = document.querySelector("#app");
 const STORAGE_KEY = "offer-radar-agent-v1";
-const QUESTION_TYPES = ["项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"];
+const REPORT_SCHEMA_VERSION = 2;
+const QUESTION_TYPES = ["自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"];
+const REVIEW_TEMPLATE_PLACEHOLDERS = new Set([
+  "综合诊断", "至少两个字的判断依据", "至少两个字的追问判断", "有证据的优点", "有证据的问题",
+  "原回答路径概括", "步骤名称", "原回答内容", "逻辑缺口", "框架选择原因", "表达建议",
+  "待补充：缺失事实", "只重组证据中的事实", "待补充的信息", "回答组织建议", "需要学习的知识", "岗位匹配判断"
+]);
 const EVENT_TYPES = [
   "RUN_CREATED", "SUPERVISOR_PLAN_ACCEPTED", "SUPERVISOR_PLAN_FALLBACK", "PHASE_STARTED",
   "TOPIC_ANALYSIS_STARTED", "TOPIC_ANALYSIS_COMPLETED", "SUBMISSION_REJECTED", "CHECKPOINT_SAVED",
   "AUDIT_STARTED", "AUDIT_COMPLETED", "AUDIT_RECOVERY_STARTED", "REVISION_REQUIRED", "TOPIC_REVISION_COMPLETED",
-  "GROWTH_PLAN_COMPLETED", "AGENT_STARTED", "AGENT_FINISHED", "RUN_RESUMED", "FALLBACK_REQUESTED",
+  "GROWTH_PLAN_COMPLETED", "GROWTH_TIMEOUT_RECOVERY", "AGENT_STARTED", "AGENT_FINISHED", "RUN_RESUMED", "FALLBACK_REQUESTED",
   "TOOL_STARTED", "TOOL_FINISHED", "AGENT_HEARTBEAT", "AGENT_TIMEOUT",
-  "AGENT_RUNTIME_FAILED", "SUBMISSION_MISSING",
+  "AGENT_RUNTIME_FAILED", "SUBMISSION_MISSING", "MODEL_JSON_AUTO_SUBMIT_SKIPPED",
   "FALLBACK_STARTED", "RUN_FINISHED", "RUN_FAILED"
 ];
 const PARSE_EVENT_TYPES = ["PARSE_CREATED", "PARSE_PHASE_STARTED", "PARSE_TOOL_FINISHED", "AGENT_STARTED", "AGENT_FINISHED", "PARSE_FINISHED", "PARSE_FAILED"];
@@ -89,8 +99,15 @@ const EVENT_LABELS = {
   AGENT_FINISHED: "Agent 执行结束",
   TOOL_STARTED: "工具开始执行",
   TOOL_FINISHED: "工具执行完成",
+  EVIDENCE_PACKET_READY: "核心证据已预取",
+  MODEL_JSON_AUTO_SUBMITTED: "模型 JSON 已自动提交",
+  MODEL_JSON_AUTO_SUBMIT_SKIPPED: "已跳过占位模板提交",
+  MODEL_SUBMISSION_CONSTRAINED: "证据引用已受控修正",
+  FINALIZER_STARTED: "结构化收尾开始",
+  FINALIZER_FINISHED: "结构化收尾完成",
   AGENT_HEARTBEAT: "Agent 执行心跳",
   AGENT_TIMEOUT: "Agent 执行超时",
+  GROWTH_TIMEOUT_RECOVERY: "从审计检查点快速恢复成长计划",
   AGENT_RUNTIME_FAILED: "Agent 运行失败",
   SUBMISSION_MISSING: "Agent 未提交结构化结果",
   RUN_RESUMED: "任务已恢复",
@@ -115,7 +132,7 @@ const state = {
   loading: false,
   error: "",
   expandedQuestionId: null,
-  questionReviewTab: "summary",
+  questionReviewTabs: {},
   questionEvidenceFocus: "",
   editingTurnId: null,
   structureEditingSegmentId: null,
@@ -135,7 +152,7 @@ window.addEventListener("hashchange", async () => {
   state.route = parseRoute();
   state.error = "";
   state.expandedQuestionId = null;
-  state.questionReviewTab = "summary";
+  state.questionReviewTabs = {};
   state.questionEvidenceFocus = "";
   state.editingTurnId = null;
   state.structureEditingSegmentId = null;
@@ -173,6 +190,9 @@ async function init() {
 
 async function loadRouteData() {
   const record = currentRecord();
+  if (state.route.name === "run" && record && state.route.params.runId) {
+    record.runId = state.route.params.runId;
+  }
   if (state.route.name === "parse" && record?.parseRunId) {
     try {
       const run = await api(`/api/v1/parse-runs/${record.parseRunId}`);
@@ -270,7 +290,7 @@ function renderSidebar() {
       </nav>
       <div class="runtime-panel">
         <span class="runtime-dot ${fixture ? "fixture" : "live"}"></span>
-        <div><strong>${fixture ? "稳定演示模式" : "HelloAgents 实时模式"}</strong><span>${fixture ? "不调用真实模型" : escapeHtml(state.health?.runtime || "连接中")}</span></div>
+        <div><strong>${fixture ? "稳定演示模式" : "实时分析模式"}</strong><span>${fixture ? "不调用真实模型" : "服务端模型已连接"}</span></div>
       </div>
       <div class="sidebar-footer">材料保存在本机 SQLite；模型密钥只从服务端环境变量读取，不进入浏览器。</div>
     </aside>`;
@@ -316,7 +336,7 @@ function renderRecordRow(record) {
     <div class="table-main"><button class="table-title record-title-link" type="button" data-nav="${route}" aria-label="${primaryActionLabel}：${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}">${escapeHtml(record.company || "未填写公司")} · ${escapeHtml(record.position || "未填写岗位")}</button>${reportGeneratedAt ? `<span class="table-report-generated">报告生成 ${escapeHtml(formatDateMinute(reportGeneratedAt))}</span>` : ""}</div>
     <time class="table-meta table-date" data-label="日期" datetime="${escapeHtml(record.interviewDate || "")}">${escapeHtml(interviewDate)}</time>
     <div class="table-meta" data-label="轮次">${escapeHtml(record.round || "--")}</div>
-    <div class="table-meta" data-label="问题">${record.questions?.length || record.questionCount || 0} 道</div>
+    <div class="table-meta" data-label="问题">${countQuestionTurns(record)} 道</div>
     <div class="table-meta table-status" data-label="状态">${renderStatus(record.status)}</div>
     <div class="table-actions">
       <button class="icon-button record-action" type="button" aria-label="${primaryActionLabel}" data-tooltip="${primaryActionLabel}" data-nav="${route}">${renderLucideIcon(primaryActionIcon)}</button>
@@ -335,6 +355,7 @@ function renderLucideIcon(name) {
     "circle-check": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><path d="m9 11 3 3L22 4"></path>',
     "file-text": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" x2="16" y1="13" y2="13"></line><line x1="8" x2="16" y1="17" y2="17"></line>',
     "plus": '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
+    "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.34-6.36L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.34 6.36L21 16"></path><path d="M16 16h5v5"></path>',
     "locate-fixed": '<line x1="2" x2="5" y1="12" y2="12"></line><line x1="19" x2="22" y1="12" y2="12"></line><line x1="12" x2="12" y1="2" y2="5"></line><line x1="12" x2="12" y1="19" y2="22"></line><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle>',
     "git-merge": '<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>',
     "pencil": '<path d="M21.17 6.17 17.83 2.83a2.83 2.83 0 0 0-4 0L3 13.66V21h7.34L21.17 10.17a2.83 2.83 0 0 0 0-4Z"></path><path d="m12.5 4.5 7 7"></path>',
@@ -614,20 +635,25 @@ function renderTopicReviewFooter(record, selected) {
 }
 
 function renderReviewDialog(record, reviewedCount, unresolvedCount) {
-  const unconfirmedCount = Math.max(0, record.topics.length - reviewedCount);
+  const topicCount = record.topics?.length || record.questions?.length || 0;
+  const unconfirmedCount = Math.max(0, topicCount - reviewedCount);
   const requiresAcknowledgement = unconfirmedCount > 0 || unresolvedCount > 0;
   const acknowledged = !requiresAcknowledgement || state.acknowledgeUnreviewed;
   const modeSelected = state.reviewMode === "local" || state.reviewMode === "web";
   const webAvailable = Boolean(state.health?.webVerifyAvailable);
-  const canStart = acknowledged && modeSelected && (state.reviewMode !== "web" || webAvailable);
+  const reportContractReady = Number(state.health?.reportSchemaVersion || 0) >= REPORT_SCHEMA_VERSION;
+  const canStart = reportContractReady && acknowledged && modeSelected && (state.reviewMode !== "web" || webAvailable);
   const modeDescription = state.reviewMode === "web"
     ? "本地证据不足或信息需要核实时，Agent 才会联网搜索。"
     : state.reviewMode === "local"
       ? "仅使用面试稿、JD、简历和本地知识库，不访问互联网。"
       : "请选择本次复盘使用的资料范围。";
-  const fromReport = state.route.params.from === "report";
+  const directReportRerun = state.route.name === "review";
+  const fromReport = directReportRerun || state.route.params.from === "report";
   const startLabel = state.loading
     ? "正在创建任务..."
+    : directReportRerun
+      ? unconfirmedCount ? "重新进行快速复盘" : "开始重新复盘"
     : fromReport
       ? unconfirmedCount ? "重新生成快速报告" : "重新生成复盘报告"
       : unconfirmedCount ? "启动快速复盘" : "启动 Agent 复盘";
@@ -638,14 +664,16 @@ function renderReviewDialog(record, reviewedCount, unresolvedCount) {
       : "我已了解未归类内容会在报告中标记";
   return `<dialog class="review-dialog" id="reviewDialog" aria-labelledby="reviewDialogTitle">
     <div class="review-dialog-header">
-      <h2 id="reviewDialogTitle">${fromReport ? "重新生成复盘报告" : "开始 Agent 复盘"}</h2>
+      <h2 id="reviewDialogTitle">${directReportRerun ? "重新进行面试复盘" : fromReport ? "重新生成复盘报告" : "开始 Agent 复盘"}</h2>
       <button type="button" class="icon-button" data-close-review-dialog aria-label="关闭复盘设置">${renderLucideIcon("x")}</button>
     </div>
     <div class="review-dialog-body">
       ${state.error ? `<div class="error review-dialog-error">${escapeHtml(state.error)}</div>` : ""}
+      ${reportContractReady ? "" : `<div class="error review-dialog-error"><strong>后端仍在运行旧版报告协议</strong><span>请重启本地服务并刷新页面，再开始复盘，避免生成缺少结构化字段的报告。</span></div>`}
+      ${directReportRerun ? `<p class="review-dialog-context">将基于当前题卡重新运行 Agent，生成新的复盘报告。原报告记录仍会保留。</p>` : ""}
       <div class="review-dialog-status ${requiresAcknowledgement ? "warning" : "success"}">
         <span class="review-dialog-status-icon" aria-hidden="true">${requiresAcknowledgement ? "!" : renderLucideIcon("circle-check")}</span>
-        <strong>${unconfirmedCount ? `还有 ${unconfirmedCount} 个题卡未经校对，将使用当前解析结果。` : unresolvedCount ? `题卡均已确认，另有 ${unresolvedCount} 项未归类内容。` : `${record.topics.length} 个题卡均已确认。`}</strong>
+        <strong>${unconfirmedCount ? `还有 ${unconfirmedCount} 个题卡未经校对，将使用当前解析结果。` : unresolvedCount ? `题卡均已确认，另有 ${unresolvedCount} 项未归类内容。` : `${topicCount} 个题卡均已确认。`}</strong>
         ${unconfirmedCount ? `<button type="button" class="text-action" data-continue-review>继续校对</button>` : ""}
       </div>
       <fieldset class="review-mode-fieldset">
@@ -839,7 +867,8 @@ function renderRunPage() {
   const auditRound = Number(progress.auditRound || 0);
   const revisionCount = Number(progress.revisionCount || 0);
   const checkpoint = progress.checkpoint || {};
-  const modeLabel = record.agentMode === "fixture" ? "Fixture 模拟" : record.degraded ? "确定性降级" : "HelloAgents 实时";
+  const modeLabel = record.agentMode === "fixture" ? "演示模式" : record.degraded ? "确定性降级" : "实时 Agent";
+  const modeClass = record.agentMode === "fixture" ? "fixture" : record.degraded ? "degraded" : "live";
   let stageStatus = {};
   if (record.status === "failed") {
     const evidenceComplete = Boolean(checkpoint.evidenceComplete) || (totalTopics > 0 && completedTopics >= totalTopics);
@@ -850,16 +879,23 @@ function renderRunPage() {
       growth_plan: !auditAccepted ? "pending" : "error"
     };
   }
+  const growthDetail = checkpoint.growthComplete
+    ? "下一步行动计划已提交"
+    : record.status === "failed" && phase === "growth_plan"
+      ? (record.failureCode === "AGENT_TIMEOUT" ? "执行超时，可从检查点恢复" : "提交失败，可从检查点恢复")
+      : checkpoint.auditAccepted
+        ? "已完成审计，等待生成计划"
+        : "等待质量审计";
   return `
     <section class="page">
       ${renderSteps(3)}
       <div class="page-header"><div><span class="eyebrow">AGENT WORKFLOW</span><h1 class="page-title">多 Agent 正在复盘</h1><p class="page-desc">${escapeHtml(record.company)} · ${escapeHtml(record.position)} · ${escapeHtml(PHASE_LABELS[phase] || phase)}</p></div><div class="run-header-actions">${record.status === "failed" ? `<button class="button secondary" id="fallbackRun">生成降级报告</button><button class="button" id="resumeRun">从检查点恢复</button>` : terminal && record.status === "completed" ? `<button class="button" id="openReport">查看报告</button>` : `<span class="live-indicator"><span></span>实时执行</span>`}</div></div>
-      <div class="agent-run-summary"><span class="agent-mode-mark ${record.agentMode || "helloagents"} ${record.degraded ? "degraded" : ""}">${escapeHtml(modeLabel)}</span><div><strong>${completedTopics}/${totalTopics} 个主题已提交</strong><span>Reflection 审计 ${auditRound}/2 轮 · 已修订 ${revisionCount} 次</span></div></div>
-      ${record.status === "failed" ? `<div class="run-failure"><strong>${escapeHtml(record.failureCode || "AGENT_FAILED")}</strong><span>${escapeHtml(record.runError || "Agent 阶段未完成，可从最近检查点恢复或主动生成降级报告。")}</span></div>` : ""}
+      <div class="agent-run-summary"><span class="agent-mode-mark ${modeClass}">${escapeHtml(modeLabel)}</span><div><strong>${completedTopics}/${totalTopics} 个主题已提交</strong><span>Reflection 审计 ${auditRound}/2 轮 · 已修订 ${revisionCount} 次</span></div></div>
+      ${record.status === "failed" ? `<div class="run-failure"><strong>${escapeHtml(record.failureCode || "AGENT_FAILED")}</strong><span>${escapeHtml(publicRuntimeText(record.runError || "Agent 阶段未完成，可从最近检查点恢复或主动生成降级报告。"))}</span></div>` : ""}
       <div class="agent-stage-grid">
         ${agentStage("evidence_review", "ReAct", "证据诊断", phase, `${completedTopics}/${totalTopics} 个主题`, stageStatus.evidence_review)}
         ${agentStage("reflection_audit", "Reflection", "质量审计", phase, `${auditRound}/2 轮 · ${revisionCount} 次修订`, stageStatus.reflection_audit)}
-        ${agentStage("growth_plan", "PlanSolve", "成长计划", phase, checkpoint.growthComplete ? "七天计划已提交" : "等待已审计报告", stageStatus.growth_plan)}
+        ${agentStage("growth_plan", "PlanSolve", "成长计划", phase, growthDetail, stageStatus.growth_plan)}
       </div>
       <section class="surface agent-timeline">
         <div class="section-title">执行轨迹</div>
@@ -899,17 +935,22 @@ function renderEvent(event) {
     data.durationSeconds != null ? `耗时 ${Number(data.durationSeconds).toFixed(2)} 秒` : ""
   ].filter(Boolean).join(" · ");
   const detail = data.message || (data.hits != null ? `检索并校验 ${data.hits} 条证据` : metrics || data.status || "阶段事件已记录");
-  return `<div class="timeline-row"><span class="timeline-index">${String(event.id).padStart(2, "0")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p></div><time>${formatTime(event.createdAt)}</time></div>`;
+  return `<div class="timeline-row"><span class="timeline-index">${String(event.id).padStart(2, "0")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(publicRuntimeText(detail))}</p></div><time>${formatTime(event.createdAt)}</time></div>`;
 }
 
 function compactRunEvents(events) {
+  const latestResumeIndex = events.reduce(
+    (latest, event, index) => event.type === "RUN_RESUMED" ? index : latest,
+    -1
+  );
+  const currentAttemptEvents = latestResumeIndex >= 0 ? events.slice(latestResumeIndex) : events;
   const latestHeartbeat = new Map();
-  events.forEach((event, index) => {
+  currentAttemptEvents.forEach((event, index) => {
     if (event.type !== "AGENT_HEARTBEAT") return;
     const data = event.data || {};
     latestHeartbeat.set(`${data.agent || "agent"}:${data.attempt || 1}`, index);
   });
-  return events.filter((event, index) => {
+  return currentAttemptEvents.filter((event, index) => {
     if (event.type !== "AGENT_HEARTBEAT") return true;
     const data = event.data || {};
     return latestHeartbeat.get(`${data.agent || "agent"}:${data.attempt || 1}`) === index;
@@ -918,41 +959,86 @@ function compactRunEvents(events) {
 
 function renderReviewPage() {
   const record = currentRecord();
-  const report = record?.report;
+  const report = record?.report ? normalizeReportRecord(record.report) : null;
   if (!record) return renderMissing();
   if (!report) return `<section class="page"><div class="empty"><div class="empty-title">报告仍在生成</div><button class="button" data-nav="#/run/${record.id}/${record.runId || ""}">查看进度</button></div></section>`;
   const interview = report.interview;
   const questions = report.questions || [];
   const actions = report.actions || [];
   const quickReview = interview.reviewMode === "quick";
-  const nextFocus = String(interview.nextFocus || "").trim();
-  const nextFocusText = nextFocus.replace(/^下一场(?:面试)?重点[：:]\s*/, "");
+  const topics = record.topics || [];
+  const reviewedCount = topics.length ? topics.filter(topicIsReviewed).length : quickReview ? 0 : questions.length;
+  const unresolvedQuestions = (record.questions || questions).filter(item => item.needsConfirmation).length;
+  const unresolvedCount = Number(record.unresolvedCount || 0) + unresolvedQuestions;
+  const gaps = interview.capabilityGaps || [];
+  const gapMap = new Map(gaps.map(item => [item.id, item]));
   return `
     <section class="page report-page">
       ${renderSteps(4)}
-      <div class="page-header"><div><span class="eyebrow">EVIDENCE REVIEW</span><h1 class="page-title">${escapeHtml(interview.company)} · ${escapeHtml(interview.position)}</h1><p class="page-desc">${escapeHtml(interview.round || "未填写轮次")} · ${escapeHtml(modeLabel(interview.analysisMode))}</p></div><div class="filters"><button class="button secondary" id="editReportCards">编辑题卡</button><button class="button" id="exportReport">导出 Markdown</button></div></div>
-      <div class="summary-band"><div class="summary-heading"><h2>整场复盘结论</h2>${quickReview ? `<span class="mode-badge quick">快速复盘·含未校对题卡</span>` : ""}</div><p>${escapeHtml(interview.summary || "暂无总结")}</p>${nextFocusText ? `<div class="summary-focus"><span>下一场重点</span><strong>${escapeHtml(nextFocusText)}</strong></div>` : ""}</div>
+      <div class="page-header"><div><span class="eyebrow">EVIDENCE REVIEW</span><h1 class="page-title">${escapeHtml(interview.company)} · ${escapeHtml(interview.position)}</h1><p class="page-desc">${escapeHtml(interview.round || "未填写轮次")} · ${escapeHtml(modeLabel(interview.analysisMode))}</p></div><div class="filters report-header-actions"><button class="button secondary" id="editReportCards">编辑题卡</button><button class="button secondary" id="exportReport">导出 Markdown</button><button class="button" id="rerunReview">${renderLucideIcon("refresh-cw")}重新面试复盘</button></div></div>
+      ${report.isLegacyReport ? renderLegacyReportNotice(report) : ""}
+      ${renderOverallEvaluation(interview, quickReview)}
       ${renderScoreSection(interview.overallScores)}
-      ${renderRiskSection(interview.topRisks || [])}
-      <section class="report-band action-plan-band"><div class="band-header"><div><span class="eyebrow">ACTION PLAN</span><h2>七天行动计划</h2></div><span class="section-count">${actions.length} 项训练</span></div><div class="action-list">${actions.map(action => renderAction(record, action)).join("")}</div></section>
-      <section class="report-band question-review-band"><div class="band-header"><h2>逐题证据复盘</h2><span class="section-count">${questions.length} 个主题</span></div><div class="accordion">${questions.map((question, index) => renderQuestionReviewV2(question, index)).join("")}</div></section>
+      ${renderGapSection(gaps, questions)}
+      <section class="report-band action-plan-band"><div class="band-header"><div><span class="eyebrow">ACTION PLAN</span><h2>下一步行动计划</h2></div><span class="section-count">${actions.length} 项行动</span></div><div class="action-list">${actions.map((action, index) => renderAction(record, action, gapMap, index)).join("")}</div></section>
+      <section class="report-band question-review-band"><div class="band-header"><h2>逐题深度复盘</h2><span class="section-count">${questions.length} 个主题</span></div><div class="accordion">${questions.map((question, index) => renderQuestionReviewV2(question, index)).join("")}</div></section>
       ${renderAuditSection(interview)}
-      <div class="metadata-line">${escapeHtml(interview.latestAIMetadata?.provider || "--")} · ${escapeHtml(interview.latestAIMetadata?.model || "--")} · ${formatDateMinute(interview.latestAIMetadata?.generatedAt)}</div>
+      <div class="metadata-line">报告生成 ${formatDateMinute(interview.latestAIMetadata?.generatedAt)}</div>
+      ${renderReviewDialog(record, reviewedCount, unresolvedCount)}
     </section>`;
+}
+
+function renderLegacyReportNotice(report) {
+  return `<section class="legacy-report-notice" role="status">
+    <span class="legacy-report-icon">${renderLucideIcon("triangle-alert")}</span>
+    <div><strong>这份报告由旧版复盘流程生成</strong><p>当前记录没有保存独立竞争力判断、结构化回答路径等 V2 内容。重启服务后使用右上角“重新面试复盘”，才能由 Agent 重新生成这些判断。</p></div>
+    <span class="legacy-report-version">报告结构 V${Number(report.reportSchemaVersion || 1)}</span>
+  </section>`;
+}
+
+function renderOverallEvaluation(interview, quickReview) {
+  const evaluation = interview.overallEvaluation || {};
+  const score = Number(evaluation.score ?? interview.overallScores?.overall ?? 0);
+  const strengths = evaluation.strengths || [];
+  const risks = evaluation.risks || [];
+  const nextFocus = String(evaluation.nextFocus || interview.nextFocus || "")
+    .replace(/^下一场(?:面试)?重点[：:]\s*/, "")
+    .replace(/七天(?:行动)?计划/g, "下一步行动计划");
+  return `<section class="summary-band evaluation-band">
+    <div class="summary-heading"><div><span class="eyebrow">OVERALL REVIEW</span><h2>面试综合评价</h2></div><div class="evaluation-heading-meta">${quickReview ? `<span class="mode-badge quick">快速复盘·含未校对题卡</span>` : ""}<span class="evaluation-score"><strong>${score.toFixed(1)}</strong><small>/10</small><em>${escapeHtml(evaluation.performanceLevel || "待评估")}</em></span></div></div>
+    <p>${escapeHtml(evaluation.summary || interview.summary || "暂无总结")}</p>
+    <div class="evaluation-competitiveness"><span>本场竞争力</span><p>${escapeHtml(evaluation.competitiveness || "暂无独立判断")}</p><small>基于本次材料，不代表实际录用结果。</small></div>
+    <div class="evaluation-points">
+      <div><span>主要优势</span><ul>${strengths.length ? strengths.map(item => `<li>${escapeHtml(item.text || item)}</li>`).join("") : "<li>暂无单独归纳的优势</li>"}</ul></div>
+      <div><span>主要风险</span><ul>${risks.length ? risks.map(item => `<li>${escapeHtml(item.text || item)}</li>`).join("") : "<li>暂无单独归纳的风险</li>"}</ul></div>
+    </div>
+    ${nextFocus ? `<div class="summary-focus"><span>下一场重点</span><strong>${escapeHtml(nextFocus)}</strong></div>` : ""}
+  </section>`;
 }
 
 function renderScoreSection(scores = {}) {
   return `<section class="report-band score-band"><div class="band-header"><div><span class="eyebrow">SCORE</span><h2>五维评分</h2></div><div class="overall-score"><strong>${Number(scores.overall || 0).toFixed(1)}</strong><span>/10</span></div></div><div class="score-grid">${Object.entries(SCORE_LABELS).filter(([key]) => key !== "overall").map(([key, label]) => `<div class="score-tile"><div class="score-tile-heading"><span>${label}</span><strong>${Number(scores[key] || 0).toFixed(1)}</strong></div><div class="score-bar"><i style="width:${Math.min(100, Number(scores[key] || 0) * 10)}%"></i></div></div>`).join("")}</div></section>`;
 }
 
-function renderRiskSection(risks) {
-  return `<section class="report-band risk-band"><div class="band-header"><div><span class="eyebrow">FOCUS AREAS</span><h2>重点关注项</h2></div>${risks.length ? `<span class="section-count">${risks.length} 项</span>` : ""}</div><div class="risk-list">${risks.length ? risks.map((risk, index) => `<div class="risk-row"><span class="risk-rank">${String(index + 1).padStart(2, "0")}</span><div class="risk-copy"><strong class="risk-title">${escapeHtml(risk.title)}</strong><p>${escapeHtml(risk.reason)}</p></div><span class="risk-level ${escapeHtml(risk.severity || "medium")}">${risk.severity === "high" ? "重点关注" : "建议关注"}</span></div>`).join("") : `<div class="risk-empty">${renderLucideIcon("circle-check")}<div><strong>暂无需要特别关注的问题</strong><span>本场未发现需要单独列出的关注事项。</span></div></div>`}</div></section>`;
+function renderGapSection(gaps, questions = []) {
+  const topicIndex = new Map(questions.map((question, index) => [question.id, index + 1]));
+  return `<section class="report-band gap-band"><div class="band-header"><div><span class="eyebrow">CAPABILITY GAPS</span><h2>技能 / 知识缺口</h2></div>${gaps.length ? `<span class="section-count">${gaps.length} 项</span>` : ""}</div><div class="gap-list">${gaps.length ? gaps.map((gap, index) => `
+    <article class="gap-row">
+      <span class="risk-rank">${String(index + 1).padStart(2, "0")}</span>
+      <div class="gap-copy"><div class="gap-heading"><span class="gap-category">${escapeHtml(GAP_CATEGORY_LABELS[gap.category] || gap.category)}</span><strong>${escapeHtml(gap.title)}</strong>${gap.legacy ? `<small>旧报告兼容</small>` : ""}</div><p>${escapeHtml(gap.description || "暂无缺口说明")}</p><div class="gap-actions">${renderGapItems("学习项", gap.learningItems)}${renderGapItems("准备项", gap.preparationItems)}</div>${gap.topicIds?.length ? `<div class="gap-topics"><span>对应题目</span>${[...new Set(gap.topicIds)].map((id, buttonIndex) => { const number = topicIndex.get(id) || buttonIndex + 1; return `<button type="button" data-open-topic="${escapeHtml(id)}" title="${escapeHtml(questions[number - 1]?.interviewerQuestion || "查看对应题目")}"><span>查看题目 ${String(number).padStart(2, "0")}</span>${renderLucideIcon("arrow-down")}</button>`; }).join("")}</div>` : ""}</div>
+      <span class="risk-level ${escapeHtml(gap.priority || "medium")}">${gap.priority === "high" ? "高优先级" : "中优先级"}</span>
+    </article>`).join("") : `<div class="risk-empty">${renderLucideIcon("circle-check")}<div><strong>暂无可靠的技能或知识缺口</strong><span>本场没有足够证据支持单独列出能力缺口。</span></div></div>`}</div></section>`;
 }
 
-function renderAction(record, action) {
+function renderGapItems(label, items = []) {
+  return `<div><span>${label}</span>${items.length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<small>暂无</small>`}</div>`;
+}
+
+function renderAction(record, action, gapMap = new Map(), index = 0) {
   const dimension = SCORE_LABELS[action.dimension] || action.dimension || "综合训练";
-  const day = Math.max(1, Number(action.day || 1));
-  return `<label class="action-item ${action.completed ? "done" : ""}"><input class="action-check" type="checkbox" data-action="${action.id}" ${action.completed ? "checked" : ""} /><span class="action-copy"><span class="action-heading"><span class="action-day">第 ${day} 天</span><strong>${escapeHtml(action.title)}</strong><span class="action-priority ${escapeHtml(action.priority || "medium")}">${action.priority === "high" ? "高优先" : "中优先"}</span></span><span class="action-description">${escapeHtml(action.description || "")}</span><span class="action-meta"><span>${escapeHtml(dimension)}</span>${action.successCriterion ? `<span>完成标准：${escapeHtml(action.successCriterion)}</span>` : ""}</span></span></label>`;
+  const order = Math.max(1, Number(action.order || action.day || index + 1));
+  const gapNames = (action.gapIds || []).map(id => gapMap.get(id)?.title).filter(Boolean);
+  return `<label class="action-item ${action.completed ? "done" : ""}"><input class="action-check" type="checkbox" data-action="${action.id}" ${action.completed ? "checked" : ""} /><span class="action-copy"><span class="action-heading"><span class="action-order">行动 ${order}</span><span class="action-type ${action.type || "preparation"}">${action.type === "learning" ? "学习项" : "准备项"}</span><strong>${escapeHtml(action.title)}</strong><span class="action-priority ${escapeHtml(action.priority || "medium")}">${action.priority === "high" ? "高优先" : "中优先"}</span></span><span class="action-description">${escapeHtml(action.description || "")}</span>${gapNames.length ? `<span class="action-gap">对应缺口：${escapeHtml(gapNames.join("、"))}</span>` : ""}<span class="action-meta"><span>提升维度：${escapeHtml(dimension)}</span>${action.successCriterion ? `<span>完成标准：${escapeHtml(action.successCriterion)}</span>` : ""}</span></span></label>`;
 }
 
 function renderQuestionReview(question, index = 0) {
@@ -976,64 +1062,114 @@ function renderQuestionReviewV2(question, index = 0) {
   const scoreClass = score >= 8 ? "strong" : score >= 6 ? "steady" : "attention";
   const followUpCount = (question.followUpTurns || []).length;
   const catalog = buildQuestionEvidenceCatalog(question);
-  return `<div class="accordion-item ${expanded ? "expanded" : ""}">
+  const analysisIncomplete = containsReviewTemplatePlaceholder(question);
+  return `<div class="accordion-item ${expanded ? "expanded" : ""}" data-topic-review="${question.id}">
     <button class="accordion-button" data-expand="${question.id}" aria-expanded="${expanded}">
       <span class="question-review-index">${String(index + 1).padStart(2, "0")}</span>
-      <span class="question-review-copy"><strong>${escapeHtml(question.interviewerQuestion)}</strong><span class="meta-row"><span class="question-type-label">${escapeHtml(question.questionType)}</span>${followUpCount ? `<span>${followUpCount} 个追问</span>` : ""}</span></span>
+      <span class="question-review-copy"><strong>${escapeHtml(question.interviewerQuestion)}</strong><span class="meta-row"><span class="question-type-label">${escapeHtml(question.questionType)}</span>${followUpCount ? `<span>${followUpCount} 个追问</span>` : ""}${analysisIncomplete ? `<span class="analysis-incomplete-badge">分析不完整</span>` : ""}</span></span>
       <span class="question-review-score ${scoreClass}"><strong>${score.toFixed(1)}</strong><small>/10</small></span>
       <span class="accordion-icon">${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span>
     </button>
-    ${expanded ? `<div class="accordion-panel question-review-panel">${renderQuestionReviewTabs(question, catalog)}${renderQuestionReviewTabContent(question, catalog)}</div>` : ""}
+    ${expanded ? `<div class="accordion-panel question-review-panel">${analysisIncomplete ? renderIncompleteAnalysisWarning() : ""}${renderQuestionReviewTabs(question, catalog)}${renderQuestionReviewTabContent(question, catalog, analysisIncomplete)}</div>` : ""}
   </div>`;
+}
+
+function containsReviewTemplatePlaceholder(value) {
+  if (Array.isArray(value)) return value.some(containsReviewTemplatePlaceholder);
+  if (value && typeof value === "object") return Object.values(value).some(containsReviewTemplatePlaceholder);
+  if (typeof value !== "string") return false;
+  const text = value.trim();
+  return REVIEW_TEMPLATE_PLACEHOLDERS.has(text) || /__FILL_[A-Z0-9_]+__/.test(text);
+}
+
+function renderIncompleteAnalysisWarning() {
+  return `<div class="analysis-incomplete-warning" role="status">${renderLucideIcon("triangle-alert")}<div><strong>本题分析未完整生成</strong><p>Agent 提交了模板占位内容，这些文字不是有效诊断。原回答和证据仍可回查；请重新进行面试复盘以生成真实分析。</p></div></div>`;
 }
 
 function renderQuestionReviewTabs(question, catalog) {
+  const activeTab = state.questionReviewTabs[question.id] || "logic";
   const tabs = [
-    ["summary", "复盘摘要"],
-    ["scores", "评分依据"],
-    ["rewrite", "优化回答"],
+    ["logic", "回答逻辑"],
+    ["signals", "面试官信号"],
+    ["diagnosis", "问题诊断"],
+    ["improvement", "优化回答"],
     ["evidence", `证据引用 ${catalog.items.length}`]
   ];
-  return `<div class="question-review-tabs" role="tablist" aria-label="逐题复盘视图">${tabs.map(([key, label]) => `<button type="button" role="tab" class="question-review-tab ${state.questionReviewTab === key ? "active" : ""}" data-question-tab="${key}" aria-selected="${state.questionReviewTab === key}">${label}</button>`).join("")}</div>`;
+  return `<div class="question-review-tabs" role="tablist" aria-label="逐题深度复盘视图">${tabs.map(([key, label]) => `<button type="button" role="tab" class="question-review-tab ${activeTab === key ? "active" : ""}" data-question-tab="${key}" data-topic-id="${question.id}" aria-selected="${activeTab === key}">${label}</button>`).join("")}</div>`;
 }
 
-function renderQuestionReviewTabContent(question, catalog) {
-  if (state.questionReviewTab === "scores") return renderQuestionScoreTab(question, catalog);
-  if (state.questionReviewTab === "evidence") return renderQuestionEvidenceTab(question, catalog);
-  if (state.questionReviewTab === "rewrite") return renderQuestionRewriteTab(question);
-  return renderQuestionSummaryTab(question);
+function renderQuestionReviewTabContent(question, catalog, analysisIncomplete = false) {
+  const activeTab = state.questionReviewTabs[question.id] || "logic";
+  if (analysisIncomplete && activeTab !== "evidence") {
+    return `<div class="question-tab-panel question-empty-state analysis-incomplete-empty" role="tabpanel">当前报告没有生成可用的${activeTab === "logic" ? "回答逻辑" : activeTab === "signals" ? "面试官信号" : activeTab === "diagnosis" ? "问题诊断" : "优化回答"}。请重新进行面试复盘；现有原文和证据仍可在“证据引用”中查看。</div>`;
+  }
+  if (activeTab === "signals") return renderQuestionSignalsTab(question, catalog);
+  if (activeTab === "diagnosis") return renderQuestionDiagnosisTab(question, catalog);
+  if (activeTab === "improvement") return renderQuestionImprovementTab(question, catalog);
+  if (activeTab === "evidence") return renderQuestionEvidenceTab(question, catalog);
+  return renderQuestionLogicTab(question, catalog);
 }
 
-function renderQuestionSummaryTab(question) {
-  const score = Number(question.scores?.overall || 0);
-  const level = score >= 8.5 ? "优秀" : score >= 7 ? "良好" : score >= 6 ? "合格" : "需要加强";
+function renderQuestionLogicTab(question, catalog) {
+  const logic = question.answerLogic || {};
+  const steps = Array.isArray(logic.steps) ? logic.steps : [];
   const answer = question.extractedAnswer || question.candidateAnswer || "暂无主回答";
-  const strengths = Array.isArray(question.strengths) ? question.strengths : [];
-  const weaknesses = Array.isArray(question.weaknesses) ? question.weaknesses : [];
   const followUps = Array.isArray(question.followUpTurns) ? question.followUpTurns : [];
-  return `<div class="question-tab-panel summary-tab-panel" role="tabpanel">
-    <section class="question-verdict"><div><span>综合评价</span><strong>${level} · ${score.toFixed(1)}</strong></div><p>${escapeHtml(compactReportText(question.diagnosis || "暂无综合诊断", 220))}</p></section>
-    <div class="question-insight-grid">
-      ${renderQuestionInsightList("回答亮点", strengths, "strength")}
-      ${renderQuestionInsightList("需要加强", weaknesses, "improvement")}
-    </div>
-    <details class="question-reading-details"><summary><span>主回答原文</span><span>查看完整内容 ${renderLucideIcon("chevron-down")}</span></summary><p>${escapeHtml(answer)}</p></details>
-    ${followUps.length ? `<section class="question-followups-summary"><div class="question-subheading"><strong>追问记录</strong><span>${followUps.length} 条</span></div><div class="question-followup-list">${followUps.map((turn, followUpIndex) => `<details class="question-followup-row"><summary><span><small>追问 ${followUpIndex + 1}</small><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问")}</strong></span><span class="follow-up-impact">${escapeHtml(turn.followUpImpact || "待判断")}</span></summary><p>${escapeHtml(turn.candidateAnswer || "未识别到回答")}</p></details>`).join("")}</div></section>` : ""}
-    <details class="question-diagnosis-details"><summary>查看完整 Agent 诊断</summary><p>${escapeHtml(question.diagnosis || "暂无综合诊断")}</p>${question.roleFitDiagnosis?.summary ? `<div><strong>岗位匹配</strong><p>${escapeHtml(question.roleFitDiagnosis.summary)}</p></div>` : ""}</details>
+  return `<div class="question-tab-panel logic-tab-panel" role="tabpanel">
+    <section class="logic-summary"><span>回答主线</span><p>${escapeHtml(logic.summary || "此报告未提供结构化回答路径。")}</p></section>
+    ${steps.length ? `<ol class="logic-step-list">${steps.map(step => `<li><span class="logic-step-index">${String(step.order).padStart(2, "0")}</span><div><strong>${escapeHtml(step.label)}</strong><p>${escapeHtml(step.content)}</p></div>${renderEvidenceButtons(step.evidenceIds, catalog, question.id)}</li>`).join("")}</ol>` : `<div class="question-empty-state">此报告未提供回答路径，可查看下方原回答。</div>`}
+    <details class="question-reading-details"><summary><span>回答原文${followUps.length ? `<small>主回答 + ${followUps.length} 个追问</small>` : ""}</span><span>查看完整内容 ${renderLucideIcon("chevron-down")}</span></summary><div class="answer-transcript-list"><section><span>主回答</span><p>${escapeHtml(answer)}</p></section>${followUps.map((turn, index) => `<section class="answer-follow-up"><span>追问 ${String(index + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问")}</strong><p>${escapeHtml(turn.candidateAnswer || "未识别到回答")}</p></div></section>`).join("")}</div></details>
   </div>`;
 }
 
-function renderQuestionInsightList(title, items, type) {
-  const rows = items.length ? items.slice(0, 3) : [type === "strength" ? "暂无单独归纳的回答亮点" : "暂无需要单独列出的改进项"];
-  return `<section class="question-insight ${type}"><h4>${title}</h4><ul>${rows.map(item => `<li title="${escapeHtml(item)}"><span>${type === "strength" ? "✓" : "•"}</span><p>${escapeHtml(item)}</p></li>`).join("")}</ul></section>`;
+function renderQuestionSignalsTab(question, catalog) {
+  const signals = Array.isArray(question.interviewerSignals) ? question.interviewerSignals : [];
+  const turns = new Map([question, ...(question.followUpTurns || [])].map(turn => [turn.id, turn]));
+  const confidenceLabels = { high: "高置信度", medium: "中置信度", low: "低置信度" };
+  return `<div class="question-tab-panel signal-tab-panel" role="tabpanel">
+    <div class="signal-notice">只展示原文中可以观察到的追问和反馈信号，不推测面试官的真实心理。</div>
+    ${signals.length ? `<ol class="signal-timeline">${signals.map((signal, index) => {
+      const turn = turns.get(signal.turnId) || {};
+      return `<li><span class="signal-node">${String(index + 1).padStart(2, "0")}</span><div class="signal-copy"><small>${index ? `追问 ${index}` : "主问题"}</small><strong>${escapeHtml(turn.interviewerQuestion || "未定位到问题原文")}</strong><div><span class="signal-type">${escapeHtml(SIGNAL_TYPE_LABELS[signal.type] || signal.type)}</span><span class="signal-confidence ${signal.confidence || "low"}">${confidenceLabels[signal.confidence] || "低置信度"}</span></div><p>${escapeHtml(signal.interpretation)}</p></div>${renderEvidenceButtons(signal.evidenceIds, catalog, question.id)}</li>`;
+    }).join("")}</ol>` : `<div class="question-empty-state">未发现具有足够证据的面试官信号。</div>`}
+  </div>`;
+}
+
+function renderQuestionDiagnosisTab(question, catalog) {
+  const score = Number(question.scores?.overall || 0);
+  const level = score >= 8.5 ? "优秀" : score >= 7 ? "良好" : score >= 6 ? "合格" : "需要加强";
+  const strengths = Array.isArray(question.strengthClaims) ? question.strengthClaims : [];
+  const weaknesses = Array.isArray(question.weaknessClaims) ? question.weaknessClaims : [];
+  return `<div class="question-tab-panel diagnosis-tab-panel" role="tabpanel">
+    <section class="question-verdict"><div><span>综合评价</span><strong>${level} · ${score.toFixed(1)}</strong></div><p>${escapeHtml(compactReportText(question.diagnosis || "暂无综合诊断", 220))}</p></section>
+    <div class="question-insight-grid">
+      ${renderQuestionInsightClaims("回答亮点", strengths, "strength", catalog, question.id)}
+      ${renderQuestionInsightClaims("需要加强", weaknesses, "improvement", catalog, question.id)}
+    </div>
+    <section class="diagnosis-scores"><div class="question-subheading"><strong>五维评分依据</strong></div>${renderDimensionScoreRows(question, catalog)}</section>
+  </div>`;
+}
+
+function renderQuestionInsightClaims(title, items, type, catalog, topicId) {
+  const rows = items.length ? items.slice(0, 3) : [{ text: type === "strength" ? "暂无单独归纳的回答亮点" : "暂无需要单独列出的改进项", evidenceIds: [] }];
+  return `<section class="question-insight ${type}"><h4>${title}</h4><ul>${rows.map(item => `<li title="${escapeHtml(item.text || item)}"><span>${type === "strength" ? "✓" : "•"}</span><p>${escapeHtml(item.text || item)}</p>${renderEvidenceButtons(item.evidenceIds, catalog, topicId)}</li>`).join("")}</ul></section>`;
 }
 
 function renderQuestionScoreTab(question, catalog) {
+  return `<div class="question-tab-panel" role="tabpanel">${renderDimensionScoreRows(question, catalog)}</div>`;
+}
+
+function renderDimensionScoreRows(question, catalog) {
   const rows = Array.isArray(question.scoreEvidence) ? question.scoreEvidence : [];
-  return `<div class="question-tab-panel" role="tabpanel"><div class="dimension-score-list">${rows.map(item => {
+  return `<div class="dimension-score-list">${rows.map(item => {
     const refs = [...new Set((item.evidenceIds || []).map(id => catalog.idToLabel.get(id)).filter(Boolean))];
-    return `<div class="dimension-score-row"><span class="dimension-name">${escapeHtml(SCORE_LABELS[item.dimension] || item.dimension)}</span><span class="dimension-result"><strong>${Number(item.score || 0).toFixed(1)}</strong><small>${escapeHtml(item.level || "待判断")}</small></span><p>${escapeHtml(item.rationale || "暂无评分理由")}</p><span class="dimension-evidence-links">${refs.length ? refs.map(label => `<button type="button" data-question-tab="evidence" data-evidence-link="${label}">${label}</button>`).join("") : `<small>无直接引用</small>`}</span></div>`;
-  }).join("")}</div></div>`;
+    return `<div class="dimension-score-row"><span class="dimension-name">${escapeHtml(SCORE_LABELS[item.dimension] || item.dimension)}</span><span class="dimension-result"><strong>${Number(item.score || 0).toFixed(1)}</strong><small>${escapeHtml(item.level || "待判断")}</small></span><p>${escapeHtml(item.rationale || "暂无评分理由")}</p><span class="dimension-evidence-links">${refs.length ? refs.map(label => `<button type="button" data-question-tab="evidence" data-topic-id="${question.id}" data-evidence-link="${label}">${label}</button>`).join("") : `<small>无直接引用</small>`}</span></div>`;
+  }).join("")}</div>`;
+}
+
+function renderEvidenceButtons(evidenceIds = [], catalog, topicId) {
+  const labels = [...new Set((evidenceIds || []).map(id => catalog.idToLabel.get(id)).filter(Boolean))];
+  return labels.length ? `<span class="inline-evidence-links">${labels.map(label => `<button type="button" data-question-tab="evidence" data-topic-id="${topicId}" data-evidence-link="${label}">${label}</button>`).join("")}</span>` : "";
 }
 
 function buildQuestionEvidenceCatalog(question) {
@@ -1051,14 +1187,22 @@ function buildQuestionEvidenceCatalog(question) {
   });
   const idToLabel = new Map();
   items.forEach(item => item.evidenceIds.forEach(id => idToLabel.set(id, item.label)));
-  (question.scoreEvidence || []).forEach(scoreItem => {
-    (scoreItem.evidenceIds || []).forEach(id => {
-      const label = idToLabel.get(id);
-      const item = items.find(candidate => candidate.label === label);
-      const dimension = SCORE_LABELS[scoreItem.dimension] || scoreItem.dimension;
-      if (item && !item.usedBy.includes(dimension)) item.usedBy.push(dimension);
+  const markUsage = (evidenceIds = [], label) => {
+    evidenceIds.forEach(id => {
+      const evidenceLabel = idToLabel.get(id);
+      const item = items.find(candidate => candidate.label === evidenceLabel);
+      if (item && !item.usedBy.includes(label)) item.usedBy.push(label);
     });
+  };
+  (question.scoreEvidence || []).forEach(scoreItem => {
+    markUsage(scoreItem.evidenceIds, SCORE_LABELS[scoreItem.dimension] || scoreItem.dimension);
   });
+  (question.answerLogic?.steps || []).forEach(item => markUsage(item.evidenceIds, "回答逻辑"));
+  (question.interviewerSignals || []).forEach(item => markUsage(item.evidenceIds, "面试官信号"));
+  (question.strengthClaims || []).forEach(item => markUsage(item.evidenceIds, "回答亮点"));
+  (question.weaknessClaims || []).forEach(item => markUsage(item.evidenceIds, "问题诊断"));
+  markUsage(question.recommendedAnswer?.evidenceIds, "优化回答");
+  (question.recommendedAnswer?.framework?.sections || []).forEach(item => markUsage(item.evidenceIds, "优化回答"));
   return { items, idToLabel };
 }
 
@@ -1085,10 +1229,28 @@ function renderCompactEvidenceRef(item, sourceLabel) {
   return `<article class="compact-evidence-ref ${highlighted ? "highlighted" : ""}" data-evidence-ref="${item.label}"><div class="compact-evidence-heading"><span>${item.label}</span><strong>${escapeHtml(sourceLabel)}</strong><small>${item.verified ? "已回查" : "待核验"}</small></div><blockquote>${escapeHtml(item.quote || "暂无引用内容")}</blockquote><div class="compact-evidence-meta"><span>${escapeHtml(item.locator || "未记录位置")}</span>${item.usedBy.length ? `<span>用于：${escapeHtml(item.usedBy.join("、"))}</span>` : ""}</div></article>`;
 }
 
-function renderQuestionRewriteTab(question) {
-  const star = question.starRewrite || {};
-  const missing = Array.isArray(star.missingInformation) ? star.missingInformation : [];
-  return `<div class="question-tab-panel" role="tabpanel"><section class="optimized-answer"><span>优化后回答</span><p>${escapeHtml(star.fullAnswer || "暂无优化回答")}</p></section><details class="star-details"><summary>查看 STAR 拆解 ${renderLucideIcon("chevron-down")}</summary><div class="star-breakdown-list">${[["S", "情境", star.situation], ["T", "任务", star.task], ["A", "行动", star.action], ["R", "结果", star.result]].map(([letter, label, value]) => `<div><span>${letter}</span><strong>${label}</strong><p>${escapeHtml(value || "暂无")}</p></div>`).join("")}</div>${missing.length ? `<div class="rewrite-missing"><strong>仍待补充</strong><ul>${missing.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : ""}</details></div>`;
+function renderQuestionImprovementTab(question, catalog) {
+  const recommended = question.recommendedAnswer || {};
+  const framework = recommended.framework || {};
+  const sections = Array.isArray(framework.sections) ? framework.sections : [];
+  const missing = Array.isArray(recommended.missingInformation) ? recommended.missingInformation : [];
+  const answerEvidence = renderEvidenceButtons(recommended.evidenceIds, catalog, question.id);
+  return `<div class="question-tab-panel improvement-tab-panel" role="tabpanel">
+    <section class="framework-heading"><div><span>回答策略</span><strong>${escapeHtml(framework.name || framework.type || "暂无推荐结构")}</strong></div><p>${escapeHtml(framework.reason || question.suggestedStructure || "此报告未记录框架选择理由。")}</p></section>
+    <section class="optimized-answer"><div class="optimized-answer-heading"><div><span>优化参考回答</span><small>可直接用于练习</small></div>${answerEvidence ? `<div class="answer-evidence"><small>依据</small>${answerEvidence}</div>` : ""}</div><p>${escapeHtml(recommended.fullAnswer || "暂无优化回答")}</p><div class="answer-provenance-note">${renderLucideIcon("shield-check")}<span>仅重组已确认事实，未确认内容不会写成确定结论。</span></div></section>
+    ${sections.length ? `<details class="answer-outline-details"><summary><span>查看回答组织思路</span><span>${sections.length} 个步骤 ${renderLucideIcon("chevron-down")}</span></summary><div class="framework-section-list">${sections.map((section, index) => `<article><span class="framework-key" title="${escapeHtml(section.key)}">${escapeHtml(frameworkKeyLabel(section.key, index))}</span><div><strong>${escapeHtml(section.label)}</strong><small>${escapeHtml(section.guidance || "")}</small><p>${escapeHtml(section.draft || "待补充")}</p></div>${renderEvidenceButtons(section.evidenceIds, catalog, question.id)}</article>`).join("")}</div></details>` : ""}
+    ${missing.length ? `<section class="rewrite-missing"><div>${renderLucideIcon("triangle-alert")}<strong>建议补充</strong></div><ul>${missing.map(item => `<li>${escapeHtml(String(item).replace(/^待补充[：:]\s*/, ""))}</li>`).join("")}</ul></section>` : ""}
+  </div>`;
+}
+
+function frameworkKeyLabel(key, index) {
+  const normalized = String(key || "").trim().toUpperCase();
+  const labels = {
+    SITUATION: "S", TASK: "T", ACTION: "A", RESULT: "R",
+    POINT: "P", REASON: "R", EXAMPLE: "E", SUMMARY: "P",
+    WHAT: "W1", WHY: "W2", HOW: "W3"
+  };
+  return labels[normalized] || (normalized.length <= 3 ? normalized : String(index + 1).padStart(2, "0"));
 }
 
 function compactReportText(value, limit = 220) {
@@ -1102,7 +1264,7 @@ function renderAuditSection(interview) {
   const hasWarnings = notes.some(note => /无法|失败|占位|缺少|警告|冲突|未通过/.test(String(note)));
   const statusTitle = hasWarnings ? "审计完成，包含系统说明" : "证据与结构检查已完成";
   const statusText = hasWarnings ? "详细技术记录已收起，不影响报告主体阅读。" : "引用、评分与改写结果已进入 Reflection 审计记录。";
-  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">REFLECTION AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">修订 ${revisions} 次</span></div><div class="audit-summary ${hasWarnings ? "warning" : ""}">${renderLucideIcon(hasWarnings ? "triangle-alert" : "circle-check")}<div><strong>${statusTitle}</strong><p>${statusText}</p></div></div>${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(note)}</li>`).join("")}</ol></details>` : ""}</section>`;
+  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">REFLECTION AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">修订 ${revisions} 次</span></div><div class="audit-summary ${hasWarnings ? "warning" : ""}">${renderLucideIcon(hasWarnings ? "triangle-alert" : "circle-check")}<div><strong>${statusTitle}</strong><p>${statusText}</p></div></div>${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(publicRuntimeText(note))}</li>`).join("")}</ol></details>` : ""}</section>`;
 }
 
 function reviewBlock(title, content) {
@@ -1603,16 +1765,25 @@ function bindParsePage() {
     if (state.editingTurnId && !confirm("当前编辑内容尚未保存，确定返回复盘报告吗？")) return;
     location.hash = `#/review/${record.id}`;
   });
+  bindReviewDialogEvents();
+  document.querySelector("#retryParse")?.addEventListener("click", retryParse);
+}
+
+function bindReviewDialogEvents() {
   document.querySelectorAll("[data-close-review-dialog]").forEach(button => button.addEventListener("click", closeReviewDialog));
   document.querySelector("[data-continue-review]")?.addEventListener("click", () => {
     closeReviewDialog();
+    if (state.route.name === "review") {
+      const record = currentRecord();
+      if (record) location.hash = `#/parse/${record.id}?from=report`;
+      return;
+    }
     locatePendingItem();
   });
   const reviewDialog = document.querySelector("#reviewDialog");
   reviewDialog?.addEventListener("close", () => { state.reviewDialogOpen = false; });
   reviewDialog?.addEventListener("click", event => { if (event.target === reviewDialog) closeReviewDialog(); });
   document.querySelector("#startRun")?.addEventListener("click", startAgentRun);
-  document.querySelector("#retryParse")?.addEventListener("click", retryParse);
 }
 
 function openReviewDialog() {
@@ -1774,7 +1945,9 @@ async function startAgentRun() {
     setError("题卡内容没有变化，无需重新生成复盘报告");
     return;
   }
-  const allTopicsReviewed = record.topics?.every(topicIsReviewed);
+  const allTopicsReviewed = record.topics?.length
+    ? record.topics.every(topicIsReviewed)
+    : record.report?.interview?.reviewMode !== "quick";
   const reviewMode = allTopicsReviewed ? "full" : "quick";
   if (reviewMode === "quick" && !state.acknowledgeUnreviewed) {
     setError("请确认使用未经人工校对的题卡进行快速复盘");
@@ -1791,6 +1964,10 @@ async function startAgentRun() {
   }
   if (state.reviewMode === "web" && !state.health?.webVerifyAvailable) {
     setError("联网核验服务当前不可用，请改用仅本地材料");
+    return;
+  }
+  if (Number(state.health?.reportSchemaVersion || 0) < REPORT_SCHEMA_VERSION) {
+    setError("后端仍在运行旧版报告协议，请重启本地服务并刷新页面后再复盘");
     return;
   }
   const enableWebVerify = state.reviewMode === "web";
@@ -1901,7 +2078,7 @@ function findQuestion(record, id) {
 
 function syncFlatQuestions(record) {
   record.questions = (record.topics || []).flatMap(topic => [topic.mainTurn, ...(topic.followUps || [])]).sort((a, b) => a.order - b.order);
-  record.questionCount = record.topics?.length || 0;
+  record.questionCount = countQuestionTurns(record);
 }
 
 function markReportEditDirty(record) {
@@ -2094,10 +2271,12 @@ function bindRunPage() {
 function connectEventSource() {
   const record = currentRecord();
   if (!record?.runId || activeSource || ["completed", "failed", "cancelled"].includes(record.status)) return;
-  activeSource = new EventSource(`/api/v1/runs/${record.runId}/events`);
+  const lastKnownEventId = state.events.reduce((latest, item) => Math.max(latest, Number(item.id || 0)), 0);
+  activeSource = new EventSource(`/api/v1/runs/${record.runId}/events?after=${lastKnownEventId}`);
   EVENT_TYPES.forEach(type => activeSource.addEventListener(type, async event => {
     const item = { id: Number(event.lastEventId || state.events.length + 1), type, data: JSON.parse(event.data || "{}"), createdAt: new Date().toISOString() };
-    if (!state.events.some(existing => existing.id === item.id)) state.events.push(item);
+    if (state.events.some(existing => existing.id === item.id)) return;
+    state.events.push(item);
     if (type === "PHASE_STARTED") record.phase = item.data.phase;
     if (type === "CHECKPOINT_SAVED") {
       record.runProgress ||= {};
@@ -2170,7 +2349,10 @@ async function resumeRun() {
   const record = currentRecord();
   if (!record?.runId) return;
   try {
+    const latest = await api(`/api/v1/runs/${record.runId}`);
+    if (await openCompletedRun(record, latest)) return;
     await api(`/api/v1/runs/${record.runId}/resume`, { method: "POST" });
+    state.events = latest.events || state.events;
     record.status = "reviewing";
     record.phase = "resuming";
     record.runError = "";
@@ -2179,8 +2361,29 @@ async function resumeRun() {
     saveRecord(record);
     render();
   } catch (error) {
+    try {
+      const latest = await api(`/api/v1/runs/${record.runId}`);
+      if (await openCompletedRun(record, latest)) return;
+    } catch (refreshError) {
+      console.warn("Unable to reconcile resumed Agent run.", refreshError);
+    }
     setError(readableError(error));
   }
+}
+
+async function openCompletedRun(record, run) {
+  if (run?.status !== "COMPLETED") return false;
+  state.events = run.events || state.events;
+  record.status = "completed";
+  record.phase = "completed";
+  record.runProgress = run.progress || record.runProgress || {};
+  record.runError = "";
+  record.failureCode = "";
+  record.agentArtifacts = run.artifacts || record.agentArtifacts || [];
+  await loadReport(record);
+  saveRecord(record);
+  location.hash = `#/review/${record.id}`;
+  return true;
 }
 
 async function fallbackRun() {
@@ -2201,20 +2404,22 @@ async function fallbackRun() {
 }
 
 async function loadReport(record) {
-  const report = await api(`/api/v1/interviews/${record.id}/report`);
+  const runQuery = record.runId ? `?runId=${encodeURIComponent(record.runId)}` : "";
+  const report = normalizeReportRecord(await api(`/api/v1/interviews/${record.id}/report${runQuery}`));
   if (report.status !== "COMPLETED") return;
   report.questions = (report.questions || []).map(normalizeQuestionRecord);
   record.report = report;
   record.questions = report.questions;
   record.actions = report.actions || [];
   record.status = "completed";
-  record.questionCount = report.questions.length;
+  record.questionCount = countQuestionTurns(record);
   record.reportEditDirty = false;
   record.updatedAt = new Date().toISOString();
   saveRecord(record);
 }
 
 function bindReviewPage() {
+  document.querySelector("#rerunReview")?.addEventListener("click", openReviewDialog);
   document.querySelector("#editReportCards")?.addEventListener("click", () => {
     const record = currentRecord();
     if (!record?.report) return;
@@ -2225,15 +2430,34 @@ function bindReviewPage() {
   document.querySelectorAll("[data-expand]").forEach(button => button.addEventListener("click", () => {
     const nextId = state.expandedQuestionId === button.dataset.expand ? null : button.dataset.expand;
     state.expandedQuestionId = nextId;
-    if (nextId) state.questionReviewTab = "summary";
+    if (nextId && !state.questionReviewTabs[nextId]) state.questionReviewTabs[nextId] = "logic";
     state.questionEvidenceFocus = "";
     render();
   }));
   document.querySelectorAll("[data-question-tab]").forEach(button => button.addEventListener("click", () => {
-    state.questionReviewTab = button.dataset.questionTab;
+    const topicId = button.dataset.topicId || state.expandedQuestionId;
+    if (!topicId) return;
+    state.questionReviewTabs[topicId] = button.dataset.questionTab;
     state.questionEvidenceFocus = button.dataset.evidenceLink || "";
     render();
     if (state.questionEvidenceFocus) requestAnimationFrame(() => document.querySelector(`[data-evidence-ref="${state.questionEvidenceFocus}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+  }));
+  document.querySelectorAll("[data-open-topic]").forEach(button => button.addEventListener("click", () => {
+    const topicId = button.dataset.openTopic;
+    state.expandedQuestionId = topicId;
+    state.questionReviewTabs[topicId] = "diagnosis";
+    state.questionEvidenceFocus = "";
+    render();
+    requestAnimationFrame(() => document.querySelector(`[data-topic-review="${topicId}"]`)?.scrollIntoView({ block: "start", behavior: "smooth" }));
+  }));
+  document.querySelectorAll(".question-review-tab").forEach((button, index, buttons) => button.addEventListener("keydown", event => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    const siblings = [...buttons].filter(item => item.dataset.topicId === button.dataset.topicId);
+    const current = siblings.indexOf(button);
+    const next = siblings[(current + (event.key === 'ArrowRight' ? 1 : -1) + siblings.length) % siblings.length];
+    next?.focus();
+    next?.click();
   }));
   document.querySelectorAll("[data-action]").forEach(input => input.addEventListener("change", () => {
     const record = currentRecord();
@@ -2243,6 +2467,17 @@ function bindReviewPage() {
     saveRecord(record);
   }));
   document.querySelector("#exportReport")?.addEventListener("click", exportReport);
+  document.querySelectorAll('input[name="reviewMode"]').forEach(input => input.addEventListener("change", event => {
+    state.reviewMode = event.currentTarget.value;
+    state.error = "";
+    render();
+  }));
+  document.querySelector("#acknowledgeUnreviewed")?.addEventListener("change", event => {
+    state.acknowledgeUnreviewed = event.currentTarget.checked;
+    state.acknowledgeUnresolved = event.currentTarget.checked;
+    render();
+  });
+  bindReviewDialogEvents();
 }
 
 function exportReport() {
@@ -2367,7 +2602,11 @@ function formatDuration(value) {
 }
 
 function readableError(error) {
-  return error instanceof Error ? error.message : String(error || "未知错误");
+  return publicRuntimeText(error instanceof Error ? error.message : String(error || "未知错误"));
+}
+
+function publicRuntimeText(value) {
+  return String(value ?? "").replace(/hello[\s-]*agents/gi, "Agent 服务");
 }
 
 function escapeHtml(value) {

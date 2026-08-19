@@ -285,12 +285,60 @@ class Database:
             rows = connection.execute("SELECT * FROM interviews ORDER BY updated_at DESC").fetchall()
         return [dict(row) for row in rows]
 
-    def delete_interview(self, interview_id: str) -> list[str]:
+    def delete_interview(self, interview_id: str) -> dict[str, list[str]]:
         with self._lock, self.connect() as connection:
-            rows = connection.execute("SELECT storage_path FROM materials WHERE interview_id=?", (interview_id,)).fetchall()
-            connection.execute("DELETE FROM growth_snapshots WHERE interview_id=?", (interview_id,))
+            materials = connection.execute(
+                "SELECT id, storage_path FROM materials WHERE interview_id=?",
+                (interview_id,),
+            ).fetchall()
+            parse_runs = connection.execute(
+                "SELECT id FROM parse_runs WHERE interview_id=?",
+                (interview_id,),
+            ).fetchall()
+            review_runs = connection.execute(
+                "SELECT id, hello_session_id FROM review_runs WHERE interview_id=?",
+                (interview_id,),
+            ).fetchall()
+            questions = connection.execute(
+                "SELECT id FROM question_cards WHERE interview_id=?",
+                (interview_id,),
+            ).fetchall()
+            review_run_ids = [row["id"] for row in review_runs]
+            artifact_sessions: list[str] = []
+            evidence_ids: list[str] = []
+            if review_run_ids:
+                placeholders = ",".join("?" for _ in review_run_ids)
+                artifact_sessions = [
+                    row["session_id"]
+                    for row in connection.execute(
+                        f"SELECT session_id FROM review_stage_artifacts WHERE run_id IN ({placeholders}) AND session_id<>''",
+                        review_run_ids,
+                    ).fetchall()
+                ]
+                evidence_ids = [
+                    row["id"]
+                    for row in connection.execute(
+                        f"SELECT id FROM evidence_refs WHERE run_id IN ({placeholders})",
+                        review_run_ids,
+                    ).fetchall()
+                ]
             connection.execute("DELETE FROM interviews WHERE id=?", (interview_id,))
-        return [row[0] for row in rows if row[0]]
+        identifiers = {
+            interview_id,
+            *(row["id"] for row in materials),
+            *(row["id"] for row in parse_runs),
+            *review_run_ids,
+            *(row["id"] for row in questions),
+            *(row["hello_session_id"] for row in review_runs if row["hello_session_id"]),
+            *artifact_sessions,
+            *evidence_ids,
+        }
+        return {
+            "storagePaths": [row["storage_path"] for row in materials if row["storage_path"]],
+            "parseRunIds": [row["id"] for row in parse_runs],
+            "reviewRunIds": review_run_ids,
+            "identifiers": sorted(identifiers),
+        }
 
     def get_parse_run_ids(self, interview_id: str) -> list[str]:
         with self.connect() as connection:
@@ -1117,6 +1165,26 @@ class Database:
                 "INSERT INTO growth_snapshots VALUES(?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), interview_id, run_id, json.dumps(scores), json.dumps(weak_dimensions, ensure_ascii=False), json.dumps(action_items, ensure_ascii=False), utc_now()),
             )
+
+    def sync_growth_snapshot(self, interview_id: str, run_id: str, scores: dict[str, Any], action_items: list[dict[str, Any]]) -> int:
+        weak_dimensions = sorted(
+            (key for key in scores if key != "overall"),
+            key=lambda key: float(scores.get(key) or 0),
+        )[:2]
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE growth_snapshots
+                SET run_id=?,scores_json=?,weak_dimensions_json=?,action_items_json=?
+                WHERE interview_id=?""",
+                (
+                    run_id,
+                    json.dumps(scores),
+                    json.dumps(weak_dimensions, ensure_ascii=False),
+                    json.dumps(action_items, ensure_ascii=False),
+                    interview_id,
+                ),
+            )
+        return cursor.rowcount
 
     def get_growth_trends(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
