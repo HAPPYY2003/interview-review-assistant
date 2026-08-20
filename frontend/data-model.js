@@ -287,7 +287,6 @@ export function normalizeReportRecord(report = {}) {
   const sourceEvaluation = sourceInterview.overallEvaluation || {};
   const overallEvaluation = {
     summary: sourceEvaluation.summary || sourceInterview.summary || "暂无总结",
-    competitiveness: sourceEvaluation.competitiveness || `${compatibilityLabel}未生成独立竞争力判断。`,
     strengths: Array.isArray(sourceEvaluation.strengths) ? sourceEvaluation.strengths : [],
     risks: Array.isArray(sourceEvaluation.risks) ? sourceEvaluation.risks : [],
     nextFocus: sourceEvaluation.nextFocus || sourceInterview.nextFocus || "",
@@ -320,14 +319,28 @@ export function normalizeReportRecord(report = {}) {
     legacy: Boolean(gap.legacy)
   }));
   const fallbackGapId = gaps[0]?.id || "legacy-gap-1";
-  const actions = (report.actions || []).map((action, index) => ({
-    ...action,
-    id: String(action.id || `action-${index + 1}`),
-    order: Number(action.order || action.day || index + 1),
-    type: action.type === "learning" ? "learning" : "preparation",
-    gapIds: Array.isArray(action.gapIds) && action.gapIds.length ? action.gapIds : [fallbackGapId],
-    successCriterion: action.successCriterion || "完成任务并保留练习记录。"
-  }));
+  const actions = (report.actions || []).map((action, index) => {
+    const status = ["pending", "in_progress", "completed", "skipped"].includes(action.status)
+      ? action.status
+      : (action.completed ? "completed" : "pending");
+    return {
+      ...action,
+      id: String(action.id || `action-${index + 1}`),
+      order: Number(action.order || action.day || index + 1),
+      type: action.type === "learning" ? "learning" : "preparation",
+      gapIds: Array.isArray(action.gapIds) && action.gapIds.length ? action.gapIds : [fallbackGapId],
+      successCriterion: action.successCriterion || "完成任务并保留练习记录。",
+      status,
+      completed: status === "completed",
+      startedAt: action.startedAt || null,
+      completedAt: action.completedAt || null,
+      userNote: String(action.userNote || ""),
+      completionEvidence: String(action.completionEvidence || ""),
+      selfRating: action.selfRating === null || action.selfRating === undefined || action.selfRating === ""
+        ? null
+        : (Number.isFinite(Number(action.selfRating)) ? Number(action.selfRating) : null)
+    };
+  });
   return {
     ...report,
     reportSchemaVersion,
@@ -368,8 +381,6 @@ export function buildMarkdownReport(interview, questions, actions) {
     "## 面试综合评价",
     "",
     `- 面试表现：${Number(evaluation.score ?? scores.overall ?? 0).toFixed(1)}/10 · ${evaluation.performanceLevel || performanceLevel(Number(scores.overall || 0))}`,
-    `- 本场竞争力：${evaluation.competitiveness || "暂无判断"}`,
-    "",
     evaluation.summary || interview.summary || "暂无总结",
     "",
     `- 主要优势：${(evaluation.strengths || []).map(item => item.text || item).join("；") || "暂无"}`,

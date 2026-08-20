@@ -178,7 +178,6 @@ class EvidenceReviewService:
         strongest = sorted(reviews, key=lambda item: item["scores"]["overall"], reverse=True)[:3]
         evaluation = {
             "summary": summary,
-            "competitiveness": self._competitiveness(overall["overall"]),
             "strengths": [
                 {"text": item["strengths"][0], "topicIds": [item["id"]]}
                 for item in strongest if item.get("strengths")
@@ -488,16 +487,6 @@ class EvidenceReviewService:
             "priority": "medium", "topicIds": [item["id"] for item in ordered[:1]], "evidenceIds": [],
             "learningItems": [], "preparationItems": ["整理一个完整项目案例"],
         }]
-
-    @staticmethod
-    def _competitiveness(score: float) -> str:
-        if score >= 8.5:
-            return "本场材料体现出较强岗位竞争力，但该判断不代表实际录用结果。"
-        if score >= 7:
-            return "本场材料体现出基础竞争力，仍需补强关键案例证据；该判断不代表实际录用结果。"
-        if score >= 6:
-            return "本场表现基本覆盖岗位要求，但差异化证据不足；该判断不代表实际录用结果。"
-        return "本场材料暴露出较明显准备缺口，建议完成针对性训练后再评估；该判断不代表实际录用结果。"
 
     @staticmethod
     def _summary(scores: dict[str, float], materials: dict[str, Any], web: bool) -> str:

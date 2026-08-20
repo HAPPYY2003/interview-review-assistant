@@ -236,6 +236,13 @@ async function loadRouteData() {
       state.error = readableError(error);
     }
   }
+  if (state.route.name === "review" && record?.runId) {
+    try {
+      await loadReport(record);
+    } catch (error) {
+      state.error = readableError(error);
+    }
+  }
   if (state.route.name === "trends") {
     try {
       const result = await api("/api/v1/profile/trends");
@@ -1085,7 +1092,7 @@ function renderReviewPage() {
 function renderLegacyReportNotice(report) {
   return `<section class="legacy-report-notice" role="status">
     <span class="legacy-report-icon">${renderLucideIcon("triangle-alert")}</span>
-    <div><strong>这份报告由旧版复盘流程生成</strong><p>当前记录没有保存独立竞争力判断、结构化回答路径等 V2 内容。重启服务后使用右上角“重新面试复盘”，才能由 Agent 重新生成这些判断。</p></div>
+    <div><strong>这份报告由旧版复盘流程生成</strong><p>当前记录没有保存结构化回答路径等新版内容。使用右上角“重新面试复盘”，可以重新生成这些分析。</p></div>
     <span class="legacy-report-version">报告结构 V${Number(report.reportSchemaVersion || 1)}</span>
   </section>`;
 }
@@ -1101,7 +1108,6 @@ function renderOverallEvaluation(interview, quickReview) {
   return `<section class="summary-band evaluation-band">
     <div class="summary-heading"><div><span class="eyebrow">OVERALL REVIEW</span><h2>面试综合评价</h2></div><div class="evaluation-heading-meta">${quickReview ? `<span class="mode-badge quick">快速复盘·含未校对题卡</span>` : ""}<span class="evaluation-score"><strong>${score.toFixed(1)}</strong><small>/10</small><em>${escapeHtml(evaluation.performanceLevel || "待评估")}</em></span></div></div>
     <p>${escapeHtml(evaluation.summary || interview.summary || "暂无总结")}</p>
-    <div class="evaluation-competitiveness"><span>本场竞争力</span><p>${escapeHtml(evaluation.competitiveness || "暂无独立判断")}</p><small>基于本次材料，不代表实际录用结果。</small></div>
     <div class="evaluation-points">
       <div><span>主要优势</span><ul>${strengths.length ? strengths.map(item => `<li>${escapeHtml(item.text || item)}</li>`).join("") : "<li>暂无单独归纳的优势</li>"}</ul></div>
       <div><span>主要风险</span><ul>${risks.length ? risks.map(item => `<li>${escapeHtml(item.text || item)}</li>`).join("") : "<li>暂无单独归纳的风险</li>"}</ul></div>
@@ -1132,7 +1138,47 @@ function renderAction(record, action, gapMap = new Map(), index = 0) {
   const dimension = SCORE_LABELS[action.dimension] || action.dimension || "综合训练";
   const order = Math.max(1, Number(action.order || action.day || index + 1));
   const gapNames = (action.gapIds || []).map(id => gapMap.get(id)?.title).filter(Boolean);
-  return `<label class="action-item ${action.completed ? "done" : ""}"><input class="action-check" type="checkbox" data-action="${action.id}" ${action.completed ? "checked" : ""} /><span class="action-copy"><span class="action-heading"><span class="action-order">行动 ${order}</span><span class="action-type ${action.type || "preparation"}">${action.type === "learning" ? "学习项" : "准备项"}</span><strong>${escapeHtml(action.title)}</strong><span class="action-priority ${escapeHtml(action.priority || "medium")}">${action.priority === "high" ? "高优先" : "中优先"}</span></span><span class="action-description">${escapeHtml(action.description || "")}</span>${gapNames.length ? `<span class="action-gap">对应缺口：${escapeHtml(gapNames.join("、"))}</span>` : ""}<span class="action-meta"><span>提升维度：${escapeHtml(dimension)}</span>${action.successCriterion ? `<span>完成标准：${escapeHtml(action.successCriterion)}</span>` : ""}</span></span></label>`;
+  const gapText = gapNames.join("、") || "暂无关联缺口";
+  const description = action.description || "暂无任务说明";
+  const successCriterion = action.successCriterion || "暂无完成标准";
+  const status = ["pending", "in_progress", "completed", "skipped"].includes(action.status)
+    ? action.status
+    : (action.completed ? "completed" : "pending");
+  const statusChoices = [
+    ["pending", "待开始"], ["in_progress", "进行中"],
+    ["completed", "已完成"], ["skipped", "已跳过"]
+  ];
+  const statusOptions = statusChoices.map(([value, label]) => `<option value="${value}" ${status === value ? "selected" : ""}>${label}</option>`).join("");
+  const statusLabel = statusChoices.find(([value]) => value === status)?.[1] || "待开始";
+  const ratingOptions = ["<option value=\"\">未评分</option>", ...[1, 2, 3, 4, 5].map(value => `<option value="${value}" ${Number(action.selfRating) === value ? "selected" : ""}>${value} 分</option>`)].join("");
+  const timestamps = [
+    action.startedAt ? `开始：${formatDateTime(action.startedAt)}` : "",
+    action.completedAt ? `完成：${formatDateTime(action.completedAt)}` : ""
+  ].filter(Boolean);
+  return `<article class="action-item ${status === "completed" ? "done" : ""}" data-action-card="${escapeHtml(action.id)}">
+    <label class="action-check-control" title="标记为已完成"><input class="action-check" type="checkbox" data-action="${escapeHtml(action.id)}" ${status === "completed" ? "checked" : ""} /></label>
+    <div class="action-copy">
+      <div class="action-heading"><span class="action-order">行动 ${order}</span><span class="action-type ${action.type || "preparation"}">${action.type === "learning" ? "学习项" : "准备项"}</span><strong>${escapeHtml(action.title)}</strong><span class="action-priority ${escapeHtml(action.priority || "medium")}">${action.priority === "high" ? "高优先" : "中优先"}</span></div>
+      <div class="action-content">
+        <p class="action-description">${escapeHtml(description)}</p>
+        <div class="action-detail-row action-gap"><span>对应缺口：</span><p>${escapeHtml(gapText)}</p></div>
+        <div class="action-detail-row action-dimension action-meta"><span>提升维度：</span><strong>${escapeHtml(dimension)}</strong></div>
+        <div class="action-detail-row action-success"><span>完成标准：</span><p>${escapeHtml(successCriterion)}</p></div>
+      </div>
+      <button type="button" class="action-content-toggle" data-toggle-action-content aria-expanded="false" hidden><span>查看完整内容</span>${renderLucideIcon("chevron-down")}</button>
+      <details class="action-progress-editor">
+        <summary>行动记录<span>${statusLabel}</span></summary>
+        <div class="action-progress-form">
+          <label class="action-progress-field"><span>状态</span><select data-action-status>${statusOptions}</select></label>
+          <label class="action-progress-field"><span>完成自评</span><select data-action-rating>${ratingOptions}</select></label>
+          <label class="action-progress-field wide"><span>练习备注</span><textarea data-action-note rows="2" maxlength="2000" placeholder="记录练习过程、困难或下一步调整">${escapeHtml(action.userNote || "")}</textarea></label>
+          <label class="action-progress-field wide"><span>完成证据</span><textarea data-action-evidence rows="2" maxlength="4000" placeholder="填写文档名称、录音编号、链接或可回查说明">${escapeHtml(action.completionEvidence || "")}</textarea></label>
+          ${timestamps.length ? `<small class="action-progress-timestamps">${timestamps.map(escapeHtml).join(" · ")}</small>` : ""}
+          <button type="button" class="icon-button action-progress-save" data-save-action="${escapeHtml(action.id)}" title="保存行动记录" aria-label="保存行动记录">${renderLucideIcon("save")}</button>
+        </div>
+      </details>
+    </div>
+  </article>`;
 }
 
 function renderQuestionReview(question, index = 0) {
@@ -2610,12 +2656,78 @@ function bindReviewPage() {
     next?.focus();
     next?.click();
   }));
-  document.querySelectorAll("[data-action]").forEach(input => input.addEventListener("change", () => {
+  document.querySelectorAll("[data-action]").forEach(input => input.addEventListener("change", async () => {
     const record = currentRecord();
     const action = record?.report?.actions?.find(item => item.id === input.dataset.action);
-    if (action) action.completed = input.checked;
+    if (!action) return;
+    const runId = record.report?.run?.id || record.runId;
+    const previous = { status: action.status, completed: action.completed };
+    const nextStatus = input.checked ? "completed" : "pending";
+    action.status = nextStatus;
+    action.completed = input.checked;
+    const card = input.closest("[data-action-card]");
+    const statusInput = card?.querySelector("[data-action-status]");
+    if (statusInput) statusInput.value = nextStatus;
     input.closest(".action-item")?.classList.toggle("done", input.checked);
-    saveRecord(record);
+    input.disabled = true;
+    try {
+      if (runId) {
+        const result = await api(`/api/v1/growth-actions/${encodeURIComponent(action.id)}`, {
+          method: "PATCH",
+          body: { runId, status: nextStatus }
+        });
+        Object.assign(action, result.action || {});
+      }
+      saveRecord(record);
+    } catch (error) {
+      action.status = previous.status;
+      action.completed = previous.completed;
+      input.checked = previous.completed;
+      input.closest(".action-item")?.classList.toggle("done", previous.completed);
+      setError(readableError(error));
+    } finally {
+      input.disabled = false;
+    }
+  }));
+  document.querySelectorAll("[data-toggle-action-content]").forEach(button => {
+    const card = button.closest("[data-action-card]");
+    const clamped = card?.querySelectorAll(".action-description, .action-gap p, .action-success p") || [];
+    button.hidden = ![...clamped].some(item => item.scrollHeight > item.clientHeight + 1 || item.scrollWidth > item.clientWidth + 1);
+    button.addEventListener("click", () => {
+      if (!card) return;
+      const expanded = card.classList.toggle("content-expanded");
+      button.setAttribute("aria-expanded", String(expanded));
+      button.innerHTML = `<span>${expanded ? "收起完整内容" : "查看完整内容"}</span>${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}`;
+    });
+  });
+  document.querySelectorAll("[data-save-action]").forEach(button => button.addEventListener("click", async () => {
+    const record = currentRecord();
+    const action = record?.report?.actions?.find(item => item.id === button.dataset.saveAction);
+    const runId = record?.report?.run?.id || record?.runId;
+    const card = button.closest("[data-action-card]");
+    if (!record || !action || !runId || !card) return;
+    const rating = card.querySelector("[data-action-rating]")?.value || "";
+    button.disabled = true;
+    try {
+      const result = await api(`/api/v1/growth-actions/${encodeURIComponent(action.id)}`, {
+        method: "PATCH",
+        body: {
+          runId,
+          status: card.querySelector("[data-action-status]")?.value || "pending",
+          userNote: card.querySelector("[data-action-note]")?.value.trim() || "",
+          completionEvidence: card.querySelector("[data-action-evidence]")?.value.trim() || "",
+          selfRating: rating ? Number(rating) : null
+        }
+      });
+      Object.assign(action, result.action || {});
+      saveRecord(record);
+      toast("行动记录已保存");
+      render();
+    } catch (error) {
+      setError(readableError(error));
+    } finally {
+      button.disabled = false;
+    }
   }));
   document.querySelector("#exportReport")?.addEventListener("click", exportReport);
   document.querySelectorAll('input[name="reviewMode"]').forEach(input => input.addEventListener("change", event => {

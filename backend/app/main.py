@@ -18,6 +18,7 @@ from backend.app.config import settings
 from backend.app.database import ActiveAgentRunError, Database
 from backend.app.schemas import (
     ConfirmQuestionsRequest,
+    GrowthActionProgressPatch,
     GrowthSnapshotDeleteBatch,
     GrowthSnapshotImportBatch,
     InterviewCreate,
@@ -597,6 +598,51 @@ def get_report(interview_id: str, run_id: str | None = Query(default=None, alias
         return workflow.report(interview_id, run_id=run_id)
     except KeyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/growth-plans/{run_id}")
+def get_growth_plan(run_id: str) -> dict[str, Any]:
+    run = get_run_or_404(run_id)
+    if run["status"] != "COMPLETED":
+        raise HTTPException(status_code=409, detail="成长计划尚未生成完成")
+    report = run.get("metrics", {}).get("report", {})
+    actions = database.merge_growth_action_progress(run_id, report.get("actionItems", []))
+    overall_evaluation = dict(report.get("overallEvaluation") or {})
+    overall_evaluation.pop("competitiveness", None)
+    return {
+        "id": run_id,
+        "runId": run_id,
+        "interviewId": run["interview_id"],
+        "reportSchemaVersion": int(report.get("reportSchemaVersion") or 1),
+        "overallEvaluation": overall_evaluation,
+        "capabilityGaps": report.get("capabilityGaps") or [],
+        "actions": actions,
+        "updatedAt": run["updated_at"],
+    }
+
+
+@app.patch("/api/v1/growth-actions/{action_id}")
+def patch_growth_action(action_id: str, payload: GrowthActionProgressPatch) -> dict[str, Any]:
+    run = get_run_or_404(payload.run_id)
+    if run["status"] != "COMPLETED":
+        raise HTTPException(status_code=409, detail="成长计划尚未生成完成")
+    report = run.get("metrics", {}).get("report", {})
+    action_items = report.get("actionItems", [])
+    merged_actions = database.merge_growth_action_progress(payload.run_id, action_items)
+    if not any(item["id"] == action_id for item in merged_actions):
+        raise HTTPException(status_code=404, detail="未找到成长行动项")
+    updates = payload.model_dump(exclude={"run_id"}, exclude_unset=True, by_alias=False)
+    database.update_growth_action_progress(
+        run_id=payload.run_id,
+        action_id=action_id,
+        interview_id=run["interview_id"],
+        updates=updates,
+    )
+    action = next(
+        item for item in database.merge_growth_action_progress(payload.run_id, action_items)
+        if item["id"] == action_id
+    )
+    return {"runId": payload.run_id, "interviewId": run["interview_id"], "action": action}
 
 
 @app.get("/api/v1/profile/trends")

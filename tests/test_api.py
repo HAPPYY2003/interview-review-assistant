@@ -457,6 +457,12 @@ def test_delete_interview_removes_database_rows_and_private_artifacts():
             "questionType": "项目经历",
         }])
         database.save_growth_snapshot(interview_id, review_run["id"], {"overall": 7.0}, [], [])
+        database.update_growth_action_progress(
+            run_id=review_run["id"],
+            action_id="action-delete-test",
+            interview_id=interview_id,
+            updates={"status": "completed"},
+        )
 
         parse_artifact = settings.data_dir / "parse-runs" / parse_run["id"]
         parse_artifact.mkdir(parents=True, exist_ok=True)
@@ -476,7 +482,10 @@ def test_delete_interview_removes_database_rows_and_private_artifacts():
         assert not session_file.exists()
         with database.connect() as connection:
             assert connection.execute("SELECT COUNT(*) FROM interviews WHERE id=?", (interview_id,)).fetchone()[0] == 0
-            for table in ("materials", "question_cards", "parse_runs", "review_runs", "growth_snapshots"):
+            for table in (
+                "materials", "question_cards", "parse_runs", "review_runs",
+                "growth_snapshots", "growth_action_progress",
+            ):
                 assert connection.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE interview_id=?",
                     (interview_id,),
@@ -485,6 +494,88 @@ def test_delete_interview_removes_database_rows_and_private_artifacts():
         repeated_delete = client.delete(f"/api/v1/interviews/{interview_id}")
         assert repeated_delete.status_code == 200
         assert repeated_delete.json() == {"deleted": True}
+
+
+def test_growth_action_progress_is_saved_on_server_and_merged_into_report():
+    interview_id = f"growth-progress-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        interview = database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "raw_transcript": "面试官：请介绍项目。\n候选人：我负责实验设计并推动上线。",
+        })
+        database.replace_questions(interview_id, review_service.parse_transcript(interview["raw_transcript"]))
+        database.confirm_questions(interview_id)
+        run = database.create_run(
+            interview_id,
+            agent_mode="fixture",
+            input_digest=workflow.input_digest(interview_id),
+        )
+        workflow.execute(run["id"])
+
+        initial = client.get(f"/api/v1/growth-plans/{run['id']}")
+        assert initial.status_code == 200
+        action = initial.json()["actions"][0]
+        assert action["status"] == "pending"
+        assert action["completed"] is False
+        assert action["startedAt"] is None
+        assert action["completedAt"] is None
+
+        updated = client.patch(
+            f"/api/v1/growth-actions/{action['id']}",
+            json={
+                "runId": run["id"],
+                "status": "completed",
+                "userNote": "已完成一次模拟回答",
+                "completionEvidence": "复盘录音 01",
+                "selfRating": 4,
+            },
+        )
+        assert updated.status_code == 200
+        saved = updated.json()["action"]
+        assert saved["status"] == "completed"
+        assert saved["completed"] is True
+        assert saved["startedAt"]
+        assert saved["completedAt"]
+        assert saved["userNote"] == "已完成一次模拟回答"
+        assert saved["completionEvidence"] == "复盘录音 01"
+        assert saved["selfRating"] == 4
+
+        reloaded_plan = client.get(f"/api/v1/growth-plans/{run['id']}").json()
+        reloaded_report = client.get(
+            f"/api/v1/interviews/{interview_id}/report",
+            params={"runId": run["id"]},
+        ).json()
+        assert reloaded_plan["actions"][0]["status"] == "completed"
+        assert reloaded_report["actions"][0]["completionEvidence"] == "复盘录音 01"
+
+        reset = client.patch(
+            f"/api/v1/growth-actions/{action['id']}",
+            json={"runId": run["id"], "status": "pending", "selfRating": None},
+        )
+        assert reset.status_code == 200
+        assert reset.json()["action"]["startedAt"] is None
+        assert reset.json()["action"]["completedAt"] is None
+        assert reset.json()["action"]["selfRating"] is None
+
+        missing = client.patch(
+            "/api/v1/growth-actions/not-an-action",
+            json={"runId": run["id"], "status": "completed"},
+        )
+        invalid_rating = client.patch(
+            f"/api/v1/growth-actions/{action['id']}",
+            json={"runId": run["id"], "selfRating": 6},
+        )
+        assert missing.status_code == 404
+        assert invalid_rating.status_code == 422
+
+        assert client.delete(f"/api/v1/interviews/{interview_id}").status_code == 200
+        with database.connect() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM growth_action_progress WHERE interview_id=?",
+                (interview_id,),
+            ).fetchone()[0] == 0
 
 
 def test_growth_snapshot_delete_keeps_interview_record():

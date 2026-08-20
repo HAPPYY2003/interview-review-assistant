@@ -801,8 +801,9 @@ class SubmitPlanTool(Tool):
                 payload = GrowthPlanSubmission.model_validate(self._flat_payload(parameters))
         except (ValidationError, ValueError) as exc:
             return self._reject(f"成长计划未通过 Schema：{exc}")
-        if re.search(r"录用(?:概率|几率|可能性)|Offer\s*概率|胜算", payload.overall_evaluation.competitiveness, re.I):
-            return self._reject("本场竞争力不能包含录用概率或胜算判断")
+        evaluation_text = json.dumps(payload.overall_evaluation.model_dump(by_alias=True), ensure_ascii=False)
+        if re.search(r"录用(?:概率|几率|可能性)|Offer\s*概率|胜算", evaluation_text, re.I):
+            return self._reject("面试综合评价不能包含录用概率或胜算判断")
         evaluation_points = [*payload.overall_evaluation.strengths, *payload.overall_evaluation.risks]
         referenced_topics = {topic_id for item in evaluation_points for topic_id in item.topic_ids}
         referenced_topics.update(topic_id for gap in payload.capability_gaps for topic_id in gap.topic_ids)
@@ -891,7 +892,6 @@ class SubmitPlanTool(Tool):
         return {
             "overallEvaluation": {
                 "summary": str(parameters.get("summary", "")).strip(),
-                "competitiveness": str(parameters.get("competitiveness", "")).strip(),
                 "strengths": evaluation_points("strengths_text"),
                 "risks": evaluation_points("risks_text"),
                 "nextFocus": str(parameters.get("next_focus", "")).strip(),

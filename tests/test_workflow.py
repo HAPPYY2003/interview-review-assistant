@@ -259,7 +259,6 @@ class ScriptedAgentRuntime:
             payload = {
                 "overallEvaluation": {
                     "summary": "这是由 GrowthPlanner 提交的整场总结。",
-                    "competitiveness": "具备基础竞争力，但不代表实际录用结果。",
                     "strengths": [{"text": "回答具备真实经历。", "topicIds": [topic_id]}],
                     "risks": [{"text": "决策依据不足。", "topicIds": [topic_id]}],
                     "nextFocus": "下一场重点表达关键决策。",
@@ -693,7 +692,7 @@ def test_real_mode_report_is_built_from_agent_artifacts(monkeypatch, settings_fa
     report = workflow.report(interview["id"])
     assert report["reportSchemaVersion"] == 3
     assert report["interview"]["summary"] == "这是由 GrowthPlanner 提交的整场总结。"
-    assert report["interview"]["overallEvaluation"]["competitiveness"]
+    assert "competitiveness" not in report["interview"]["overallEvaluation"]
     assert report["questions"][0]["answerLogic"]["steps"]
     assert report["questions"][0]["recommendedAnswer"]["framework"]["type"]
     assert report["interview"]["latestAIMetadata"]["provider"] == "HelloAgents"

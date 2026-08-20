@@ -80,7 +80,6 @@ def _growth_submission(topic_id: str, evidence_id: str) -> dict:
     return {
         "overallEvaluation": {
             "summary": "本场回答有真实证据基础，下一步应加强结构与决策解释。",
-            "competitiveness": "具备基础竞争力，但不代表实际录用结果。",
             "strengths": [{"text": "回答包含真实经历。", "topicIds": [topic_id]}],
             "risks": [{"text": "决策依据不足。", "topicIds": [topic_id]}],
             "nextFocus": "下一场重点说明个人判断与取舍。",
@@ -281,7 +280,7 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     nonconsecutive["actionItems"][2]["order"] = 4
     assert validate_plan_once(nonconsecutive)[0].status.value == "partial"
     probability_claim = _growth_submission("topic-1", transcript["id"])
-    probability_claim["overallEvaluation"]["competitiveness"] = "本场录用概率为 80%。"
+    probability_claim["overallEvaluation"]["summary"] = "本场录用概率为 80%。"
     assert validate_plan_once(probability_claim)[0].status.value == "partial"
 
     _, audit_plan_submit = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
@@ -354,7 +353,6 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     _, flat_submit = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
     flat_response = flat_submit.run({
         "summary": "本场复盘需要提升表达结构。",
-        "competitiveness": "具备基础竞争力，但不代表实际录用结果。",
         "next_focus": "下一场重点说明决策依据。",
         "strengths_text": "回答包含真实经历|||topic-1",
         "risks_text": "表达结构不足|||topic-1",

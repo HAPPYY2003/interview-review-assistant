@@ -1448,7 +1448,6 @@ class ReviewWorkflow:
         template = {
             "overallEvaluation": {
                 "summary": "整场综合判断",
-                "competitiveness": "本场竞争力判断，并注明不代表实际录用结果",
                 "strengths": [{"text": "主要优势", "topicIds": [topic_id]}],
                 "risks": [{"text": "主要风险", "topicIds": [topic_id]}],
                 "nextFocus": "下一场重点",
@@ -1860,9 +1859,10 @@ class ReviewWorkflow:
         self.db.save_reviews(run_id, reviews)
         artifacts = self.db.get_stage_artifacts(run_id, accepted_only=True)
         evaluation = dict(batch.get("overallEvaluation") or {
-            "summary": batch.get("summary", ""), "competitiveness": "当前报告未生成独立竞争力判断。",
+            "summary": batch.get("summary", ""),
             "strengths": [], "risks": [], "nextFocus": batch.get("nextFocus", ""),
         })
+        evaluation.pop("competitiveness", None)
         evaluation["score"] = overall.get("overall", 0)
         evaluation["performanceLevel"] = self._performance_level(float(overall.get("overall") or 0))
         report_meta = {
@@ -1901,12 +1901,11 @@ class ReviewWorkflow:
         artifacts = self.db.get_stage_artifacts(run_id)
         overall_scores = meta.get("overallScores", {})
         report_version = int(meta.get("reportSchemaVersion") or 1)
-        compatibility_label = "此旧版报告" if report_version < REPORT_SCHEMA_VERSION else "当前报告"
         overall_evaluation = dict(meta.get("overallEvaluation") or {
             "summary": meta.get("summary", ""),
-            "competitiveness": f"{compatibility_label}未生成独立竞争力判断。",
             "strengths": [], "risks": [], "nextFocus": meta.get("nextFocus", ""),
         })
+        overall_evaluation.pop("competitiveness", None)
         overall_evaluation.setdefault("score", overall_scores.get("overall", 0))
         overall_evaluation.setdefault("performanceLevel", self._performance_level(float(overall_scores.get("overall") or 0)))
         capability_gaps = meta.get("capabilityGaps") or self._legacy_gaps(meta.get("topRisks", []))
@@ -1923,7 +1922,8 @@ class ReviewWorkflow:
             "latestAIMetadata": {"provider": providers.get(run.get("agent_mode"), "Legacy"), "model": model, "promptVersion": "offer-radar-agent-v3", "generatedAt": run["updated_at"]},
         }
         receipts = [public_artifact_receipt(item) for item in artifacts]
-        return {"status": "COMPLETED", "reportSchemaVersion": report_version, "interview": public_interview, "questions": self.db.get_reviews(run_id), "actions": meta.get("actionItems", []), "artifacts": receipts, "run": {key: run[key] for key in ("id", "status", "phase", "hello_session_id", "review_mode", "agent_mode", "degraded", "audit_round", "revision_count", "metrics")}}
+        actions = self.db.merge_growth_action_progress(run_id, meta.get("actionItems", []))
+        return {"status": "COMPLETED", "reportSchemaVersion": report_version, "interview": public_interview, "questions": self.db.get_reviews(run_id), "actions": actions, "artifacts": receipts, "run": {key: run[key] for key in ("id", "status", "phase", "hello_session_id", "review_mode", "agent_mode", "degraded", "audit_round", "revision_count", "metrics")}}
 
     def _growth_history(self, position: str) -> list[dict[str, Any]]:
         rows = self.db.get_growth_trends()

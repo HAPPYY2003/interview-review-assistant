@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -329,7 +329,6 @@ class EvaluationPointSubmission(StrictModel):
 
 class OverallEvaluationSubmission(StrictModel):
     summary: str = Field(min_length=2, max_length=1200)
-    competitiveness: str = Field(min_length=2, max_length=800)
     strengths: list[EvaluationPointSubmission] = Field(default_factory=list, max_length=3)
     risks: list[EvaluationPointSubmission] = Field(default_factory=list, max_length=3)
     next_focus: str = Field(min_length=2, max_length=500, alias="nextFocus")
@@ -397,6 +396,26 @@ class GrowthPlanSubmission(StrictModel):
         high_priority = {item.id for item in self.capability_gaps if item.priority == "high"}
         if high_priority - referenced:
             raise ValueError("每个高优先级缺口至少需要一个行动项")
+        return self
+
+
+class GrowthActionProgressPatch(APIModel):
+    run_id: str = Field(min_length=1, alias="runId")
+    status: Literal["pending", "in_progress", "completed", "skipped"] | None = None
+    started_at: datetime | None = Field(default=None, alias="startedAt")
+    completed_at: datetime | None = Field(default=None, alias="completedAt")
+    user_note: str | None = Field(default=None, max_length=2000, alias="userNote")
+    completion_evidence: str | None = Field(default=None, max_length=4000, alias="completionEvidence")
+    self_rating: int | None = Field(default=None, ge=1, le=5, alias="selfRating")
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> "GrowthActionProgressPatch":
+        editable = {
+            "status", "started_at", "completed_at", "user_note",
+            "completion_evidence", "self_rating",
+        }
+        if not (self.model_fields_set & editable):
+            raise ValueError("至少需要提交一个行动进度字段")
         return self
 
 

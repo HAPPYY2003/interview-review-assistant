@@ -154,6 +154,15 @@ class Database:
             FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE,
             FOREIGN KEY(run_id) REFERENCES review_runs(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS growth_action_progress (
+            run_id TEXT NOT NULL, action_id TEXT NOT NULL, interview_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', started_at TEXT, completed_at TEXT,
+            user_note TEXT NOT NULL DEFAULT '', completion_evidence TEXT NOT NULL DEFAULT '',
+            self_rating INTEGER, updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, action_id),
+            FOREIGN KEY(run_id) REFERENCES review_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE
+        );
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -1186,6 +1195,108 @@ class Database:
             )
         return cursor.rowcount
 
+    def get_growth_action_progress(self, run_id: str) -> dict[str, dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM growth_action_progress WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+        return {str(row["action_id"]): self._growth_action_progress_dict(row) for row in rows}
+
+    def merge_growth_action_progress(
+        self,
+        run_id: str,
+        action_items: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        progress = self.get_growth_action_progress(run_id)
+        merged: list[dict[str, Any]] = []
+        for index, source in enumerate(action_items):
+            action = dict(source)
+            action_id = str(action.get("id") or f"action-{index + 1}")
+            saved = progress.get(action_id)
+            status = str(
+                (saved or {}).get("status")
+                or ("completed" if action.get("completed") else "pending")
+            )
+            action.update({
+                "id": action_id,
+                "status": status,
+                "completed": status == "completed",
+                "startedAt": (saved or {}).get("startedAt"),
+                "completedAt": (saved or {}).get("completedAt"),
+                "userNote": (saved or {}).get("userNote", ""),
+                "completionEvidence": (saved or {}).get("completionEvidence", ""),
+                "selfRating": (saved or {}).get("selfRating"),
+            })
+            merged.append(action)
+        return merged
+
+    def update_growth_action_progress(
+        self,
+        *,
+        run_id: str,
+        action_id: str,
+        interview_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM growth_action_progress WHERE run_id=? AND action_id=?",
+                (run_id, action_id),
+            ).fetchone()
+            current = self._growth_action_progress_dict(row) if row else {
+                "status": "pending", "startedAt": None, "completedAt": None,
+                "userNote": "", "completionEvidence": "", "selfRating": None,
+            }
+            field_map = {
+                "status": "status", "started_at": "startedAt", "completed_at": "completedAt",
+                "user_note": "userNote", "completion_evidence": "completionEvidence",
+                "self_rating": "selfRating",
+            }
+            for source, target in field_map.items():
+                if source in updates:
+                    value = updates[source]
+                    if isinstance(value, datetime):
+                        value = value.isoformat()
+                    current[target] = value
+
+            status = str(current.get("status") or "pending")
+            if status == "completed":
+                current["startedAt"] = current.get("startedAt") or now
+                current["completedAt"] = current.get("completedAt") or now
+            elif status == "in_progress":
+                current["startedAt"] = current.get("startedAt") or now
+                current["completedAt"] = None
+            elif status == "pending":
+                current["startedAt"] = None
+                current["completedAt"] = None
+            else:
+                current["completedAt"] = None
+
+            connection.execute(
+                """INSERT INTO growth_action_progress(
+                run_id,action_id,interview_id,status,started_at,completed_at,user_note,
+                completion_evidence,self_rating,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,action_id) DO UPDATE SET
+                interview_id=excluded.interview_id,status=excluded.status,
+                started_at=excluded.started_at,completed_at=excluded.completed_at,
+                user_note=excluded.user_note,completion_evidence=excluded.completion_evidence,
+                self_rating=excluded.self_rating,updated_at=excluded.updated_at""",
+                (
+                    run_id, action_id, interview_id, status,
+                    current.get("startedAt"), current.get("completedAt"),
+                    current.get("userNote") or "", current.get("completionEvidence") or "",
+                    current.get("selfRating"), now,
+                ),
+            )
+            saved = connection.execute(
+                "SELECT * FROM growth_action_progress WHERE run_id=? AND action_id=?",
+                (run_id, action_id),
+            ).fetchone()
+        return self._growth_action_progress_dict(saved)
+
     def get_growth_trends(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -1195,7 +1306,17 @@ class Database:
                 LEFT JOIN review_runs r ON r.id=g.run_id
                 ORDER BY g.created_at"""
             ).fetchall()
-        return [{**dict(row), "scores": json.loads(row["scores_json"]), "weakDimensions": json.loads(row["weak_dimensions_json"]), "actionItems": json.loads(row["action_items_json"])} for row in rows]
+        return [
+            {
+                **dict(row),
+                "scores": json.loads(row["scores_json"]),
+                "weakDimensions": json.loads(row["weak_dimensions_json"]),
+                "actionItems": self.merge_growth_action_progress(
+                    row["run_id"], json.loads(row["action_items_json"]),
+                ),
+            }
+            for row in rows
+        ]
 
     def get_growth_candidates(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1285,6 +1406,16 @@ class Database:
                 tuple(unique_ids),
             )
         return cursor.rowcount
+
+    @staticmethod
+    def _growth_action_progress_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "runId": row["run_id"], "actionId": row["action_id"],
+            "interviewId": row["interview_id"], "status": row["status"],
+            "startedAt": row["started_at"], "completedAt": row["completed_at"],
+            "userNote": row["user_note"], "completionEvidence": row["completion_evidence"],
+            "selfRating": row["self_rating"], "updatedAt": row["updated_at"],
+        }
 
     @staticmethod
     def _question_dict(row: sqlite3.Row, links: dict[str, list[str]] | None = None) -> dict[str, Any]:

@@ -4,7 +4,7 @@ Offer Radar Agent 是一个本地优先的智能面试复盘助手。它在保�
 
 本仓库是个人独立设计与迭代的作品仓库，与 HelloAgents 社区毕业设计提交目录相互独立。当前版本聚焦产品 MVP 和工程实现，暂不包含毕业设计评测、数据集指标或消融实验。
 
-当前稳定版本：`v0.4.0`。
+当前稳定版本：`v0.4.1`。
 
 ## 核心能力
 
@@ -104,7 +104,7 @@ tests/                  基础功能和 API 回归测试
 
 解析子状态：`QUEUED -> INSPECTING -> TRANSCRIBING -> VALIDATING -> STRUCTURING -> SUBMITTING -> COMPLETED`，文字来源自动跳过 `TRANSCRIBING`。
 
-核心接口包括 `/api/v1/interviews`、`/materials`、`/parse`、`/parse-runs/{id}/events`、`/segments`、`/questions`、`/confirm`、`/review-runs`、`/runs/{id}/events`、`/resume`、`/fallback`、`/report` 和 `/api/v1/profile/trends`。旧版四个 Node API 路径由 FastAPI 兼容层暂时承接。
+核心接口包括 `/api/v1/interviews`、`/materials`、`/parse`、`/parse-runs/{id}/events`、`/segments`、`/questions`、`/confirm`、`/review-runs`、`/runs/{id}/events`、`/resume`、`/fallback`、`/report` 和 `/api/v1/profile/trends`。成长行动进度通过 `GET /api/v1/growth-plans/{runId}` 读取，并通过 `PATCH /api/v1/growth-actions/{actionId}` 保存状态、备注、完成证据和自评；更新请求需携带 `runId`。旧版四个 Node API 路径由 FastAPI 兼容层暂时承接。
 
 ## 隐私边界
 
