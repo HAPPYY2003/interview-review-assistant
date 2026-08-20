@@ -25,6 +25,9 @@ from backend.app.schemas import (
     InterviewImport,
     MaterialText,
     QuestionPatch,
+    PracticeAttemptCreate,
+    PracticeSessionCreate,
+    PracticeSessionPatch,
     ReviewRunCreate,
     TranscriptSegmentMergeRequest,
     TranscriptSegmentPatch,
@@ -35,6 +38,7 @@ from backend.app.services.document_parser import DocumentParseError, DocumentPar
 from backend.app.services.evidence import EvidenceReviewService
 from backend.app.services.knowledge import KnowledgeBase
 from backend.app.services.parse_workflow import ParseWorkflow
+from backend.app.services.practice import PracticeService
 from backend.app.services.workflow import REPORT_SCHEMA_VERSION, ReviewWorkflow, public_artifact_receipt
 
 
@@ -45,6 +49,7 @@ review_service = EvidenceReviewService(knowledge)
 document_parser = DocumentParser(settings.max_file_bytes)
 workflow = ReviewWorkflow(database, review_service, settings)
 parse_workflow = ParseWorkflow(database, settings)
+practice_service = PracticeService(database, settings)
 background_tasks: set[asyncio.Task[Any]] = set()
 
 
@@ -59,7 +64,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="Offer Radar Agent", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Offer Radar Agent", version="0.5.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
@@ -469,6 +474,18 @@ def _schedule_fallback(run_id: str) -> None:
     task.add_done_callback(background_tasks.discard)
 
 
+def _schedule_practice_brief(session_id: str) -> None:
+    task = asyncio.create_task(asyncio.to_thread(practice_service.generate_brief, session_id))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def _schedule_practice_review(session_id: str, attempt_id: str) -> None:
+    task = asyncio.create_task(asyncio.to_thread(practice_service.review_attempt, session_id, attempt_id))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 @app.post("/api/v1/interviews/{interview_id}/review-runs", status_code=202)
 async def create_review_run(interview_id: str, payload: ReviewRunCreate | None = Body(default=None)) -> dict[str, Any]:
     get_interview_or_404(interview_id)
@@ -643,6 +660,100 @@ def patch_growth_action(action_id: str, payload: GrowthActionProgressPatch) -> d
         if item["id"] == action_id
     )
     return {"runId": payload.run_id, "interviewId": run["interview_id"], "action": action}
+
+
+@app.post("/api/v1/growth-actions/{action_id}/practice-sessions", status_code=202)
+async def create_practice_session(action_id: str, payload: PracticeSessionCreate) -> dict[str, Any]:
+    run = get_run_or_404(payload.run_id)
+    try:
+        context = practice_service.action_context(payload.run_id, action_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到成长行动项") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    mode = payload.mode or practice_service.recommend_mode(context)
+    session, created = database.create_or_get_practice_session(
+        interview_id=run["interview_id"], run_id=payload.run_id,
+        action_id=action_id, mode=mode,
+    )
+    action = context["action"]
+    if action.get("status") == "pending":
+        database.update_growth_action_progress(
+            run_id=payload.run_id, action_id=action_id,
+            interview_id=run["interview_id"], updates={"status": "in_progress"},
+        )
+    if created:
+        _schedule_practice_brief(session["id"])
+    return {**database.get_practice_session(session["id"]), "created": created}
+
+
+@app.get("/api/v1/practice-sessions/{session_id}")
+def get_practice_session(session_id: str) -> dict[str, Any]:
+    try:
+        return database.get_practice_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到练习会话") from exc
+
+
+@app.patch("/api/v1/practice-sessions/{session_id}")
+def patch_practice_session(session_id: str, payload: PracticeSessionPatch) -> dict[str, Any]:
+    try:
+        session = database.get_practice_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到练习会话") from exc
+    if session["status"] in {"generating", "reviewing"}:
+        raise HTTPException(status_code=409, detail="练习正在生成或审查，请稍后再保存")
+    next_status = "draft" if payload.draft_text.strip() else "ready"
+    return database.update_practice_session(session_id, {
+        "draftText": payload.draft_text, "status": next_status,
+        "errorCode": "", "errorMessage": "",
+    })
+
+
+@app.post("/api/v1/practice-sessions/{session_id}/submit", status_code=202)
+async def submit_practice_attempt(session_id: str, payload: PracticeAttemptCreate) -> dict[str, Any]:
+    try:
+        session = database.get_practice_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到练习会话") from exc
+    if session["status"] in {"generating", "reviewing"}:
+        raise HTTPException(status_code=409, detail="练习正在生成或审查，请稍后再提交")
+    if not session.get("brief"):
+        raise HTTPException(status_code=409, detail="练习内容尚未生成")
+    response_text = payload.response_text.strip()
+    if not response_text:
+        raise HTTPException(status_code=422, detail="练习内容不能为空")
+    attempt = database.create_practice_attempt(
+        session_id, response_text=response_text, self_rating=payload.self_rating,
+    )
+    _schedule_practice_review(session_id, attempt["id"])
+    return {"sessionId": session_id, "attempt": attempt, "status": "reviewing"}
+
+
+@app.post("/api/v1/practice-sessions/{session_id}/retry", status_code=202)
+async def retry_practice_session(session_id: str) -> dict[str, Any]:
+    try:
+        session = database.get_practice_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到练习会话") from exc
+    if session["status"] != "failed":
+        return session
+    attempts = session.get("attempts") or []
+    latest = attempts[-1] if attempts else None
+    if latest and latest.get("status") == "failed":
+        database.update_practice_attempt(latest["id"], {
+            "status": "reviewing", "errorCode": "", "errorMessage": "",
+        })
+        database.update_practice_session(session_id, {
+            "status": "reviewing", "errorCode": "", "errorMessage": "",
+        })
+        _schedule_practice_review(session_id, latest["id"])
+    else:
+        database.update_practice_session(session_id, {
+            "status": "generating", "errorCode": "", "errorMessage": "",
+        })
+        _schedule_practice_brief(session_id)
+    return database.get_practice_session(session_id)
 
 
 @app.get("/api/v1/profile/trends")

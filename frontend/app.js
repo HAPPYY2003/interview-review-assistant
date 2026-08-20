@@ -14,6 +14,12 @@ const app = document.querySelector("#app");
 const STORAGE_KEY = "offer-radar-agent-v1";
 const REPORT_SCHEMA_VERSION = 3;
 const QUESTION_TYPES = ["自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"];
+const PRACTICE_MODE_LABELS = {
+  oral_answer: "口述表达",
+  follow_up_drill: "追问演练",
+  case_builder: "案例补充",
+  knowledge_quiz: "知识自测"
+};
 const REVIEW_TEMPLATE_PLACEHOLDERS = new Set([
   "综合诊断", "至少两个字的判断依据", "至少两个字的追问判断", "有证据的优点", "有证据的问题",
   "原回答路径概括", "步骤名称", "原回答内容", "逻辑缺口", "框架选择原因", "表达建议",
@@ -150,13 +156,24 @@ const state = {
   acknowledgeUnresolved: false,
   acknowledgeUnreviewed: false,
   reviewDialogOpen: false,
-  reviewNavFilter: "all"
+  reviewNavFilter: "all",
+  practiceDialogOpen: false,
+  practiceActionId: "",
+  practiceMode: "",
+  practiceSession: null,
+  practiceDraft: "",
+  practiceSelfRating: "",
+  practiceSelectedAttemptId: "",
+  practiceLoading: false
 };
 let activeSource = null;
 let toastTimer = null;
+let practicePollTimer = null;
+let practiceOriginScrollY = 0;
 
 window.addEventListener("hashchange", async () => {
   closeEventSource();
+  closePracticeDialog(false);
   state.route = parseRoute();
   state.error = "";
   state.expandedQuestionId = null;
@@ -292,6 +309,12 @@ function render() {
       if (dialog && !dialog.open) dialog.showModal();
     });
   }
+  if (state.practiceDialogOpen) {
+    requestAnimationFrame(() => {
+      const dialog = document.querySelector("#practiceDialog");
+      if (dialog && !dialog.open) dialog.showModal();
+    });
+  }
 }
 
 function renderSidebar() {
@@ -392,6 +415,9 @@ function renderLucideIcon(name) {
     "file-text": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" x2="16" y1="13" y2="13"></line><line x1="8" x2="16" y1="17" y2="17"></line>',
     "plus": '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
     "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.34-6.36L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.34 6.36L21 16"></path><path d="M16 16h5v5"></path>',
+    "play": '<polygon points="6 3 20 12 6 21 6 3"></polygon>',
+    "save": '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline>',
+    "send": '<path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path>',
     "locate-fixed": '<line x1="2" x2="5" y1="12" y2="12"></line><line x1="19" x2="22" y1="12" y2="12"></line><line x1="12" x2="12" y1="2" y2="5"></line><line x1="12" x2="12" y1="19" y2="22"></line><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle>',
     "loader-circle": '<path d="M21 12a9 9 0 1 1-6.22-8.56"></path>',
     "git-merge": '<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>',
@@ -1086,6 +1112,7 @@ function renderReviewPage() {
       ${renderAuditSection(interview)}
       <div class="metadata-line">报告生成 ${formatDateMinute(interview.latestAIMetadata?.generatedAt)}</div>
       ${renderReviewDialog(record, reviewedCount, unresolvedCount)}
+      ${renderPracticeDrawer(record, actions, gapMap, questions)}
     </section>`;
 }
 
@@ -1166,6 +1193,7 @@ function renderAction(record, action, gapMap = new Map(), index = 0) {
         <div class="action-detail-row action-success"><span>完成标准：</span><p>${escapeHtml(successCriterion)}</p></div>
       </div>
       <button type="button" class="action-content-toggle" data-toggle-action-content aria-expanded="false" hidden><span>查看完整内容</span>${renderLucideIcon("chevron-down")}</button>
+      ${renderPracticeActionBar(action)}
       <details class="action-progress-editor">
         <summary>行动记录<span>${statusLabel}</span></summary>
         <div class="action-progress-form">
@@ -1179,6 +1207,109 @@ function renderAction(record, action, gapMap = new Map(), index = 0) {
       </details>
     </div>
   </article>`;
+}
+
+function renderPracticeActionBar(action) {
+  const count = Math.max(0, Number(action.practiceCount || 0));
+  const result = String(action.latestPracticeResult || "");
+  const status = String(action.latestPracticeStatus || "");
+  let label = "尚未练习";
+  if (status === "generating") label = "正在准备练习";
+  else if (status === "reviewing") label = "正在生成反馈";
+  else if (result === "draft" || status === "draft") label = "草稿已保存";
+  else if (count && result === "met") label = `已练习 ${count} 次 · 最近已达标`;
+  else if (count && result === "partially_met") label = `已练习 ${count} 次 · 最近部分达标`;
+  else if (count && result === "not_met") label = `已练习 ${count} 次 · 建议继续练习`;
+  else if (count) label = `已练习 ${count} 次`;
+  else if (status === "failed") label = "练习生成失败，可重试";
+  const buttonLabel = status === "draft" || result === "draft" ? "继续练习" : count ? "查看反馈" : "开始练习";
+  return `<div class="action-practice-bar">
+    <div><span class="practice-status-dot ${escapeHtml(status || "idle")}"></span><span>${escapeHtml(label)}</span></div>
+    <button type="button" class="practice-entry" data-open-practice="${escapeHtml(action.id)}">${renderLucideIcon(count ? "arrow-right" : "play")}<span>${buttonLabel}</span></button>
+  </div>`;
+}
+
+function renderPracticeDrawer(record, actions, gapMap, questions) {
+  if (!state.practiceDialogOpen) return "";
+  const action = actions.find(item => item.id === state.practiceActionId);
+  if (!action) return "";
+  const session = state.practiceSession;
+  const busy = state.practiceLoading || ["generating", "reviewing"].includes(session?.status);
+  const selectedMode = state.practiceMode || session?.mode || "oral_answer";
+  const attempts = session?.attempts || [];
+  const selectedAttempt = attempts.find(item => item.id === state.practiceSelectedAttemptId) || attempts.at(-1) || null;
+  const linkedGaps = (action.gapIds || []).map(id => gapMap.get(id)).filter(Boolean);
+  const questionMap = new Map(questions.map((question, index) => [question.id, { ...question, index: index + 1 }]));
+  const brief = session?.brief || {};
+  return `<dialog class="practice-drawer" id="practiceDialog" aria-labelledby="practiceDrawerTitle">
+    <div class="practice-drawer-header">
+      <div><span>行动练习</span><h2 id="practiceDrawerTitle">${escapeHtml(action.title)}</h2></div>
+      <button type="button" class="icon-button" data-close-practice aria-label="关闭练习">${renderLucideIcon("x")}</button>
+    </div>
+    <div class="practice-drawer-body">
+      <section class="practice-context">
+        <div class="practice-context-meta"><span class="action-type ${action.type || "preparation"}">${action.type === "learning" ? "学习项" : "准备项"}</span><span>${escapeHtml(SCORE_LABELS[action.dimension] || action.dimension || "综合训练")}</span></div>
+        <p>${escapeHtml(action.description || "暂无行动说明")}</p>
+        ${linkedGaps.length ? `<div class="practice-linked-list"><strong>关联缺口</strong>${linkedGaps.map(item => `<span>${escapeHtml(item.title)}</span>`).join("")}</div>` : ""}
+      </section>
+      <section class="practice-mode-section">
+        <div class="practice-section-heading"><h3>练习方式</h3><span>选择最适合当前行动的训练形式</span></div>
+        <div class="practice-mode-control" role="tablist">${Object.entries(PRACTICE_MODE_LABELS).map(([value, label]) => `<button type="button" data-practice-mode="${value}" class="${selectedMode === value ? "active" : ""}" aria-selected="${selectedMode === value}" ${busy ? "disabled" : ""}>${label}</button>`).join("")}</div>
+      </section>
+      ${renderPracticeSessionContent(session, action, questionMap, selectedAttempt, busy)}
+    </div>
+  </dialog>`;
+}
+
+function renderPracticeSessionContent(session, action, questionMap, selectedAttempt, busy) {
+  if (!session || state.practiceLoading) {
+    return `<div class="practice-loading" role="status">${renderLucideIcon("loader-circle")}<div><strong>正在准备个性化练习</strong><span>读取当前行动、关联缺口和已确认题目。</span></div></div>`;
+  }
+  if (session.status === "failed") {
+    return `<div class="practice-failure"><strong>练习暂时未完成</strong><p>${escapeHtml(session.errorMessage || "服务暂时不可用，请稍后重试。")}</p><button type="button" class="button secondary" data-retry-practice>${renderLucideIcon("refresh-cw")}重新尝试</button></div>`;
+  }
+  if (session.status === "generating") {
+    return `<div class="practice-loading" role="status">${renderLucideIcon("loader-circle")}<div><strong>正在生成练习任务</strong><span>通常会在几十秒内完成。</span></div></div>`;
+  }
+  const brief = session.brief || {};
+  const attempts = session.attempts || [];
+  const review = selectedAttempt?.review || {};
+  const linkedTopics = (brief.linkedTopicIds || []).map(id => questionMap.get(id)).filter(Boolean);
+  return `<section class="practice-brief">
+      <div class="practice-brief-heading"><div><span>训练目标</span><h3>${escapeHtml(brief.objective || action.title)}</h3></div><small>${Number(brief.estimatedMinutes || 10)} 分钟</small></div>
+      <div class="practice-why"><strong>为什么要做</strong><p>${escapeHtml(brief.why || action.description || "")}</p></div>
+      ${linkedTopics.length ? `<div class="practice-topic-links"><strong>关联原题</strong>${linkedTopics.map(item => `<button type="button" data-open-topic="${escapeHtml(item.id)}">题目 ${String(item.index).padStart(2, "0")} · ${escapeHtml(item.interviewerQuestion)}</button>`).join("")}</div>` : ""}
+      <div class="practice-steps"><strong>建议步骤</strong><ol>${(brief.steps || []).map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ol></div>
+      <div class="practice-prompt"><span>本次练习</span><p>${escapeHtml(brief.prompt || "")}</p></div>
+      <div class="practice-criterion"><strong>完成标准</strong><span>${escapeHtml(brief.successCriterion || action.successCriterion || "")}</span></div>
+    </section>
+    <section class="practice-response">
+      <div class="practice-section-heading"><h3>练习内容</h3><span>新增事实和数字会被标记为待核实，不会写回原报告。</span></div>
+      <textarea id="practiceResponse" maxlength="8000" rows="9" placeholder="在这里输入你的口述稿、案例材料或知识点回答…" ${session.status === "reviewing" ? "disabled" : ""}>${escapeHtml(state.practiceDraft)}</textarea>
+      <div class="practice-response-meta"><span><b id="practiceCharCount">${state.practiceDraft.length}</b>/8000</span><label>完成自评<select id="practiceSelfRating"><option value="">未评分</option>${[1, 2, 3, 4, 5].map(value => `<option value="${value}" ${Number(state.practiceSelfRating) === value ? "selected" : ""}>${value} 分</option>`).join("")}</select></label></div>
+      <div class="practice-response-actions"><button type="button" class="button ghost" data-save-practice-draft ${session.status === "reviewing" ? "disabled" : ""}>${renderLucideIcon("save")}保存草稿</button><button type="button" class="button" data-submit-practice ${!state.practiceDraft.trim() || session.status === "reviewing" ? "disabled" : ""}>${session.status === "reviewing" ? renderLucideIcon("loader-circle") : renderLucideIcon("send")}提交练习</button></div>
+    </section>
+    ${session.status === "reviewing" ? `<div class="practice-loading compact" role="status">${renderLucideIcon("loader-circle")}<div><strong>正在检查练习内容</strong><span>会逐项对照完成标准，并标记待核实事实。</span></div></div>` : ""}
+    ${attempts.length ? renderPracticeFeedback(attempts, selectedAttempt, review, action) : ""}`;
+}
+
+function renderPracticeFeedback(attempts, selectedAttempt, review, action) {
+  const statusLabels = { met: "已达到", partially_met: "部分达到", not_met: "未达到" };
+  return `<section class="practice-feedback">
+    <div class="practice-section-heading"><h3>练习反馈</h3><div class="practice-attempt-tabs">${attempts.map(item => `<button type="button" data-practice-attempt="${escapeHtml(item.id)}" class="${item.id === selectedAttempt?.id ? "active" : ""}">第 ${item.attemptNo} 次</button>`).join("")}</div></div>
+    ${selectedAttempt?.status === "failed" ? `<div class="practice-failure compact"><strong>本次反馈失败</strong><p>${escapeHtml(selectedAttempt.errorMessage || "可点击重试继续生成反馈。")}</p><button type="button" class="button secondary" data-retry-practice>${renderLucideIcon("refresh-cw")}重试反馈</button></div>` : selectedAttempt?.status === "reviewed" ? `
+      <p class="practice-feedback-summary">${escapeHtml(review.summary || "")}</p>
+      <div class="practice-rubric-list">${(review.rubricResults || []).map(item => `<div><span class="practice-result ${escapeHtml(item.status)}">${statusLabels[item.status] || item.status}</span><p>${escapeHtml(item.feedback || "")}</p></div>`).join("")}</div>
+      <div class="practice-feedback-grid"><div><strong>做得好的地方</strong>${renderPracticeBullets(review.strengths, "暂无单独归纳")}</div><div><strong>下一次改进</strong>${renderPracticeBullets(review.improvements, "继续保持当前表达")}</div></div>
+      ${(review.factualRisks || []).length ? `<div class="practice-factual-risks"><strong>待核实事实</strong>${renderPracticeBullets(review.factualRisks)}</div>` : ""}
+      <div class="practice-next-focus"><span>下次重点</span><p>${escapeHtml(review.nextAttemptFocus || "")}</p></div>
+      <div class="practice-feedback-actions"><button type="button" class="button secondary" data-practice-again>${renderLucideIcon("refresh-cw")}再练一次</button>${review.completionRecommended && action.status !== "completed" ? `<button type="button" class="button" data-complete-practice-action>${renderLucideIcon("check")}确认完成行动</button>` : ""}</div>
+    ` : ""}
+  </section>`;
+}
+
+function renderPracticeBullets(items = [], fallback = "") {
+  return items.length ? `<ul>${items.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : (fallback ? `<p>${escapeHtml(fallback)}</p>` : "");
 }
 
 function renderQuestionReview(question, index = 0) {
@@ -2641,6 +2772,7 @@ function bindReviewPage() {
   }));
   document.querySelectorAll("[data-open-topic]").forEach(button => button.addEventListener("click", () => {
     const topicId = button.dataset.openTopic;
+    if (button.closest("#practiceDialog")) closePracticeDialog(false);
     state.expandedQuestionId = topicId;
     state.questionReviewTabs[topicId] = "diagnosis";
     state.questionEvidenceFocus = "";
@@ -2741,6 +2873,247 @@ function bindReviewPage() {
     render();
   });
   bindReviewDialogEvents();
+  bindPracticeDrawer();
+}
+
+function bindPracticeDrawer() {
+  document.querySelectorAll("[data-open-practice]").forEach(button => button.addEventListener("click", () => openPractice(button.dataset.openPractice)));
+  document.querySelectorAll("[data-close-practice]").forEach(button => button.addEventListener("click", () => closePracticeDialog()));
+  const dialog = document.querySelector("#practiceDialog");
+  dialog?.addEventListener("cancel", event => {
+    event.preventDefault();
+    closePracticeDialog();
+  });
+  dialog?.addEventListener("click", event => {
+    if (event.target === dialog) closePracticeDialog();
+  });
+  document.querySelectorAll("[data-practice-mode]").forEach(button => button.addEventListener("click", () => selectPracticeMode(button.dataset.practiceMode)));
+  const response = document.querySelector("#practiceResponse");
+  response?.addEventListener("input", event => {
+    state.practiceDraft = event.currentTarget.value;
+    const count = document.querySelector("#practiceCharCount");
+    if (count) count.textContent = String(state.practiceDraft.length);
+    const submit = document.querySelector("[data-submit-practice]");
+    if (submit) submit.disabled = !state.practiceDraft.trim();
+  });
+  document.querySelector("#practiceSelfRating")?.addEventListener("change", event => {
+    state.practiceSelfRating = event.currentTarget.value;
+  });
+  document.querySelector("[data-save-practice-draft]")?.addEventListener("click", () => savePracticeDraft());
+  document.querySelector("[data-submit-practice]")?.addEventListener("click", submitPracticeAttempt);
+  document.querySelectorAll("[data-retry-practice]").forEach(button => button.addEventListener("click", retryPracticeSession));
+  document.querySelector("[data-practice-again]")?.addEventListener("click", () => {
+    state.practiceDraft = "";
+    state.practiceSelfRating = "";
+    state.practiceSelectedAttemptId = "";
+    render();
+    requestAnimationFrame(() => document.querySelector("#practiceResponse")?.focus());
+  });
+  document.querySelectorAll("[data-practice-attempt]").forEach(button => button.addEventListener("click", () => {
+    state.practiceSelectedAttemptId = button.dataset.practiceAttempt;
+    render();
+  }));
+  document.querySelector("[data-complete-practice-action]")?.addEventListener("click", completePracticeAction);
+}
+
+async function openPractice(actionId) {
+  const record = currentRecord();
+  const action = record?.report?.actions?.find(item => item.id === actionId);
+  if (!record || !action) return;
+  practiceOriginScrollY = window.scrollY;
+  state.practiceDialogOpen = true;
+  state.practiceActionId = actionId;
+  state.practiceMode = "";
+  state.practiceSession = null;
+  state.practiceDraft = "";
+  state.practiceSelfRating = "";
+  state.practiceSelectedAttemptId = "";
+  state.practiceLoading = true;
+  render();
+  try {
+    const session = action.latestPracticeSessionId
+      ? await api(`/api/v1/practice-sessions/${encodeURIComponent(action.latestPracticeSessionId)}`)
+      : await createPracticeSession(actionId, "");
+    acceptPracticeSession(session, false);
+    render();
+    schedulePracticePoll();
+  } catch (error) {
+    state.practiceLoading = false;
+    state.practiceSession = { status: "failed", errorMessage: readableError(error) };
+    render();
+  }
+}
+
+async function createPracticeSession(actionId, mode) {
+  const record = currentRecord();
+  const runId = record?.report?.run?.id || record?.runId;
+  if (!record || !runId) throw new Error("当前报告缺少可用的复盘任务 ID");
+  return api(`/api/v1/growth-actions/${encodeURIComponent(actionId)}/practice-sessions`, {
+    method: "POST",
+    body: { runId, ...(mode ? { mode } : {}) }
+  });
+}
+
+async function selectPracticeMode(mode) {
+  if (!PRACTICE_MODE_LABELS[mode] || ["generating", "reviewing"].includes(state.practiceSession?.status)) return;
+  state.practiceMode = mode;
+  state.practiceLoading = true;
+  state.practiceSession = null;
+  state.practiceDraft = "";
+  state.practiceSelfRating = "";
+  state.practiceSelectedAttemptId = "";
+  render();
+  try {
+    const session = await createPracticeSession(state.practiceActionId, mode);
+    acceptPracticeSession(session, false);
+    render();
+    schedulePracticePoll();
+  } catch (error) {
+    state.practiceLoading = false;
+    state.practiceSession = { status: "failed", errorMessage: readableError(error) };
+    render();
+  }
+}
+
+function acceptPracticeSession(session, preserveDraft = false) {
+  state.practiceSession = session;
+  state.practiceMode = session.mode || state.practiceMode;
+  state.practiceLoading = false;
+  if (!preserveDraft) state.practiceDraft = session.draftText || "";
+  const attempts = session.attempts || [];
+  if (!attempts.some(item => item.id === state.practiceSelectedAttemptId)) {
+    state.practiceSelectedAttemptId = attempts.at(-1)?.id || "";
+  }
+}
+
+function schedulePracticePoll() {
+  clearTimeout(practicePollTimer);
+  if (!state.practiceDialogOpen || !["generating", "reviewing"].includes(state.practiceSession?.status)) return;
+  practicePollTimer = setTimeout(pollPracticeSession, 1000);
+}
+
+async function pollPracticeSession() {
+  if (!state.practiceDialogOpen || !state.practiceSession?.id) return;
+  try {
+    const previousStatus = state.practiceSession.status;
+    const session = await api(`/api/v1/practice-sessions/${encodeURIComponent(state.practiceSession.id)}`);
+    acceptPracticeSession(session, previousStatus === "reviewing");
+    if (!["generating", "reviewing"].includes(session.status)) await refreshPracticeReportActions();
+    render();
+    schedulePracticePoll();
+  } catch (error) {
+    state.practiceLoading = false;
+    state.practiceSession = { ...state.practiceSession, status: "failed", errorMessage: readableError(error) };
+    render();
+  }
+}
+
+async function refreshPracticeReportActions() {
+  const record = currentRecord();
+  if (!record) return;
+  try {
+    const runQuery = record.runId ? `?runId=${encodeURIComponent(record.runId)}` : "";
+    const report = normalizeReportRecord(await api(`/api/v1/interviews/${record.id}/report${runQuery}`));
+    if (report.status !== "COMPLETED") return;
+    record.report = report;
+    record.actions = report.actions || [];
+    saveRecord(record);
+  } catch (error) {
+    console.warn("Failed to refresh practice summaries", error);
+  }
+}
+
+async function savePracticeDraft(silent = false) {
+  const session = state.practiceSession;
+  if (!session?.id || ["generating", "reviewing"].includes(session.status)) return;
+  try {
+    const updated = await api(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}`, {
+      method: "PATCH",
+      body: { draftText: state.practiceDraft }
+    });
+    acceptPracticeSession(updated, true);
+    await refreshPracticeReportActions();
+    render();
+    if (!silent) requestAnimationFrame(() => toast("练习草稿已保存"));
+  } catch (error) {
+    if (!silent) setError(readableError(error));
+  }
+}
+
+async function submitPracticeAttempt() {
+  const session = state.practiceSession;
+  const responseText = state.practiceDraft.trim();
+  if (!session?.id || !responseText || ["generating", "reviewing"].includes(session.status)) return;
+  try {
+    await api(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}/submit`, {
+      method: "POST",
+      body: {
+        responseText,
+        selfRating: state.practiceSelfRating ? Number(state.practiceSelfRating) : null
+      }
+    });
+    const updated = await api(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}`);
+    state.practiceDraft = "";
+    acceptPracticeSession(updated, true);
+    render();
+    schedulePracticePoll();
+  } catch (error) {
+    setError(readableError(error));
+  }
+}
+
+async function retryPracticeSession() {
+  const sessionId = state.practiceSession?.id;
+  if (!sessionId) return;
+  try {
+    const session = await api(`/api/v1/practice-sessions/${encodeURIComponent(sessionId)}/retry`, { method: "POST" });
+    acceptPracticeSession(session, true);
+    render();
+    schedulePracticePoll();
+  } catch (error) {
+    setError(readableError(error));
+  }
+}
+
+async function completePracticeAction() {
+  const record = currentRecord();
+  const action = record?.report?.actions?.find(item => item.id === state.practiceActionId);
+  const runId = record?.report?.run?.id || record?.runId;
+  if (!record || !action || !runId) return;
+  try {
+    const result = await api(`/api/v1/growth-actions/${encodeURIComponent(action.id)}`, {
+      method: "PATCH",
+      body: { runId, status: "completed" }
+    });
+    Object.assign(action, result.action || {}, { completed: true });
+    saveRecord(record);
+    render();
+    requestAnimationFrame(() => toast("行动已标记为完成"));
+  } catch (error) {
+    setError(readableError(error));
+  }
+}
+
+function closePracticeDialog(shouldRender = true) {
+  clearTimeout(practicePollTimer);
+  practicePollTimer = null;
+  if (shouldRender && state.practiceSession?.id && !["generating", "reviewing"].includes(state.practiceSession.status) && state.practiceDraft !== (state.practiceSession.draftText || "")) {
+    void api(`/api/v1/practice-sessions/${encodeURIComponent(state.practiceSession.id)}`, {
+      method: "PATCH", body: { draftText: state.practiceDraft }
+    }).catch(() => {});
+  }
+  state.practiceDialogOpen = false;
+  state.practiceActionId = "";
+  state.practiceMode = "";
+  state.practiceSession = null;
+  state.practiceDraft = "";
+  state.practiceSelfRating = "";
+  state.practiceSelectedAttemptId = "";
+  state.practiceLoading = false;
+  if (shouldRender) {
+    render();
+    requestAnimationFrame(() => window.scrollTo({ top: practiceOriginScrollY }));
+  }
 }
 
 function exportReport() {

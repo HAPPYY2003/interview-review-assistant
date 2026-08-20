@@ -578,6 +578,113 @@ def test_growth_action_progress_is_saved_on_server_and_merged_into_report():
             ).fetchone()[0] == 0
 
 
+def test_action_practice_session_supports_draft_feedback_reuse_and_cascade_delete():
+    interview_id = f"practice-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        interview = database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "raw_transcript": (
+                "面试官：请介绍你负责的实验项目。\n"
+                "候选人：我负责实验设计、指标定义和跨团队推进，完成上线验证。"
+            ),
+        })
+        database.replace_questions(interview_id, review_service.parse_transcript(interview["raw_transcript"]))
+        database.confirm_questions(interview_id)
+        run = database.create_run(
+            interview_id,
+            agent_mode="fixture",
+            input_digest=workflow.input_digest(interview_id),
+        )
+        workflow.execute(run["id"])
+        action = client.get(f"/api/v1/growth-plans/{run['id']}").json()["actions"][0]
+
+        created = client.post(
+            f"/api/v1/growth-actions/{action['id']}/practice-sessions",
+            json={"runId": run["id"], "mode": "follow_up_drill"},
+        )
+        assert created.status_code == 202
+        session_id = created.json()["id"]
+        session = {}
+        for _ in range(80):
+            session = client.get(f"/api/v1/practice-sessions/{session_id}").json()
+            if session["status"] in {"ready", "failed"}:
+                break
+            time.sleep(0.025)
+        assert session["status"] == "ready"
+        assert session["brief"]["mode"] == "follow_up_drill"
+        assert 3 <= len(session["brief"]["steps"]) <= 5
+        assert len(session["brief"]["rubric"]) >= 2
+
+        reused = client.post(
+            f"/api/v1/growth-actions/{action['id']}/practice-sessions",
+            json={"runId": run["id"], "mode": "follow_up_drill"},
+        )
+        assert reused.status_code == 202
+        assert reused.json()["id"] == session_id
+        assert reused.json()["created"] is False
+
+        draft = client.patch(
+            f"/api/v1/practice-sessions/{session_id}",
+            json={"draftText": "先保存一份练习草稿。"},
+        )
+        assert draft.status_code == 200
+        assert draft.json()["status"] == "draft"
+        assert draft.json()["draftText"] == "先保存一份练习草稿。"
+
+        response_text = (
+            "我的判断是先明确实验目标，再说明个人负责的指标定义和推进动作。"
+            "我会区分团队成果与个人贡献，并补充验证周期和数据来源。"
+            "目前我记得结果提升了 37%，但这个数字需要回查原始材料后再确认。"
+        )
+        submitted = client.post(
+            f"/api/v1/practice-sessions/{session_id}/submit",
+            json={"responseText": response_text, "selfRating": 4},
+        )
+        assert submitted.status_code == 202
+        for _ in range(80):
+            session = client.get(f"/api/v1/practice-sessions/{session_id}").json()
+            if session["status"] in {"reviewed", "failed"}:
+                break
+            time.sleep(0.025)
+        assert session["status"] == "reviewed"
+        assert len(session["attempts"]) == 1
+        assert session["attempts"][0]["attemptNo"] == 1
+        assert session["attempts"][0]["status"] == "reviewed"
+        assert any("37%" in item for item in session["attempts"][0]["review"]["factualRisks"])
+        assert session["attempts"][0]["review"]["completionRecommended"] is False
+
+        report = client.get(
+            f"/api/v1/interviews/{interview_id}/report",
+            params={"runId": run["id"]},
+        ).json()
+        practice_action = next(item for item in report["actions"] if item["id"] == action["id"])
+        assert practice_action["practiceCount"] == 1
+        assert practice_action["latestPracticeStatus"] == "reviewed"
+        assert practice_action["latestPracticeSessionId"] == session_id
+
+        invalid_action = client.post(
+            "/api/v1/growth-actions/not-an-action/practice-sessions",
+            json={"runId": run["id"]},
+        )
+        invalid_mode = client.post(
+            f"/api/v1/growth-actions/{action['id']}/practice-sessions",
+            json={"runId": run["id"], "mode": "video_interview"},
+        )
+        assert invalid_action.status_code == 404
+        assert invalid_mode.status_code == 422
+
+        assert client.delete(f"/api/v1/interviews/{interview_id}").status_code == 200
+        with database.connect() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM practice_sessions WHERE interview_id=?", (interview_id,)
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                "SELECT COUNT(*) FROM practice_attempts WHERE session_id=?", (session_id,)
+            ).fetchone()[0] == 0
+
+
 def test_growth_snapshot_delete_keeps_interview_record():
     interview_id = f"trend-delete-{uuid.uuid4()}"
     with TestClient(app) as client:

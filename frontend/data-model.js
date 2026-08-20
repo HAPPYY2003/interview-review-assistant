@@ -336,6 +336,10 @@ export function normalizeReportRecord(report = {}) {
       completedAt: action.completedAt || null,
       userNote: String(action.userNote || ""),
       completionEvidence: String(action.completionEvidence || ""),
+      practiceCount: Math.max(0, Number(action.practiceCount || 0)),
+      latestPracticeStatus: String(action.latestPracticeStatus || ""),
+      latestPracticeSessionId: String(action.latestPracticeSessionId || ""),
+      latestPracticeResult: String(action.latestPracticeResult || ""),
       selfRating: action.selfRating === null || action.selfRating === undefined || action.selfRating === ""
         ? null
         : (Number.isFinite(Number(action.selfRating)) ? Number(action.selfRating) : null)

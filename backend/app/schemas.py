@@ -419,6 +419,73 @@ class GrowthActionProgressPatch(APIModel):
         return self
 
 
+PracticeMode = Literal["oral_answer", "follow_up_drill", "case_builder", "knowledge_quiz"]
+
+
+class PracticeRubricItem(StrictModel):
+    id: str = Field(min_length=1, max_length=80)
+    label: str = Field(min_length=2, max_length=80)
+    criterion: str = Field(min_length=2, max_length=300)
+
+
+class PracticeBrief(StrictModel):
+    mode: PracticeMode
+    objective: str = Field(min_length=2, max_length=300)
+    why: str = Field(min_length=2, max_length=500)
+    linked_gap_ids: list[str] = Field(default_factory=list, max_length=5, alias="linkedGapIds")
+    linked_topic_ids: list[str] = Field(default_factory=list, max_length=10, alias="linkedTopicIds")
+    allowed_evidence_ids: list[str] = Field(default_factory=list, max_length=30, alias="allowedEvidenceIds")
+    steps: list[str] = Field(min_length=3, max_length=5)
+    prompt: str = Field(min_length=2, max_length=1200)
+    rubric: list[PracticeRubricItem] = Field(min_length=2, max_length=6)
+    success_criterion: str = Field(min_length=2, max_length=300, alias="successCriterion")
+    estimated_minutes: int = Field(ge=3, le=30, alias="estimatedMinutes")
+
+    @model_validator(mode="after")
+    def validate_rubric_ids(self) -> "PracticeBrief":
+        ids = [item.id for item in self.rubric]
+        if len(ids) != len(set(ids)):
+            raise ValueError("练习评价标准 ID 不能重复")
+        return self
+
+
+class PracticeRubricResult(StrictModel):
+    rubric_id: str = Field(min_length=1, max_length=80, alias="rubricId")
+    status: Literal["met", "partially_met", "not_met"]
+    feedback: str = Field(min_length=2, max_length=500)
+
+
+class PracticeReview(StrictModel):
+    summary: str = Field(min_length=2, max_length=600)
+    rubric_results: list[PracticeRubricResult] = Field(min_length=2, max_length=6, alias="rubricResults")
+    strengths: list[str] = Field(default_factory=list, max_length=5)
+    improvements: list[str] = Field(default_factory=list, max_length=5)
+    factual_risks: list[str] = Field(default_factory=list, max_length=8, alias="factualRisks")
+    next_attempt_focus: str = Field(min_length=2, max_length=400, alias="nextAttemptFocus")
+    completion_recommended: bool = Field(alias="completionRecommended")
+
+    @model_validator(mode="after")
+    def validate_result_ids(self) -> "PracticeReview":
+        ids = [item.rubric_id for item in self.rubric_results]
+        if len(ids) != len(set(ids)):
+            raise ValueError("练习反馈不能重复评价同一标准")
+        return self
+
+
+class PracticeSessionCreate(APIModel):
+    run_id: str = Field(min_length=1, alias="runId")
+    mode: PracticeMode | None = None
+
+
+class PracticeSessionPatch(APIModel):
+    draft_text: str = Field(max_length=8000, alias="draftText")
+
+
+class PracticeAttemptCreate(APIModel):
+    response_text: str = Field(min_length=1, max_length=8000, alias="responseText")
+    self_rating: int | None = Field(default=None, ge=1, le=5, alias="selfRating")
+
+
 class GrowthAuditFinding(StrictModel):
     target_type: Literal["overall_evaluation", "capability_gap", "action_item"] = Field(alias="targetType")
     target_id: str = Field(min_length=1, max_length=100, alias="targetId")

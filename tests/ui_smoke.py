@@ -429,6 +429,7 @@ def run() -> None:
             assert "逐题复盘审计" in page.locator(".audit-band").inner_text()
             assert "成长计划终审" in page.locator(".audit-band").inner_text()
             assert page.locator(".action-item").count() == 3
+            assert page.locator(".practice-entry").count() == 3
             assert page.locator(".action-deliverable").count() == 0
             assert page.locator(".action-order").first.inner_text() == "行动 1"
             assert page.locator(".action-meta").first.inner_text().startswith("提升维度：")
@@ -436,6 +437,31 @@ def run() -> None:
             assert page.locator(".gap-topics").evaluate_all(
                 "groups => groups.every(group => { const labels = [...group.querySelectorAll('button')].map(button => button.innerText); return labels.length === new Set(labels).size; })"
             ), "gap topic actions need distinct labels within each gap"
+            page.locator(".practice-entry").first.click()
+            practice_drawer = page.locator("#practiceDialog")
+            practice_drawer.wait_for(state="visible")
+            page.locator(".practice-brief").wait_for(timeout=8_000)
+            assert page.locator(".practice-mode-control button").count() == 4
+            assert page.locator(".practice-steps li").count() >= 3
+            assert page.locator(".practice-response textarea").is_visible()
+            assert_no_overflow(page, "desktop practice drawer")
+            practice_text = (
+                "我会先直接说明项目目标，再交代自己负责的判断、方案和推进动作。"
+                "回答时区分个人贡献与团队成果，并说明结果如何验证。"
+                "对于当前没有原始材料支持的细节，我会明确标记为待补充，不把推测写成事实。"
+                "最后我会根据完成标准再口头复述一次，检查回答是否聚焦、结构清楚且可以回查。"
+            )
+            page.locator("#practiceResponse").fill(practice_text)
+            page.locator("[data-save-practice-draft]").click()
+            page.locator("#practiceResponse").wait_for(state="visible")
+            assert page.locator("#practiceResponse").input_value() == practice_text
+            page.locator("[data-submit-practice]").click()
+            page.locator(".practice-rubric-list").wait_for(timeout=8_000)
+            assert page.locator(".practice-rubric-list > div").count() >= 2
+            assert page.locator(".practice-attempt-tabs button").count() == 1
+            page.screenshot(path=OUTPUT_DIR / "ui-practice-desktop.png", full_page=True)
+            page.locator("[data-close-practice]").click()
+            practice_drawer.wait_for(state="detached")
             rerun_review = page.locator("#rerunReview")
             assert rerun_review.is_visible()
             assert rerun_review.inner_text().strip() == "重新面试复盘"
@@ -529,10 +555,18 @@ def run() -> None:
             assert page.locator(".action-list").evaluate(
                 "node => getComputedStyle(node).gridTemplateColumns.split(' ').length === 1"
             )
+            page.locator(".practice-entry").first.click()
+            mobile_practice_drawer = page.locator("#practiceDialog")
+            mobile_practice_drawer.wait_for(state="visible")
+            assert mobile_practice_drawer.evaluate("node => Math.abs(node.getBoundingClientRect().width - innerWidth) <= 1")
+            assert_no_overflow(page, "mobile practice drawer")
+            page.screenshot(path=OUTPUT_DIR / "ui-practice-mobile.png", full_page=True)
+            page.locator("[data-close-practice]").click()
             page.screenshot(path=OUTPUT_DIR / "ui-report-mobile.png", full_page=True)
             page.set_viewport_size({"width": 1440, "height": 900})
             page.goto(f"{BASE_URL}/#/trends", wait_until="networkidle")
             add_trend = page.locator("#openTrendImport")
+            add_trend.wait_for(timeout=10_000)
             assert add_trend.is_visible(), "growth trends should expose a manual import entry point"
             add_trend.click()
             trend_dialog = page.locator("#trendImportDialog")
@@ -563,6 +597,7 @@ def run() -> None:
             page.screenshot(path=OUTPUT_DIR / "ui-trends-import-desktop.png", full_page=True)
             page.locator("[data-close-trend-import]").first.click()
             page.goto(report_url, wait_until="networkidle")
+            page.locator("#editReportCards").wait_for(timeout=10_000)
             assert page.locator("#editReportCards").is_visible()
 
             page.locator("#editReportCards").click()
@@ -582,6 +617,7 @@ def run() -> None:
             assert regenerate.is_enabled(), "a real card edit should enable report regeneration"
             page.locator("#returnToReport").click()
             page.wait_for_url(re.compile(r"#/review/"), timeout=10_000)
+            page.locator("#editReportCards").wait_for(timeout=10_000)
             assert page.locator("#editReportCards").is_visible()
 
             run_page = desktop.new_page()

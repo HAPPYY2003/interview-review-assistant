@@ -163,6 +163,29 @@ class Database:
             FOREIGN KEY(run_id) REFERENCES review_runs(id) ON DELETE CASCADE,
             FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS practice_sessions (
+            id TEXT PRIMARY KEY, interview_id TEXT NOT NULL, run_id TEXT NOT NULL,
+            action_id TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'generating',
+            brief_json TEXT NOT NULL DEFAULT '{}', draft_text TEXT NOT NULL DEFAULT '',
+            error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(run_id, action_id, mode),
+            FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES review_runs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS practice_attempts (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, attempt_no INTEGER NOT NULL,
+            response_text TEXT NOT NULL, self_rating INTEGER,
+            status TEXT NOT NULL DEFAULT 'reviewing', review_json TEXT NOT NULL DEFAULT '{}',
+            error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(session_id, attempt_no),
+            FOREIGN KEY(session_id) REFERENCES practice_sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_practice_sessions_run_action
+            ON practice_sessions(run_id, action_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_practice_attempts_session
+            ON practice_attempts(session_id, attempt_no);
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -1209,6 +1232,7 @@ class Database:
         action_items: Iterable[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         progress = self.get_growth_action_progress(run_id)
+        practice = self.get_practice_action_summaries(run_id)
         merged: list[dict[str, Any]] = []
         for index, source in enumerate(action_items):
             action = dict(source)
@@ -1227,6 +1251,10 @@ class Database:
                 "userNote": (saved or {}).get("userNote", ""),
                 "completionEvidence": (saved or {}).get("completionEvidence", ""),
                 "selfRating": (saved or {}).get("selfRating"),
+                "practiceCount": int((practice.get(action_id) or {}).get("practiceCount") or 0),
+                "latestPracticeStatus": (practice.get(action_id) or {}).get("latestPracticeStatus", ""),
+                "latestPracticeSessionId": (practice.get(action_id) or {}).get("latestPracticeSessionId", ""),
+                "latestPracticeResult": (practice.get(action_id) or {}).get("latestPracticeResult", ""),
             })
             merged.append(action)
         return merged
@@ -1296,6 +1324,192 @@ class Database:
                 (run_id, action_id),
             ).fetchone()
         return self._growth_action_progress_dict(saved)
+
+    def create_or_get_practice_session(
+        self,
+        *,
+        interview_id: str,
+        run_id: str,
+        action_id: str,
+        mode: str,
+    ) -> tuple[dict[str, Any], bool]:
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM practice_sessions WHERE run_id=? AND action_id=? AND mode=?",
+                (run_id, action_id, mode),
+            ).fetchone()
+            created = row is None
+            if created:
+                session_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO practice_sessions(
+                    id,interview_id,run_id,action_id,mode,status,brief_json,draft_text,
+                    error_code,error_message,created_at,updated_at)
+                    VALUES(?,?,?,?,?,'generating','{}','','','',?,?)""",
+                    (session_id, interview_id, run_id, action_id, mode, now, now),
+                )
+            else:
+                session_id = str(row["id"])
+        return self.get_practice_session(session_id), created
+
+    def get_practice_session(self, session_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM practice_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(session_id)
+            attempts = connection.execute(
+                "SELECT * FROM practice_attempts WHERE session_id=? ORDER BY attempt_no",
+                (session_id,),
+            ).fetchall()
+        result = self._practice_session_dict(row)
+        result["attempts"] = [self._practice_attempt_dict(item) for item in attempts]
+        return result
+
+    def update_practice_session(self, session_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "status": "status", "brief": "brief_json", "draftText": "draft_text",
+            "errorCode": "error_code", "errorMessage": "error_message",
+        }
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, column in allowed.items():
+            if key not in updates:
+                continue
+            value = updates[key]
+            if key == "brief":
+                value = json.dumps(value or {}, ensure_ascii=False)
+            assignments.append(f"{column}=?")
+            values.append(value)
+        if not assignments:
+            return self.get_practice_session(session_id)
+        assignments.append("updated_at=?")
+        values.append(utc_now())
+        values.append(session_id)
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE practice_sessions SET {','.join(assignments)} WHERE id=?",
+                tuple(values),
+            )
+            if not cursor.rowcount:
+                raise KeyError(session_id)
+        return self.get_practice_session(session_id)
+
+    def create_practice_attempt(
+        self,
+        session_id: str,
+        *,
+        response_text: str,
+        self_rating: int | None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            session = connection.execute(
+                "SELECT id FROM practice_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if not session:
+                raise KeyError(session_id)
+            row = connection.execute(
+                "SELECT COALESCE(MAX(attempt_no),0)+1 FROM practice_attempts WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            attempt_no = int(row[0])
+            attempt_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT INTO practice_attempts(
+                id,session_id,attempt_no,response_text,self_rating,status,review_json,
+                error_code,error_message,created_at,updated_at)
+                VALUES(?,?,?,?,?,'reviewing','{}','','',?,?)""",
+                (attempt_id, session_id, attempt_no, response_text, self_rating, now, now),
+            )
+            connection.execute(
+                """UPDATE practice_sessions SET status='reviewing',draft_text='',
+                error_code='',error_message='',updated_at=? WHERE id=?""",
+                (now, session_id),
+            )
+        return self.get_practice_attempt(attempt_id)
+
+    def get_practice_attempt(self, attempt_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM practice_attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+        if not row:
+            raise KeyError(attempt_id)
+        return self._practice_attempt_dict(row)
+
+    def update_practice_attempt(self, attempt_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "status": "status", "review": "review_json",
+            "errorCode": "error_code", "errorMessage": "error_message",
+        }
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, column in allowed.items():
+            if key not in updates:
+                continue
+            value = updates[key]
+            if key == "review":
+                value = json.dumps(value or {}, ensure_ascii=False)
+            assignments.append(f"{column}=?")
+            values.append(value)
+        assignments.append("updated_at=?")
+        values.append(utc_now())
+        values.append(attempt_id)
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE practice_attempts SET {','.join(assignments)} WHERE id=?",
+                tuple(values),
+            )
+            if not cursor.rowcount:
+                raise KeyError(attempt_id)
+        return self.get_practice_attempt(attempt_id)
+
+    def get_practice_action_summaries(self, run_id: str) -> dict[str, dict[str, Any]]:
+        with self.connect() as connection:
+            sessions = connection.execute(
+                "SELECT * FROM practice_sessions WHERE run_id=? ORDER BY updated_at",
+                (run_id,),
+            ).fetchall()
+            attempts = connection.execute(
+                """SELECT a.* FROM practice_attempts a
+                JOIN practice_sessions s ON s.id=a.session_id
+                WHERE s.run_id=? ORDER BY a.created_at""",
+                (run_id,),
+            ).fetchall()
+        by_session: dict[str, list[dict[str, Any]]] = {}
+        for row in attempts:
+            item = self._practice_attempt_dict(row)
+            by_session.setdefault(item["sessionId"], []).append(item)
+        summaries: dict[str, dict[str, Any]] = {}
+        for row in sessions:
+            session = self._practice_session_dict(row)
+            action_id = session["actionId"]
+            session_attempts = by_session.get(session["id"], [])
+            current = summaries.setdefault(action_id, {
+                "practiceCount": 0, "latestPracticeStatus": "",
+                "latestPracticeSessionId": "", "latestPracticeResult": "",
+            })
+            current["practiceCount"] += len(session_attempts)
+            current["latestPracticeStatus"] = session["status"]
+            current["latestPracticeSessionId"] = session["id"]
+            latest = session_attempts[-1] if session_attempts else None
+            if latest and latest.get("status") == "reviewed":
+                review = latest.get("review") or {}
+                results = review.get("rubricResults") or []
+                if review.get("completionRecommended"):
+                    current["latestPracticeResult"] = "met"
+                elif any(item.get("status") in {"met", "partially_met"} for item in results):
+                    current["latestPracticeResult"] = "partially_met"
+                else:
+                    current["latestPracticeResult"] = "not_met"
+            elif latest:
+                current["latestPracticeResult"] = latest.get("status", "")
+            elif session.get("draftText"):
+                current["latestPracticeResult"] = "draft"
+        return summaries
 
     def get_growth_trends(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1415,6 +1629,29 @@ class Database:
             "startedAt": row["started_at"], "completedAt": row["completed_at"],
             "userNote": row["user_note"], "completionEvidence": row["completion_evidence"],
             "selfRating": row["self_rating"], "updatedAt": row["updated_at"],
+        }
+
+    @staticmethod
+    def _practice_session_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "interviewId": row["interview_id"],
+            "runId": row["run_id"], "actionId": row["action_id"],
+            "mode": row["mode"], "status": row["status"],
+            "brief": json.loads(row["brief_json"] or "{}"),
+            "draftText": row["draft_text"], "errorCode": row["error_code"],
+            "errorMessage": row["error_message"], "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    @staticmethod
+    def _practice_attempt_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "sessionId": row["session_id"],
+            "attemptNo": int(row["attempt_no"]), "responseText": row["response_text"],
+            "selfRating": row["self_rating"], "status": row["status"],
+            "review": json.loads(row["review_json"] or "{}"),
+            "errorCode": row["error_code"], "errorMessage": row["error_message"],
+            "createdAt": row["created_at"], "updatedAt": row["updated_at"],
         }
 
     @staticmethod

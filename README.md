@@ -4,7 +4,7 @@ Offer Radar Agent 是一个本地优先的智能面试复盘助手。它在保�
 
 本仓库是个人独立设计与迭代的作品仓库，与 HelloAgents 社区毕业设计提交目录相互独立。当前版本聚焦产品 MVP 和工程实现，暂不包含毕业设计评测、数据集指标或消融实验。
 
-当前稳定版本：`v0.4.1`。
+当前稳定版本：`v0.5.0`。
 
 ## 核心能力
 
@@ -18,6 +18,8 @@ Offer Radar Agent 是一个本地优先的智能面试复盘助手。它在保�
 - 五维评分由代码按 `20/15/25/20/20` 权重计算，模型不能直接修改总分。
 - 每个主题、审计轮次和成长计划都保存版本化 artifact；失败后从最近已接受检查点恢复。
 - QualityAuditor 在报告发布前终审成长计划；首轮发现问题时最多退回 GrowthPlanner 修订一次，第二轮关键问题会阻止发布。
+- 每项下一步行动都提供按需练习入口，支持口述表达、追问演练、案例补充和知识自测；草稿、尝试历史和结构化反馈保存在本机。
+- 练习反馈会标记原报告证据无法支持的新事实或数字，不会修改五维评分，也不会自动替用户完成行动。
 - SSE 展示阶段、工具、证据数、耗时和错误，不输出模型隐藏思考。
 - SQLite 保存业务记录，HelloAgents SessionStore 和 TraceLogger 保存恢复与审计信息。
 - fixture 模式无需 API Key，适合本地演示；HelloAgents 模式调用真实模型且不会静默降级。
@@ -38,6 +40,9 @@ flowchart LR
     TT --> RF["ReflectionAgent 审计"]
     TT --> GP["PlanSolveAgent 成长计划"]
     GP --> GA["QualityAuditor 成长计划终审"]
+    GA --> AP["报告内行动练习"]
+    AP --> PC["SimpleAgent 练习教练"]
+    AP --> PR["ReflectionAgent 练习反馈"]
     WF --> DB["SQLite"]
     WF --> TRACE["Session + Trace"]
 ```
@@ -104,15 +109,27 @@ tests/                  基础功能和 API 回归测试
 
 解析子状态：`QUEUED -> INSPECTING -> TRANSCRIBING -> VALIDATING -> STRUCTURING -> SUBMITTING -> COMPLETED`，文字来源自动跳过 `TRANSCRIBING`。
 
-核心接口包括 `/api/v1/interviews`、`/materials`、`/parse`、`/parse-runs/{id}/events`、`/segments`、`/questions`、`/confirm`、`/review-runs`、`/runs/{id}/events`、`/resume`、`/fallback`、`/report` 和 `/api/v1/profile/trends`。成长行动进度通过 `GET /api/v1/growth-plans/{runId}` 读取，并通过 `PATCH /api/v1/growth-actions/{actionId}` 保存状态、备注、完成证据和自评；更新请求需携带 `runId`。旧版四个 Node API 路径由 FastAPI 兼容层暂时承接。
+核心接口包括 `/api/v1/interviews`、`/materials`、`/parse`、`/parse-runs/{id}/events`、`/segments`、`/questions`、`/confirm`、`/review-runs`、`/runs/{id}/events`、`/resume`、`/fallback`、`/report` 和 `/api/v1/profile/trends`。成长行动进度通过 `GET /api/v1/growth-plans/{runId}` 读取，并通过 `PATCH /api/v1/growth-actions/{actionId}` 保存状态、备注、完成证据和自评；更新请求需携带 `runId`。
+
+行动练习使用以下接口，全部在报告生成后按需调用：
+
+```text
+POST  /api/v1/growth-actions/{actionId}/practice-sessions
+GET   /api/v1/practice-sessions/{sessionId}
+PATCH /api/v1/practice-sessions/{sessionId}
+POST  /api/v1/practice-sessions/{sessionId}/submit
+POST  /api/v1/practice-sessions/{sessionId}/retry
+```
+
+旧版四个 Node API 路径由 FastAPI 兼容层暂时承接。
 
 ## 隐私边界
 
 - 上传材料只写入本项目 `data` 目录；音频仅在用户明确确认授权后发送到 Deepgram。
-- 删除面试会同时删除本机音频、片段、解析 artifact、题卡和报告。
+- 删除面试会同时删除本机音频、片段、解析 artifact、题卡、报告和行动练习历史。
 - Trace 会脱敏，不记录 API Key；公开 SSE 不包含原始提示词和隐藏思考。
 - 联网核验默认关闭，启用后也只能补充事实引用，不能单独提高面试评分。
-- 第一版不包含 OCR、实时录音、本地语音模型、账号、云同步、向量数据库和自动投递。
+- 当前行动练习只支持文字输入，不包含语音练习、摄像头或独立训练中心；项目仍不包含 OCR、实时录音、本地语音模型、账号、云同步、向量数据库和自动投递。
 
 ## 基础验证
 

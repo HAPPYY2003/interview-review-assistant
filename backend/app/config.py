@@ -38,6 +38,8 @@ class Settings:
     review_fast_path_enabled: bool = _bool("REVIEW_FAST_PATH_ENABLED", True)
     review_evidence_packet_limit: int = int(os.getenv("REVIEW_EVIDENCE_PACKET_LIMIT", "12"))
     parse_worker_concurrency: int = int(os.getenv("PARSE_WORKER_CONCURRENCY", "3"))
+    practice_brief_timeout: int = int(os.getenv("PRACTICE_BRIEF_TIMEOUT", "45"))
+    practice_review_timeout: int = int(os.getenv("PRACTICE_REVIEW_TIMEOUT", "60"))
     asr_provider: str = os.getenv("ASR_PROVIDER", "deepgram").strip().lower()
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "").strip()
     deepgram_model: str = os.getenv("DEEPGRAM_MODEL", "nova-3").strip()

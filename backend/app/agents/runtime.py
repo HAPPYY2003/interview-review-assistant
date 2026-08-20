@@ -344,6 +344,90 @@ class HelloAgentsRuntime:
             success=bool(text.strip()),
         )
 
+    def generate_practice_brief(self, prompt: str) -> AgentRuntimeResult:
+        """Generate one action-practice brief without entering a tool loop."""
+        if not self.available:
+            raise RuntimeError(f"HelloAgents 不可用：{self.import_error}")
+        self.configure_environment()
+        agent = self.SimpleAgent(
+            "offer-radar-practice-coach",
+            self.HelloAgentsLLM(),
+            system_prompt=(
+                "你是行动练习教练。只输出一个 JSON 对象，不得输出 Markdown 或思考过程。"
+                "只能使用输入中给出的 action、gap、topic 和 evidence ID，不得新增候选人经历或数字。"
+                "你的任务是生成训练目标、3至5个步骤、练习题和2至6条评价标准，不要生成示例答案。"
+                "缺少事实时明确提示用户自行补充。"
+            ),
+            config=self._config(),
+            enable_tool_calling=False,
+        )
+        started = time.perf_counter()
+        result = agent.run(prompt)
+        elapsed = round(time.perf_counter() - started, 3)
+        text = result if isinstance(result, str) else str(result)
+        return AgentRuntimeResult(
+            text=text,
+            session_id=getattr(agent, "session_id", None),
+            metadata={"runtime": "helloagents", "agent": "PracticeCoach", "duration_seconds": elapsed},
+            success=bool(text.strip()),
+        )
+
+    def review_practice_response(self, prompt: str) -> AgentRuntimeResult:
+        """Review one user-authored practice response in a single reflection pass."""
+        if not self.available:
+            raise RuntimeError(f"HelloAgents 不可用：{self.import_error}")
+        self.configure_environment()
+        agent = self.ReflectionAgent(
+            "offer-radar-practice-reviewer",
+            self.HelloAgentsLLM(),
+            system_prompt=(
+                "你是行动练习审查员。只输出一个 JSON 对象，不得输出 Markdown 或思考过程。"
+                "逐条评价输入中的 rubric；不得修改正式面试评分。用户答案中的新经历和数字不等于原面试证据，"
+                "无法由 allowedEvidence 支持时写入 factualRisks。不要生成或代写新的候选人经历。"
+            ),
+            config=self._config(),
+            max_iterations=0,
+            enable_tool_calling=False,
+        )
+        started = time.perf_counter()
+        result = agent.run(prompt)
+        elapsed = round(time.perf_counter() - started, 3)
+        text = result if isinstance(result, str) else str(result)
+        return AgentRuntimeResult(
+            text=text,
+            session_id=getattr(agent, "session_id", None),
+            metadata={"runtime": "helloagents", "agent": "PracticeReviewer", "duration_seconds": elapsed},
+            success=bool(text.strip()),
+        )
+
+    def finalize_practice_review(self, prompt: str) -> AgentRuntimeResult:
+        """Repair one invalid practice review into the exact JSON contract."""
+        if not self.available:
+            raise RuntimeError(f"HelloAgents 不可用：{self.import_error}")
+        self.configure_environment()
+        agent = self.SimpleAgent(
+            "offer-radar-practice-review-finalizer",
+            self.HelloAgentsLLM(),
+            system_prompt=(
+                "你是 PracticeReviewFinalizer。只输出一个合法 JSON 对象，不得输出 Markdown、解释或思考过程。"
+                "rubricResults 必须逐条覆盖输入中的 rubric ID，状态只能是 met、partially_met、not_met。"
+                "用户新增且无法由 allowedEvidence 支持的数字或事实必须写入 factualRisks。"
+                "不得修改正式面试评分，不得生成或代写候选人经历。"
+            ),
+            config=self._config(),
+            enable_tool_calling=False,
+        )
+        started = time.perf_counter()
+        result = agent.run(prompt)
+        elapsed = round(time.perf_counter() - started, 3)
+        text = result if isinstance(result, str) else str(result)
+        return AgentRuntimeResult(
+            text=text,
+            session_id=getattr(agent, "session_id", None),
+            metadata={"runtime": "helloagents", "agent": "PracticeReviewFinalizer", "duration_seconds": elapsed},
+            success=bool(text.strip()),
+        )
+
     def run_supervisor(self, context: dict[str, Any], tools: list[Any] | None = None, on_phase: Callable[[str], None] | None = None) -> AgentRuntimeResult:
         registry = self.ToolRegistry()
         for tool in tools or []:
