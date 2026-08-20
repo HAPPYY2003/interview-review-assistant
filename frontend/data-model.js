@@ -180,6 +180,7 @@ export function normalizeInterviewRecord(record = {}) {
     overallScores: { ...EMPTY_SCORES, ...(record.overallScores || {}) },
     topRisks: Array.isArray(record.topRisks) ? record.topRisks : [],
     auditNotes: Array.isArray(record.auditNotes) ? record.auditNotes : [],
+    growthPlanAudit: record.growthPlanAudit && typeof record.growthPlanAudit === "object" ? record.growthPlanAudit : null,
     report: record.report ? normalizeReportRecord(record.report) : null,
     createdAt: record.createdAt || new Date().toISOString(),
     updatedAt: record.updatedAt || new Date().toISOString()
@@ -331,7 +332,15 @@ export function normalizeReportRecord(report = {}) {
     ...report,
     reportSchemaVersion,
     isLegacyReport: reportSchemaVersion < 2,
-    interview: { ...sourceInterview, overallScores: scores, overallEvaluation, capabilityGaps: gaps },
+    interview: {
+      ...sourceInterview,
+      overallScores: scores,
+      overallEvaluation,
+      capabilityGaps: gaps,
+      growthPlanAudit: sourceInterview.growthPlanAudit && typeof sourceInterview.growthPlanAudit === "object"
+        ? sourceInterview.growthPlanAudit
+        : null
+    },
     questions: (report.questions || []).map(item => normalizeQuestionRecord(item, { reportSchemaVersion })),
     actions
   };
@@ -378,6 +387,14 @@ export function buildMarkdownReport(interview, questions, actions) {
     "## 下一步行动计划",
     "",
     ...(actions.length ? actions.map((item, index) => `- [${item.completed ? "x" : " "}] **行动 ${item.order || item.day || index + 1} · ${item.type === "learning" ? "学习项" : "准备项"} · ${item.title}**\n  - 任务：${item.description || ""}\n  - 提升维度：${SCORE_LABELS[item.dimension] || item.dimension || "综合训练"}\n  - 完成标准：${item.successCriterion || "暂无"}`) : ["- 暂无行动项"]),
+    "",
+    "## 质量审计",
+    "",
+    `- 逐题复盘审计：${(interview.auditNotes || [])[0] || "暂无审计摘要"}`,
+    interview.growthPlanAudit
+      ? `- 成长计划终审：${interview.growthPlanAudit.summary || "已完成"}（第 ${interview.growthPlanAudit.round || 1} 轮，修订 ${interview.growthPlanAudit.revisionCount || 0} 次）`
+      : "- 成长计划终审：该报告生成时未启用成长计划终审",
+    ...((interview.growthPlanAudit?.findings || []).map(item => `  - [${item.severity}] ${item.message}`)),
     "",
     "## 逐题深度复盘",
     ""

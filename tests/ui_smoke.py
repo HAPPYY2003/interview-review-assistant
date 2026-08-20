@@ -425,6 +425,9 @@ def run() -> None:
             assert page.get_by_role("heading", name="逐题深度复盘").is_visible()
             assert page.locator(".legacy-report-notice").count() == 0
             assert "旧报告未" not in page.locator(".report-page").inner_text()
+            assert page.locator(".audit-summary").count() == 2
+            assert "逐题复盘审计" in page.locator(".audit-band").inner_text()
+            assert "成长计划终审" in page.locator(".audit-band").inner_text()
             assert page.locator(".action-item").count() == 3
             assert page.locator(".action-deliverable").count() == 0
             assert page.locator(".action-order").first.inner_text() == "行动 1"
@@ -586,21 +589,34 @@ def run() -> None:
             run_payload = {
                 "id": "ui-agent-run",
                 "status": "FAILED",
-                "phase": "failed",
+                "phase": "growth_audit",
                 "agent_mode": "helloagents",
                 "degraded": False,
-                "error": "两轮 Reflection 审计后仍存在关键问题",
-                "failure_code": "AUDIT_CRITICAL",
+                "error": "成长计划第二轮终审后仍存在关键问题",
+                "failure_code": "GROWTH_AUDIT_CRITICAL",
                 "events": [
                     {"id": 1, "type": "TOPIC_ANALYSIS_COMPLETED", "data": {"topicId": "topic-1", "evidenceCount": 3}, "createdAt": "2026-08-09T10:00:00Z"},
-                    {"id": 2, "type": "AUDIT_COMPLETED", "data": {"round": 2, "findingCount": 1}, "createdAt": "2026-08-09T10:01:00Z"},
-                    {"id": 3, "type": "RUN_FAILED", "data": {"code": "AUDIT_CRITICAL", "message": "两轮 Reflection 审计后仍存在关键问题"}, "createdAt": "2026-08-09T10:02:00Z"},
+                    {"id": 2, "type": "AUDIT_COMPLETED", "data": {"round": 1, "findingCount": 0}, "createdAt": "2026-08-09T10:01:00Z"},
+                    {"id": 3, "type": "GROWTH_PLAN_REVISED", "data": {"revisionCount": 1}, "createdAt": "2026-08-09T10:02:00Z"},
+                    {"id": 4, "type": "GROWTH_AUDIT_COMPLETED", "data": {"round": 2, "findingCount": 1, "criticalCount": 1, "accepted": False}, "createdAt": "2026-08-09T10:03:00Z"},
+                    {"id": 5, "type": "RUN_FAILED", "data": {"code": "GROWTH_AUDIT_CRITICAL", "message": "成长计划第二轮终审后仍存在关键问题"}, "createdAt": "2026-08-09T10:04:00Z"},
                 ],
                 "progress": {
                     "completedTopics": 2,
-                    "auditRound": 2,
-                    "revisionCount": 1,
-                    "checkpoint": {"completedTopicIds": ["topic-1", "topic-2"], "evidenceComplete": True},
+                    "auditRound": 1,
+                    "revisionCount": 0,
+                    "growthAuditRound": 2,
+                    "growthRevisionCount": 1,
+                    "growthAuditAccepted": False,
+                    "checkpoint": {
+                        "completedTopicIds": ["topic-1", "topic-2"],
+                        "evidenceComplete": True,
+                        "auditAccepted": True,
+                        "growthComplete": True,
+                        "growthAuditRound": 2,
+                        "growthRevisionCount": 1,
+                        "growthAuditAccepted": False,
+                    },
                 },
                 "artifacts": [],
             }
@@ -613,7 +629,7 @@ def run() -> None:
             run_record = next(item for item in run_records if item["id"] in page.url)
             run_record["runId"] = "ui-agent-run"
             run_record["status"] = "failed"
-            run_record["phase"] = "failed"
+            run_record["phase"] = "growth_audit"
             run_record["topics"] = [{"id": "topic-1"}, {"id": "topic-2"}]
             run_record["questionCount"] = 2
             run_page.evaluate(
@@ -630,18 +646,74 @@ def run() -> None:
             run_page.goto(f"{BASE_URL}/#/run/{run_record['id']}/ui-agent-run", wait_until="networkidle")
             run_summary = run_page.locator(".agent-run-summary").inner_text()
             assert "HelloAgents" not in run_summary
-            assert "2/2 个主题已提交" in run_summary, run_summary
-            assert "Reflection 审计 2/2 轮 · 已修订 1 次" in run_summary
-            assert run_page.locator(".agent-stage.done").count() == 1
+            assert "Reflection" not in run_page.locator(".page").inner_text()
+            assert "成长计划终审未完成" in run_summary, run_summary
+            assert "2/2 主题" in run_summary
+            assert "1 轮通过" in run_summary
+            assert "已修订 1 次" in run_summary
+            assert "第 2 轮终审未通过 · 可恢复" in run_summary
+            assert run_page.locator(".run-progress-track").get_attribute("aria-valuenow") == "98"
+            assert run_page.locator(".agent-stage").count() == 4
+            assert run_page.locator(".agent-stage.done").count() == 3
             assert run_page.locator(".agent-stage.error").count() == 1
+            error_stage_style = run_page.locator(".agent-stage.error").evaluate(
+                "element => ({ borderWidth: getComputedStyle(element).borderWidth, backgroundColor: getComputedStyle(element).backgroundColor })"
+            )
+            assert error_stage_style["borderWidth"] == "0px", error_stage_style
+            assert error_stage_style["backgroundColor"] in {"rgba(0, 0, 0, 0)", "transparent"}, error_stage_style
+            stage_layout = run_page.evaluate(
+                """() => {
+                    const grid = document.querySelector('.agent-stage-grid').getBoundingClientRect();
+                    const stages = [...document.querySelectorAll('.agent-stage')];
+                    const boxes = stages.map(stage => stage.getBoundingClientRect());
+                    return {
+                        widths: boxes.map(box => box.width),
+                        leftDelta: Math.abs(grid.left - boxes[0].left),
+                        rightDelta: Math.abs(grid.right - boxes.at(-1).right),
+                        labelsClearLine: stages.every(stage => {
+                            const marker = stage.querySelector('.agent-stage-marker').getBoundingClientRect();
+                            const title = stage.querySelector('strong').getBoundingClientRect();
+                            return title.top >= marker.bottom + 5;
+                        }),
+                    };
+                }"""
+            )
+            assert max(stage_layout["widths"]) - min(stage_layout["widths"]) <= 1, stage_layout
+            assert stage_layout["leftDelta"] <= 1 and stage_layout["rightDelta"] <= 1, stage_layout
+            assert stage_layout["labelsClearLine"], stage_layout
             assert run_page.locator("#resumeRun").is_visible()
             assert run_page.locator("#fallbackRun").is_visible()
-            assert "AUDIT_CRITICAL" in run_page.locator(".run-failure").inner_text()
+            assert "GROWTH_AUDIT_CRITICAL" in run_page.locator(".run-failure").inner_text()
             assert_no_overflow(run_page, "desktop failed Agent run page")
             run_page.screenshot(path=OUTPUT_DIR / "ui-agent-run-desktop.png", full_page=True)
+
+            failed_review_route = f"#/run/{run_record['id']}/ui-agent-run"
+            run_page.goto(f"{BASE_URL}/#/", wait_until="networkidle")
+            failed_review_links = run_page.locator(f'[data-nav="{failed_review_route}"]')
+            assert failed_review_links.count() == 2
+            assert failed_review_links.last.get_attribute("data-tooltip") == "查看失败原因"
+            failed_review_links.first.click()
+            run_page.wait_for_function("expected => location.hash === expected", arg=failed_review_route)
+            run_page.locator(".run-failure").wait_for()
+
             run_page.set_viewport_size({"width": 390, "height": 844})
             assert_no_overflow(run_page, "mobile failed Agent run page")
             run_page.screenshot(path=OUTPUT_DIR / "ui-agent-run-mobile.png", full_page=True)
+
+            run_page.goto(f"{BASE_URL}/#/", wait_until="networkidle")
+            run_page.evaluate(
+                """recordId => {
+                    const records = JSON.parse(localStorage.getItem('offer-radar-agent-v1'));
+                    const record = records.find(item => item.id === recordId);
+                    record.status = 'failed';
+                    record.failureSource = 'parse';
+                    record.parseError = '材料解析失败';
+                    localStorage.setItem('offer-radar-agent-v1', JSON.stringify(records));
+                }""",
+                run_record["id"],
+            )
+            run_page.reload(wait_until="networkidle")
+            assert run_page.locator(f'[data-nav^="#/parse/{run_record["id"]}"]').count() == 2
             desktop.close()
 
             mobile = browser.new_context(viewport={"width": 390, "height": 844})

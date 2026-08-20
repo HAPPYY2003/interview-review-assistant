@@ -35,7 +35,7 @@ def test_v1_api_end_to_end_and_sse_contract():
     with TestClient(app) as client:
         health = client.get("/api/health")
         assert health.status_code == 200
-        assert health.json()["reportSchemaVersion"] == 2
+        assert health.json()["reportSchemaVersion"] == 3
         created = client.post("/api/v1/interviews", json=payload)
         assert created.status_code == 201
 
@@ -71,7 +71,7 @@ def test_v1_api_end_to_end_and_sse_contract():
 
         started = client.post(f"/api/v1/interviews/{interview_id}/review-runs", json={"enableWebVerify": False})
         assert started.status_code == 202
-        assert started.json()["reportSchemaVersion"] == 2
+        assert started.json()["reportSchemaVersion"] == 3
         run_id = started.json()["id"]
 
         run = {}
@@ -84,19 +84,36 @@ def test_v1_api_end_to_end_and_sse_contract():
         assert [event["type"] for event in run["events"]][-1] == "RUN_FINISHED"
         assert run["agent_mode"] == "fixture"
         assert run["progress"]["completedTopics"] == 1
+        assert run["progress"]["growthAuditRound"] == 1
+        assert run["progress"]["growthRevisionCount"] == 0
+        assert run["progress"]["growthAuditAccepted"] is True
         assert {item["phase"] for item in run["artifacts"]} == {
-            "evidence_review", "reflection_audit", "growth_plan",
+            "evidence_review", "reflection_audit", "growth_plan", "growth_audit",
         }
+        assert {item["agent_type"] for item in run["artifacts"]} == {
+            "EvidenceAnalyst", "QualityAuditor", "GrowthPlanner", "GrowthPlanAuditor",
+        }
+        assert {event["type"] for event in run["events"]}.issuperset({
+            "GROWTH_AUDIT_STARTED", "GROWTH_AUDIT_COMPLETED",
+        })
 
         report = client.get(f"/api/v1/interviews/{interview_id}/report")
         assert report.status_code == 200
         assert report.json()["status"] == "COMPLETED"
-        assert report.json()["reportSchemaVersion"] == 2
+        assert report.json()["reportSchemaVersion"] == 3
         assert report.json()["questions"][0]["evidenceRefs"]
         assert report.json()["questions"][0]["answerLogic"]["steps"]
         assert report.json()["questions"][0]["recommendedAnswer"]["framework"]["type"]
         assert report.json()["interview"]["overallEvaluation"]["score"] == report.json()["interview"]["overallScores"]["overall"]
+        assert report.json()["interview"]["auditRound"] == 1
         assert report.json()["interview"]["capabilityGaps"]
+        assert report.json()["interview"]["growthPlanAudit"] == {
+            "decision": "pass",
+            "summary": "成长计划已通过确定性结构与引用校验。",
+            "findings": [],
+            "round": 1,
+            "revisionCount": 0,
+        }
         assert len(report.json()["actions"]) == 3
         assert all(item["gapIds"] and item["successCriterion"] for item in report.json()["actions"])
         assert all("deliverable" not in item for item in report.json()["actions"])
@@ -141,6 +158,8 @@ def test_v1_api_end_to_end_and_sse_contract():
 
         events = client.get(f"/api/v1/runs/{run_id}/events")
         assert events.status_code == 200
+        assert "event: GROWTH_AUDIT_STARTED" in events.text
+        assert "event: GROWTH_AUDIT_COMPLETED" in events.text
         assert "event: RUN_FINISHED" in events.text
         assert "THINKING" not in events.text
         last_event_id = run["events"][-1]["id"]
@@ -365,7 +384,7 @@ def test_failed_agent_run_only_falls_back_after_explicit_request():
         assert any(event["type"] == "FALLBACK_REQUESTED" for event in completed["events"])
 
         report = client.get(f"/api/v1/interviews/{interview_id}/report").json()
-        assert report["reportSchemaVersion"] == 2
+        assert report["reportSchemaVersion"] == 3
         assert report["interview"]["capabilityGaps"]
         assert len(report["actions"]) == 3
         assert report["interview"]["latestAIMetadata"]["provider"] == "DeterministicFallback"
@@ -462,6 +481,10 @@ def test_delete_interview_removes_database_rows_and_private_artifacts():
                     f"SELECT COUNT(*) FROM {table} WHERE interview_id=?",
                     (interview_id,),
                 ).fetchone()[0] == 0
+
+        repeated_delete = client.delete(f"/api/v1/interviews/{interview_id}")
+        assert repeated_delete.status_code == 200
+        assert repeated_delete.json() == {"deleted": True}
 
 
 def test_growth_snapshot_delete_keeps_interview_record():

@@ -4,7 +4,7 @@ Offer Radar Agent 是一个本地优先的智能面试复盘助手。它在保�
 
 本仓库是个人独立设计与迭代的作品仓库，与 HelloAgents 社区毕业设计提交目录相互独立。当前版本聚焦产品 MVP 和工程实现，暂不包含毕业设计评测、数据集指标或消融实验。
 
-当前稳定版本：`v0.3.0`。
+当前稳定版本：`v0.4.0`。
 
 ## 核心能力
 
@@ -12,11 +12,12 @@ Offer Radar Agent 是一个本地优先的智能面试复盘助手。它在保�
 - MP3、M4A、WAV、FLAC、OGG 音频通过 Deepgram `nova-3` 转写，限制 200MB、120 分钟。
 - ReAct ParseAgent 调用材料检查、转写、校验、语义拆题和提交工具；SimpleAgent Worker 分块识别主问题、回答与追问。
 - 原始转写和人工修订双轨保存，题卡只能引用真实片段；生成后停在人工确认节点。
-- PlanSolveAgent 主管按照“证据诊断、反思审计、成长计划”三阶段调度。
+- PlanSolveAgent 主管按照“证据诊断、逐题质量审计、成长计划、成长计划终审”四阶段调度。
 - ReActAgent、ReflectionAgent、PlanSolveAgent 子 Agent 通过 TaskTool 协作。
 - 原回答、JD、简历和本地知识库引用均带来源定位；无效引用在审计阶段移除。
 - 五维评分由代码按 `20/15/25/20/20` 权重计算，模型不能直接修改总分。
 - 每个主题、审计轮次和成长计划都保存版本化 artifact；失败后从最近已接受检查点恢复。
+- QualityAuditor 在报告发布前终审成长计划；首轮发现问题时最多退回 GrowthPlanner 修订一次，第二轮关键问题会阻止发布。
 - SSE 展示阶段、工具、证据数、耗时和错误，不输出模型隐藏思考。
 - SQLite 保存业务记录，HelloAgents SessionStore 和 TraceLogger 保存恢复与审计信息。
 - fixture 模式无需 API Key，适合本地演示；HelloAgents 模式调用真实模型且不会静默降级。
@@ -36,6 +37,7 @@ flowchart LR
     TT --> RA["ReActAgent 证据诊断"]
     TT --> RF["ReflectionAgent 审计"]
     TT --> GP["PlanSolveAgent 成长计划"]
+    GP --> GA["QualityAuditor 成长计划终审"]
     WF --> DB["SQLite"]
     WF --> TRACE["Session + Trace"]
 ```
@@ -74,7 +76,7 @@ DEEPGRAM_API_KEY=your-deepgram-key
 
 API Key 不会发送到浏览器，也不会写入 SQLite。默认 `AGENT_RUNTIME=fixture`；显式选择 `helloagents` 但缺少 LLM Key 时，创建复盘会返回配置错误，不会伪装成真实 Agent 或自动生成规则报告。未配置 Deepgram Key 时文字解析仍可用，音频入口会禁用。
 
-真实 Agent 任务失败后，用户可以调用 `/api/v1/runs/{id}/resume` 从检查点恢复，或明确调用 `/api/v1/runs/{id}/fallback` 生成确定性降级报告。报告页会分别标记 `HelloAgents Agent 生成`、`Fixture 模拟报告` 或 `确定性降级报告`。
+真实 Agent 任务失败后，用户可以调用 `/api/v1/runs/{id}/resume` 从检查点恢复，或明确调用 `/api/v1/runs/{id}/fallback` 生成确定性降级报告。前端只展示 `实时 Agent`、`演示模式` 或 `确定性降级`，不显示底层框架类名。
 
 ## Docker
 

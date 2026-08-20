@@ -252,7 +252,21 @@ def fallback_utterances(atoms: list[dict[str, Any]], profile: TranscriptProfile,
     if not atoms:
         return []
     groups: list[list[dict[str, Any]]] = []
-    if profile.profile_type != "raw_stream":
+    if profile.profile_type == "labeled_lines":
+        current: list[dict[str, Any]] = []
+        current_speaker = ""
+        for atom in atoms:
+            label = str(atom.get("speakerLabel") or "").strip().lower()
+            role = str(atom.get("speakerRole") or "unknown")
+            speaker = f"label:{label}" if label else f"role:{role}" if role != "unknown" else f"atom:{atom['id']}"
+            if current and speaker != current_speaker:
+                groups.append(current)
+                current = []
+            current.append(atom)
+            current_speaker = speaker
+        if current:
+            groups.append(current)
+    elif profile.profile_type != "raw_stream":
         groups = [[atom] for atom in atoms]
     else:
         current: list[dict[str, Any]] = []
@@ -408,7 +422,35 @@ def chunk_atoms(atoms: list[dict[str, Any]], size: int = 160, overlap: int = 24)
 
 
 def chunk_utterances(utterances: list[dict[str, Any]], size: int = 40, overlap: int = 6) -> list[list[dict[str, Any]]]:
-    return _chunk([item for item in utterances if not item.get("excluded")], size, overlap)
+    usable = [item for item in utterances if not item.get("excluded")]
+    if not usable:
+        return []
+    chunks: list[list[dict[str, Any]]] = []
+    start = 0
+    while start < len(usable):
+        end = min(len(usable), start + size)
+        if end < len(usable):
+            lower = max(start + 1, end - overlap)
+            complete_turn_boundaries = [
+                index
+                for index in range(lower, end + 1)
+                if index < len(usable)
+                and usable[index - 1].get("speakerRole") == "candidate"
+                and usable[index].get("speakerRole") == "interviewer"
+            ]
+            if complete_turn_boundaries:
+                end = complete_turn_boundaries[-1]
+        chunks.append(usable[start:end])
+        if end >= len(usable):
+            break
+        overlap_start = max(start + 1, end - overlap)
+        interviewer_starts = [
+            index
+            for index in range(overlap_start, end)
+            if usable[index].get("speakerRole") == "interviewer"
+        ]
+        start = interviewer_starts[0] if interviewer_starts else overlap_start
+    return chunks
 
 
 def _chunk(items: list[dict[str, Any]], size: int, overlap: int) -> list[list[dict[str, Any]]]:
@@ -445,6 +487,12 @@ def _role_from_label(label: str) -> str:
 def _text_from_atoms(atoms: list[dict[str, Any]], source: str) -> str:
     if not atoms:
         return ""
+    if len(atoms) > 1 and any(str(item.get("speakerLabel") or "").strip() for item in atoms):
+        return "\n".join(
+            str(item.get("rawText", "")).strip()
+            for item in atoms
+            if str(item.get("rawText", "")).strip()
+        )
     start, end = atoms[0].get("startChar"), atoms[-1].get("endChar")
     if source and start is not None and end is not None:
         return source[int(start):int(end)].strip()

@@ -2,7 +2,8 @@ import json
 
 from backend.app.schemas import TopicReviewSubmission
 from backend.app.services.knowledge import KnowledgeBase
-from backend.app.tools import build_agent_tools, build_audit_agent_tools, build_growth_agent_tools
+from backend.app.tools import build_agent_tools, build_audit_agent_tools, build_growth_agent_tools, build_growth_audit_agent_tools
+from backend.app.tools.agent_tools import JsonSnapshotTool, ScoreTool, SubmitTopicReviewTool
 
 
 def _topic_submission(topic_id: str, transcript_id: str, job_id: str, *, follow_ups: list[str] | None = None) -> dict:
@@ -62,6 +63,17 @@ def _topic_submission(topic_id: str, transcript_id: str, job_id: str, *, follow_
         "uncertainties": [],
         "revisionSummary": "",
     }
+
+
+def test_json_snapshot_returns_large_payload_only_once():
+    tool = JsonSnapshotTool("GetContext", "读取上下文。", {"items": [1, 2, 3]})
+
+    first = tool.run({})
+    repeated = tool.run({})
+
+    assert first.data["payload"] == {"items": [1, 2, 3]}
+    assert repeated.data == {"alreadyRead": True, "readCount": 2}
+    assert tool.read_count == 2
 
 
 def _growth_submission(topic_id: str, evidence_id: str) -> dict:
@@ -133,49 +145,64 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     exhausted = lookup.run({"source_type": "transcript", "query": "项目"})
     assert exhausted.status.value == "partial"
     assert exhausted.data["budgetExhausted"] is True
-    score = next(tool for tool in tools if tool.name == "Score").run({"levels_json": json.dumps({name: "合格" for name in ("relevance", "structure", "evidence", "depth", "roleFit")}, ensure_ascii=False)})
+    assert all(tool.name != "Score" for tool in tools)
+    score = ScoreTool().run({"levels_json": json.dumps({name: "合格" for name in ("relevance", "structure", "evidence", "depth", "roleFit")}, ensure_ascii=False)})
     assert score.data["overall"] == 6.0
 
     accepted = submit.run({"review_json": json.dumps(_topic_submission("topic-1", transcript["id"], job["id"]), ensure_ascii=False)})
     assert accepted.status.value == "success"
     assert submit.last_review["scores"]["overall"] == 6.0
+    duplicate = submit.run({"review_json": "{}"})
+    assert duplicate.status.value == "success"
+    assert duplicate.data["locked"] is True
+
+    def validate_once(payload):
+        validator = SubmitTopicReviewTool(submit.topic, submit.registry, has_jd=True)
+        response = validator.run({"review_json": json.dumps(payload, ensure_ascii=False)})
+        return response, validator
+
     placeholder = _topic_submission("topic-1", transcript["id"], job["id"])
     placeholder["diagnosis"] = "综合诊断"
-    assert submit.run({"review_json": json.dumps(placeholder, ensure_ascii=False)}).status.value == "partial"
-    assert "占位" in submit.last_error
+    response, validator = validate_once(placeholder)
+    assert response.status.value == "partial"
+    assert "占位" in validator.last_error
     repeated_rationale = _topic_submission("topic-1", transcript["id"], job["id"])
     for dimension in repeated_rationale["dimensions"]:
         dimension["rationale"] = "回答具备基础信息并有原文支持。"
-    assert submit.run({"review_json": json.dumps(repeated_rationale, ensure_ascii=False)}).status.value == "partial"
-    assert "五维评分" in submit.last_error
+    response, validator = validate_once(repeated_rationale)
+    assert response.status.value == "partial"
+    assert "五维评分" in validator.last_error
     incomplete_framework = _topic_submission("topic-1", transcript["id"], job["id"])
     incomplete_framework["recommendedAnswer"]["framework"]["sections"] = incomplete_framework["recommendedAnswer"]["framework"]["sections"][:1]
-    assert submit.run({"review_json": json.dumps(incomplete_framework, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(incomplete_framework)[0].status.value == "partial"
     submit.topic["followUpTurns"] = [{"id": "follow-1", "interviewerQuestion": "请补充结果。", "candidateAnswer": "结果提升 20%。"}]
     missing_signal = _topic_submission("topic-1", transcript["id"], job["id"], follow_ups=["follow-1"])
-    assert submit.run({"review_json": json.dumps(missing_signal, ensure_ascii=False)}).status.value == "partial"
-    assert "面试官信号" in submit.last_error
+    response, validator = validate_once(missing_signal)
+    assert response.status.value == "partial"
+    assert "面试官信号" in validator.last_error
     submit.topic["followUpTurns"] = []
     stale = _topic_submission("topic-1", transcript["id"], job["id"])
     stale["topicVersion"] = 2
-    assert submit.run({"review_json": json.dumps(stale, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(stale)[0].status.value == "partial"
     forged = _topic_submission("topic-1", "ev-forged", job["id"])
-    assert submit.run({"review_json": json.dumps(forged, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(forged)[0].status.value == "partial"
     invalid_logic = _topic_submission("topic-1", transcript["id"], job["id"])
     invalid_logic["answerLogic"]["steps"][0]["evidenceIds"] = [job["id"]]
-    assert submit.run({"review_json": json.dumps(invalid_logic, ensure_ascii=False)}).status.value == "partial"
-    invalid_signal = _topic_submission("topic-1", transcript["id"], job["id"])
+    assert validate_once(invalid_logic)[0].status.value == "partial"
+    submit.topic["followUpTurns"] = [{"id": "follow-1", "interviewerQuestion": "请补充结果。", "candidateAnswer": "结果提升 20%。"}]
+    invalid_signal = _topic_submission("topic-1", transcript["id"], job["id"], follow_ups=["follow-1"])
     invalid_signal["interviewerSignals"] = [{
         "turnId": "topic-1", "type": "request_detail", "interpretation": "要求补充细节。",
         "confidence": "high", "evidenceIds": [transcript["id"]],
     }]
-    assert submit.run({"review_json": json.dumps(invalid_signal, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(invalid_signal)[0].status.value == "partial"
+    submit.topic["followUpTurns"] = []
     invalid_framework = _topic_submission("topic-1", transcript["id"], job["id"])
     invalid_framework["recommendedAnswer"]["framework"]["type"] = "CHAIN"
-    assert submit.run({"review_json": json.dumps(invalid_framework, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(invalid_framework)[0].status.value == "partial"
     invented_number = _topic_submission("topic-1", transcript["id"], job["id"])
     invented_number["recommendedAnswer"]["fullAnswer"] = "我推动实验后转化率提升 30%。"
-    assert submit.run({"review_json": json.dumps(invented_number, ensure_ascii=False)}).status.value == "partial"
+    assert validate_once(invented_number)[0].status.value == "partial"
 
     audit_tools, audit_submit = build_audit_agent_tools([submit.last_review], {transcript["id"]: transcript, job["id"]: job})
     assert {tool.name for tool in audit_tools} == {"GetDraftReview", "VerifyEvidence", "SubmitAudit"}
@@ -224,28 +251,105 @@ def test_custom_tools_validate_evidence_levels_audit_and_growth(settings_factory
     assert len(growth_submit.last_submission["actionItems"]) == 3
     assert [item["order"] for item in growth_submit.last_submission["actionItems"]] == [1, 2, 3]
     assert all("deliverable" not in item for item in growth_submit.last_submission["actionItems"])
+    duplicate_plan = growth_submit.run({"plan_json": "{}"})
+    assert duplicate_plan.status.value == "success"
+    assert duplicate_plan.data["locked"] is True
+
+    def validate_plan_once(payload):
+        _, validator = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
+        response = validator.run({"plan_json": json.dumps(payload, ensure_ascii=False)})
+        return response, validator
+
     legacy_plan = _growth_submission("topic-1", transcript["id"])
     for item in legacy_plan["actionItems"]:
         item["day"] = item.pop("order")
         item["deliverable"] = "旧版具体产出"
-    assert growth_submit.run({"plan_json": json.dumps(legacy_plan, ensure_ascii=False)}).status.value == "success"
-    assert [item["order"] for item in growth_submit.last_submission["actionItems"]] == [1, 2, 3]
-    assert all("day" not in item and "deliverable" not in item for item in growth_submit.last_submission["actionItems"])
+    response, legacy_submit = validate_plan_once(legacy_plan)
+    assert response.status.value == "success"
+    assert [item["order"] for item in legacy_submit.last_submission["actionItems"]] == [1, 2, 3]
+    assert all("day" not in item and "deliverable" not in item for item in legacy_submit.last_submission["actionItems"])
     duplicate_gaps = _growth_submission("topic-1", transcript["id"])
     duplicate_gaps["capabilityGaps"].append(dict(duplicate_gaps["capabilityGaps"][0]))
-    assert growth_submit.run({"plan_json": json.dumps(duplicate_gaps, ensure_ascii=False)}).status.value == "partial"
+    assert validate_plan_once(duplicate_gaps)[0].status.value == "partial"
     invalid_gap_reference = _growth_submission("topic-1", transcript["id"])
     invalid_gap_reference["actionItems"][0]["gapIds"] = ["gap-missing"]
-    assert growth_submit.run({"plan_json": json.dumps(invalid_gap_reference, ensure_ascii=False)}).status.value == "partial"
+    assert validate_plan_once(invalid_gap_reference)[0].status.value == "partial"
     too_short = _growth_submission("topic-1", transcript["id"])
     too_short["actionItems"] = too_short["actionItems"][:2]
-    assert growth_submit.run({"plan_json": json.dumps(too_short, ensure_ascii=False)}).status.value == "partial"
+    assert validate_plan_once(too_short)[0].status.value == "partial"
     nonconsecutive = _growth_submission("topic-1", transcript["id"])
     nonconsecutive["actionItems"][2]["order"] = 4
-    assert growth_submit.run({"plan_json": json.dumps(nonconsecutive, ensure_ascii=False)}).status.value == "partial"
+    assert validate_plan_once(nonconsecutive)[0].status.value == "partial"
     probability_claim = _growth_submission("topic-1", transcript["id"])
     probability_claim["overallEvaluation"]["competitiveness"] = "本场录用概率为 80%。"
-    assert growth_submit.run({"plan_json": json.dumps(probability_claim, ensure_ascii=False)}).status.value == "partial"
+    assert validate_plan_once(probability_claim)[0].status.value == "partial"
+
+    _, audit_plan_submit = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
+    audit_plan_submit.run({"plan_json": json.dumps(_growth_submission("topic-1", transcript["id"]), ensure_ascii=False)})
+    plan_artifact = {"id": "growth-artifact-1", "version": 1, "payload": {"plan": audit_plan_submit.last_submission}}
+    audit_context = {
+        "overallScores": {"overall": 6.0},
+        "topics": [{"topicId": "topic-1", "title": "项目经历", "evidenceIds": [transcript["id"]]}],
+        "evidenceCatalog": [{"evidenceId": transcript["id"], "sourceType": "transcript"}],
+    }
+    growth_audit_tools, growth_audit_submit = build_growth_audit_agent_tools(
+        plan_artifact, audit_context, {transcript["id"]: transcript, job["id"]: job},
+    )
+    assert {tool.name for tool in growth_audit_tools} == {"GetGrowthPlan", "GetGrowthAuditContext", "VerifyEvidence", "SubmitGrowthAudit"}
+    unread_growth_audit = growth_audit_submit.run({
+        "audit_json": json.dumps({"decision": "pass", "summary": "不应跳过上下文读取。", "findings": []}, ensure_ascii=False),
+    })
+    assert unread_growth_audit.status.value == "partial"
+    assert "GetGrowthPlan" in growth_audit_submit.last_error
+    assert "GetGrowthAuditContext" in growth_audit_submit.last_error
+    for tool in growth_audit_tools:
+        if tool.name in {"GetGrowthPlan", "GetGrowthAuditContext"}:
+            tool.run({})
+    accepted_growth_audit = growth_audit_submit.run({
+        "audit_json": json.dumps({"decision": "pass", "summary": "成长计划可追溯且可执行。", "findings": []}, ensure_ascii=False),
+    })
+    assert accepted_growth_audit.status.value == "success"
+    duplicate_growth_audit = growth_audit_submit.run({
+        "audit_json": json.dumps({"decision": "revise", "summary": "重复提交。", "findings": [{
+            "targetType": "capability_gap", "targetId": "missing-gap", "code": "unsupported_gap",
+            "severity": "critical", "message": "不应覆盖首次结果。", "topicIds": [], "evidenceIds": [],
+        }]}, ensure_ascii=False),
+    })
+    assert duplicate_growth_audit.status.value == "success"
+    assert duplicate_growth_audit.data["locked"] is True
+
+    invalid_growth_audit_tools, invalid_growth_audit = build_growth_audit_agent_tools(
+        plan_artifact, audit_context, {transcript["id"]: transcript},
+    )
+    for tool in invalid_growth_audit_tools:
+        if tool.name in {"GetGrowthPlan", "GetGrowthAuditContext"}:
+            tool.run({})
+    invalid_target = invalid_growth_audit.run({
+        "audit_json": json.dumps({"decision": "revise", "summary": "需要修订。", "findings": [{
+            "targetType": "capability_gap", "targetId": "missing-gap", "code": "unsupported_gap",
+            "severity": "critical", "message": "缺口不存在。", "topicIds": ["topic-1"], "evidenceIds": [transcript["id"]],
+        }]}, ensure_ascii=False),
+    })
+    assert invalid_target.status.value == "partial"
+    assert "未知缺口" in invalid_growth_audit.last_error
+
+    invalid_growth_audit_tools, invalid_growth_audit = build_growth_audit_agent_tools(
+        plan_artifact, audit_context, {transcript["id"]: transcript},
+    )
+    for tool in invalid_growth_audit_tools:
+        if tool.name in {"GetGrowthPlan", "GetGrowthAuditContext"}:
+            tool.run({})
+    empty_revision = invalid_growth_audit.run({
+        "audit_json": json.dumps({"decision": "revise", "summary": "需要修订。", "findings": []}, ensure_ascii=False),
+    })
+    assert empty_revision.status.value == "partial"
+    pass_with_critical = invalid_growth_audit.run({
+        "audit_json": json.dumps({"decision": "pass", "summary": "错误通过。", "findings": [{
+            "targetType": "overall_evaluation", "targetId": "overall-evaluation", "code": "overall_score_conflict",
+            "severity": "critical", "message": "综合评价与分数冲突。", "topicIds": ["topic-1"], "evidenceIds": [],
+        }]}, ensure_ascii=False),
+    })
+    assert pass_with_critical.status.value == "partial"
 
     _, flat_submit = build_growth_agent_tools([submit.last_review], [], KnowledgeBase(settings.knowledge_dir))
     flat_response = flat_submit.run({
@@ -300,11 +404,71 @@ def test_recommended_answer_accepts_chinese_number_normalization_and_rejects_new
 
     assert accepted.status.value == "success"
 
+    payload["recommendedAnswer"]["fullAnswer"] = (
+        "第一部分说明背景，第二部分说明行动，并从五个方面组织，区分三类状态。" + normalized_answer
+    )
+    outlined_submit = SubmitTopicReviewTool(context["topic"], submit.registry, has_jd=True)
+    outlined = outlined_submit.run({"review_json": json.dumps(payload, ensure_ascii=False)})
+    assert outlined.status.value == "success"
+
     payload["recommendedAnswer"]["fullAnswer"] += " 另一个指标达到 62%。"
-    rejected = submit.run({"review_json": json.dumps(payload, ensure_ascii=False)})
+    rejected_submit = SubmitTopicReviewTool(context["topic"], submit.registry, has_jd=True)
+    rejected = rejected_submit.run({"review_json": json.dumps(payload, ensure_ascii=False)})
 
     assert rejected.status.value == "partial"
-    assert "62%" in submit.last_error
+    assert "62%" in rejected_submit.last_error
+
+
+def test_topic_submission_normalizes_timestamp_signal_to_followup_uuid():
+    answer_id = "ev-answer"
+    question_id = "ev-follow-question"
+    job_id = "ev-job"
+    registry = {
+        answer_id: {"id": answer_id, "sourceType": "transcript", "quote": "我推动实验，转化率提升 20%。", "locator": "字符 10-30"},
+        question_id: {"id": question_id, "sourceType": "transcript", "quote": "请补充说明最终结果。", "locator": "06:23"},
+        job_id: {"id": job_id, "sourceType": "job_description", "quote": "负责实验设计和数据分析。", "locator": "字符 0-12"},
+    }
+    topic = {
+        "id": "topic-1", "version": 1, "interviewerQuestion": "请介绍项目。",
+        "followUpTurns": [{"id": "follow-1", "interviewerQuestion": "请补充说明最终结果。", "candidateAnswer": "转化率提升 20%。"}],
+    }
+    submit = SubmitTopicReviewTool(topic, registry, has_jd=True)
+    payload = _topic_submission("topic-1", answer_id, job_id, follow_ups=["follow-1"])
+    payload["interviewerSignals"] = [{
+        "turnId": "06:23", "type": "verify_data", "interpretation": "追问要求核查结果数据。",
+        "confidence": "high", "evidenceIds": [question_id],
+    }]
+
+    response = submit.run({"review_json": json.dumps(payload, ensure_ascii=False)})
+
+    assert response.status.value == "success"
+    assert submit.last_submission["interviewerSignals"][0]["turnId"] == "follow-1"
+
+
+def test_topic_submission_drops_interviewer_signals_without_followups():
+    answer_id = "ev-answer"
+    question_id = "ev-main-question"
+    job_id = "ev-job"
+    registry = {
+        answer_id: {"id": answer_id, "sourceType": "transcript", "quote": "我推动实验，转化率提升 20%。", "locator": "字符 10-30"},
+        question_id: {"id": question_id, "sourceType": "transcript", "quote": "请介绍项目。", "locator": "00:00"},
+        job_id: {"id": job_id, "sourceType": "job_description", "quote": "负责实验设计和数据分析。", "locator": "字符 0-12"},
+    }
+    submit = SubmitTopicReviewTool(
+        {"id": "topic-1", "version": 1, "interviewerQuestion": "请介绍项目。", "followUpTurns": []},
+        registry,
+        has_jd=True,
+    )
+    payload = _topic_submission("topic-1", answer_id, job_id)
+    payload["interviewerSignals"] = [{
+        "turnId": "00:00", "type": "request_detail", "interpretation": "主问题要求介绍项目。",
+        "confidence": "medium", "evidenceIds": [question_id],
+    }]
+
+    response = submit.run({"review_json": json.dumps(payload, ensure_ascii=False)})
+
+    assert response.status.value == "success"
+    assert submit.last_submission["interviewerSignals"] == []
 
 
 def test_supervisor_registers_task_and_new_domain_tools(settings_factory):
@@ -319,7 +483,8 @@ def test_supervisor_registers_task_and_new_domain_tools(settings_factory):
         registry.register_tool(tool)
     supervisor = runtime.create_supervisor(registry)
     names = set(registry.list_tools())
-    assert {"KnowledgeSearch", "EvidenceLookup", "Score", "WebVerify", "SubmitTopicReview", "Task"}.issubset(names)
+    assert {"KnowledgeSearch", "EvidenceLookup", "WebVerify", "SubmitTopicReview", "Task"}.issubset(names)
+    assert "Score" not in names
     assert supervisor.__class__.__name__ == "PlanSolveAgent"
 
 

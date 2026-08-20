@@ -4,6 +4,7 @@ import json
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,22 @@ ASSESSMENT_REASON_RULES = {
         ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN,
     ),
 }
+
+
+# Dialogue workers can be conservative about parent relationships, especially
+# after clean speaker-labelled lines have been merged into complete utterances.
+# These rules only repair obvious continuation questions; standalone topic
+# openers remain main questions and ambiguous cases stay with the Agent result.
+LOCAL_FOLLOW_UP_REFERENCE_RE = re.compile(
+    r"(?:你刚才|刚才(?:提到|说到)|你(?:前面|上面)提到|你提到|前面(?:提到|说到)|"
+    r"这个(?:场景|问题|项目|方案|能力|助手|指标|结果)|这些|其中|上述|"
+    r"模型效果提升以后|你和[^？?]{0,24}有没有)"
+)
+LOCAL_FOLLOW_UP_DETAIL_RE = re.compile(r"^(?:那么|那|再|具体|进一步|为什么|如何|怎么|最终|结果)")
+LOCAL_MAIN_QUESTION_RE = re.compile(
+    r"^(?:先请|请(?:你)?(?:用.{0,8})?做.{0,6}自我介绍|介绍一下|请完整|请讲一个|讲一次|"
+    r"假设|现在让你|最后一个问题|最后请|企业场景)"
+)
 
 
 class ParsePipelineContext:
@@ -182,9 +199,16 @@ class ParsePipelineContext:
         agent_error = ""
         if self.settings.real_agent_enabled:
             try:
-                agent_segments = self._build_agent_utterances()
-                if agent_segments:
-                    self.segments = agent_segments
+                if self._needs_agent_utterances():
+                    agent_segments = self._build_agent_utterances()
+                    if agent_segments:
+                        self.segments = agent_segments
+                else:
+                    self.workflow.tool_event(self.parse_run_id, "LocalUtterancesReused", {
+                        "profileType": self.profile.profile_type if self.profile else "unknown",
+                        "atomCount": len(self.atoms),
+                        "segmentCount": len(self.segments),
+                    })
                 cards = self._build_agent_cards()
             except (ValueError, ValidationError, TypeError) as exc:
                 agent_error = str(exc)
@@ -203,12 +227,15 @@ class ParsePipelineContext:
         self._write_json("questions.json", cards)
         atom_chunks = len(chunk_atoms(self.atoms)) if self.profile and self.profile.profile_type == "raw_stream" else 1
         dialogue_chunks = len(chunk_utterances(self.segments))
+        dialogue_concurrency = max(1, min(int(self.settings.parse_worker_concurrency), dialogue_chunks))
         self.workflow.tool_event(self.parse_run_id, "TranscriptStructuring", {
             "atomChunkCount": atom_chunks, "dialogueChunkCount": dialogue_chunks, "questionCount": len(cards),
+            "dialogueConcurrency": dialogue_concurrency,
             "validationErrors": len(errors), "agentFallback": bool(agent_error),
         })
         return {
             "artifactId": self.parse_run_id, "atomChunkCount": atom_chunks, "dialogueChunkCount": dialogue_chunks,
+            "dialogueConcurrency": dialogue_concurrency,
             "questionCount": len(cards), "validationErrors": errors[:10], "agentFallback": bool(agent_error),
         }
 
@@ -234,14 +261,19 @@ class ParsePipelineContext:
             if not first_payload:
                 continue
             selected_payload, unresolved = first_payload, False
-            if self.profile.profile_type == "raw_stream":
+            first_batch = self._valid_utterance_batch(first_payload, chunk)
+            if self.profile.profile_type == "raw_stream" and not self._utterance_batch_is_confident(first_batch):
                 second_payload = self.runtime.run_utterance_worker(chunk, "speaker_first", core_start)
-                if second_payload and self._utterance_signature(first_payload) != self._utterance_signature(second_payload):
+                second_batch = self._valid_utterance_batch(second_payload, chunk) if second_payload else None
+                if first_batch is None and second_batch is not None:
+                    selected_payload, first_batch = second_payload, second_batch
+                elif second_batch is not None and self._utterance_signature(first_payload) != self._utterance_signature(second_payload):
                     audit = self.runtime.run_parse_auditor(first_payload, second_payload) or {}
                     selection = audit.get("selected")
                     selected_payload = second_payload if selection == "speaker_first" else first_payload
                     unresolved = selection not in {"boundary_first", "speaker_first"}
-            batch = UtteranceBatch.model_validate(selected_payload)
+                    first_batch = second_batch if selection == "speaker_first" else first_batch
+            batch = first_batch or UtteranceBatch.model_validate(selected_payload)
             self._validate_assessment_atoms(batch.model_dump(mode="json"), {item["id"] for item in chunk})
             converted = utterances_from_submission(batch, chunk, self.raw_source, self.profile)
             for utterance in converted:
@@ -265,12 +297,49 @@ class ParsePipelineContext:
             item["ordinal"] = index
         return result
 
+    def _needs_agent_utterances(self) -> bool:
+        if not self.profile:
+            return False
+        if self.profile.profile_type == "labeled_lines" and self.profile.speaker_label_coverage >= 0.8:
+            return False
+        if self.profile.profile_type == "audio":
+            usable = [item for item in self.segments if not item.get("excluded")]
+            known = [item for item in usable if item.get("speakerRole") in {"interviewer", "candidate"}]
+            average = sum(float(item.get("speakerConfidence") or item.get("confidence") or 0) for item in usable) / max(1, len(usable))
+            if usable and len(known) / len(usable) >= 0.9 and average >= 0.75:
+                return False
+        return True
+
+    def _valid_utterance_batch(self, payload: dict[str, Any] | None, atoms: list[dict[str, Any]]) -> UtteranceBatch | None:
+        if not payload:
+            return None
+        try:
+            batch = UtteranceBatch.model_validate(payload)
+            self._validate_assessment_atoms(batch.model_dump(mode="json"), {item["id"] for item in atoms})
+        except (ValidationError, ValueError, TypeError):
+            return None
+        allowed = {item["id"] for item in atoms}
+        referenced = {atom_id for item in batch.utterances for atom_id in item.atom_ids}
+        return batch if referenced and referenced.issubset(allowed) else None
+
+    @staticmethod
+    def _utterance_batch_is_confident(batch: UtteranceBatch | None) -> bool:
+        if batch is None or not batch.utterances:
+            return False
+        uncertain = sum(item.speaker_role == "unknown" for item in batch.utterances)
+        scores = [
+            min(item.speaker_assessment.score, item.boundary_assessment.score)
+            for item in batch.utterances
+        ]
+        return uncertain / len(batch.utterances) <= 0.1 and min(scores) >= 80
+
     def _build_agent_cards(self) -> list[dict[str, Any]]:
         utterance_map = {item["id"]: item for item in self.segments}
         atom_ids = {item["id"] for item in self.atoms}
         submissions: dict[tuple[str, ...], Any] = {}
         conflicts: set[tuple[str, ...]] = set()
-        for chunk in chunk_utterances(self.segments):
+
+        def process_chunk(chunk: list[dict[str, Any]]) -> QuestionTurnBatch:
             payload = None
             last_error: Exception | None = None
             for _ in range(2):
@@ -285,27 +354,47 @@ class ParsePipelineContext:
                     for turn in batch.question_turns:
                         if any(item not in allowed for item in [*turn.question_utterance_ids, *turn.answer_utterance_ids]):
                             raise ValueError("DIALOGUE_UNKNOWN_UTTERANCE")
-                    for turn in batch.question_turns:
-                        signature = tuple(turn.question_utterance_ids)
-                        existing = submissions.get(signature)
-                        if existing and existing.model_dump() != turn.model_dump():
-                            conflicts.add(signature)
-                        else:
-                            submissions.setdefault(signature, turn)
                     last_error = None
-                    break
+                    return batch
                 except (ValidationError, ValueError) as exc:
                     last_error = exc
             if last_error:
                 raise last_error
+            raise ValueError("EMPTY_DIALOGUE_SUBMISSION")
+
+        chunks = chunk_utterances(self.segments)
+        concurrency = max(1, min(int(self.settings.parse_worker_concurrency), len(chunks)))
+        batches: dict[int, QuestionTurnBatch] = {}
+        if concurrency == 1:
+            for index, chunk in enumerate(chunks):
+                batches[index] = process_chunk(chunk)
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="offer-radar-parse") as executor:
+                futures = {executor.submit(process_chunk, chunk): index for index, chunk in enumerate(chunks)}
+                for future in as_completed(futures):
+                    batches[futures[future]] = future.result()
+
+        for index in range(len(chunks)):
+            for turn in batches[index].question_turns:
+                signature = tuple(turn.question_utterance_ids)
+                existing = submissions.get(signature)
+                if not existing:
+                    submissions.setdefault(signature, turn)
+                    continue
+                if self._dialogue_turn_structure(existing) != self._dialogue_turn_structure(turn):
+                    conflicts.add(signature)
+                if self._dialogue_turn_rank(turn) > self._dialogue_turn_rank(existing):
+                    submissions[signature] = turn
         ordered = sorted(submissions.items(), key=lambda item: utterance_map[item[0][0]]["ordinal"])
         cards: list[dict[str, Any]] = []
         roots_by_anchor: dict[str, dict[str, Any]] = {}
+        last_root: dict[str, Any] | None = None
         for signature, turn in ordered:
             q_segments = [utterance_map[item] for item in turn.question_utterance_ids]
             a_segments = [utterance_map[item] for item in turn.answer_utterance_ids]
             question_text = "\n".join(item["rawText"] for item in q_segments).strip()
             answer_text = "\n".join(item["rawText"] for item in a_segments).strip()
+            question_type = normalize_question_type(turn.question_type, question_text)
             speaker = self._speaker_assessment([*q_segments, *a_segments])
             assessments = {
                 "speaker": speaker,
@@ -324,14 +413,31 @@ class ParsePipelineContext:
                 hard_reasons.append(ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT)
             parent = roots_by_anchor.get(turn.parent_question_anchor or "")
             is_follow_up = turn.turn_type == "follow_up" and bool(parent)
-            if turn.turn_type == "follow_up" and not parent:
+            local_follow_up_score = self._local_follow_up_score(
+                question_text,
+                question_type,
+                turn.topic_title,
+                last_root,
+            )
+            if not is_follow_up and last_root and local_follow_up_score is not None:
+                parent = last_root
+                is_follow_up = True
+                question_atom_ids = [atom_id for item in q_segments for atom_id in item.get("atomIds", [])]
+                assessments["followUp"] = ConfidenceAssessment(
+                    score=local_follow_up_score,
+                    reason_codes=[],
+                    evidence_atom_ids=question_atom_ids,
+                    summary="根据问题中的上下文指代和主题连续性归入最近主问题",
+                )
+            elif turn.turn_type == "follow_up" and not parent:
                 hard_reasons.append(ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN)
-            confidence = calculate_turn_confidence(turn.turn_type, assessments, self.profile.source_quality, hard_reasons=hard_reasons)
+            effective_turn_type = "follow_up" if is_follow_up else "main"
+            confidence = calculate_turn_confidence(effective_turn_type, assessments, self.profile.source_quality, hard_reasons=hard_reasons)
             question_id = str(uuid.uuid4())
             topic_title = parent["title"] if is_follow_up else turn.topic_title or infer_topic_title(question_text, turn.question_type)
             card = {
                 "id": question_id, "order": q_segments[0]["ordinal"], "interviewerQuestion": question_text,
-                "candidateAnswer": answer_text, "questionType": normalize_question_type(turn.question_type, question_text),
+                "candidateAnswer": answer_text, "questionType": question_type,
                 "initialDiagnosis": [], "confirmed": False, "version": 1,
                 "topicRootId": parent["id"] if is_follow_up else question_id,
                 "parentQuestionId": parent["id"] if is_follow_up else None,
@@ -343,7 +449,13 @@ class ParsePipelineContext:
             }
             cards.append(card)
             if not is_follow_up:
-                roots_by_anchor[turn.question_utterance_ids[0]] = {"id": question_id, "title": topic_title}
+                last_root = {
+                    "id": question_id,
+                    "title": topic_title,
+                    "questionType": question_type,
+                    "questionText": question_text,
+                }
+                roots_by_anchor[turn.question_utterance_ids[0]] = last_root
         return cards
 
     def _sanitize_dialogue_payload(self, payload: dict[str, Any], utterances: list[dict[str, Any]]) -> dict[str, Any]:
@@ -520,6 +632,60 @@ class ParsePipelineContext:
     @staticmethod
     def _utterance_signature(payload: dict[str, Any]) -> tuple[Any, ...]:
         return tuple((tuple(item.get("atom_ids", [])), item.get("speaker_role")) for item in payload.get("utterances", []))
+
+    @staticmethod
+    def _dialogue_turn_structure(turn: Any) -> tuple[Any, ...]:
+        return (
+            tuple(turn.answer_utterance_ids),
+            turn.turn_type,
+            turn.parent_question_anchor or "",
+        )
+
+    @staticmethod
+    def _dialogue_turn_rank(turn: Any) -> tuple[Any, ...]:
+        assessments = [
+            turn.question_boundary_assessment,
+            turn.answer_boundary_assessment,
+            turn.qa_pairing_assessment,
+            turn.question_type_assessment,
+            turn.topic_grouping_assessment,
+        ]
+        if turn.follow_up_assessment:
+            assessments.append(turn.follow_up_assessment)
+        average = sum(item.score for item in assessments) / max(1, len(assessments))
+        return (bool(turn.answer_utterance_ids), average, len(turn.answer_utterance_ids))
+
+    @staticmethod
+    def _local_follow_up_score(
+        question_text: str,
+        question_type: str,
+        topic_title: str,
+        last_root: dict[str, Any] | None,
+    ) -> int | None:
+        """Return a confidence score only for locally explainable continuations."""
+        if not last_root:
+            return None
+        compact = re.sub(r"\s+", "", question_text)
+        if not compact or LOCAL_MAIN_QUESTION_RE.search(compact):
+            return None
+        if LOCAL_FOLLOW_UP_REFERENCE_RE.search(compact):
+            return 90
+        if not LOCAL_FOLLOW_UP_DETAIL_RE.search(compact):
+            return None
+        if question_type == last_root.get("questionType"):
+            return 84
+
+        current_ascii = set(re.findall(r"[a-z][a-z0-9_-]{1,}", f"{question_text} {topic_title}".lower()))
+        root_ascii = set(
+            re.findall(
+                r"[a-z][a-z0-9_-]{1,}",
+                f"{last_root.get('questionText', '')} {last_root.get('title', '')}".lower(),
+            )
+        )
+        generic = {"ai", "agent", "mvp", "pm"}
+        if (current_ascii & root_ascii) - generic:
+            return 87
+        return None
 
     @staticmethod
     def _has_reason(item: dict[str, Any], code: ConfirmationReasonCode) -> bool:

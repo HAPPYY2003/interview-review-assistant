@@ -12,7 +12,7 @@ import {
 
 const app = document.querySelector("#app");
 const STORAGE_KEY = "offer-radar-agent-v1";
-const REPORT_SCHEMA_VERSION = 2;
+const REPORT_SCHEMA_VERSION = 3;
 const QUESTION_TYPES = ["自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"];
 const REVIEW_TEMPLATE_PLACEHOLDERS = new Set([
   "综合诊断", "至少两个字的判断依据", "至少两个字的追问判断", "有证据的优点", "有证据的问题",
@@ -24,6 +24,7 @@ const EVENT_TYPES = [
   "TOPIC_ANALYSIS_STARTED", "TOPIC_ANALYSIS_COMPLETED", "SUBMISSION_REJECTED", "CHECKPOINT_SAVED",
   "AUDIT_STARTED", "AUDIT_COMPLETED", "AUDIT_RECOVERY_STARTED", "REVISION_REQUIRED", "TOPIC_REVISION_COMPLETED",
   "GROWTH_PLAN_COMPLETED", "GROWTH_TIMEOUT_RECOVERY", "AGENT_STARTED", "AGENT_FINISHED", "RUN_RESUMED", "FALLBACK_REQUESTED",
+  "GROWTH_AUDIT_STARTED", "GROWTH_AUDIT_COMPLETED", "GROWTH_REVISION_REQUIRED", "GROWTH_PLAN_REVISED", "GROWTH_AUDIT_ROUND_RETRY",
   "TOOL_STARTED", "TOOL_FINISHED", "AGENT_HEARTBEAT", "AGENT_TIMEOUT",
   "AGENT_RUNTIME_FAILED", "SUBMISSION_MISSING", "MODEL_JSON_AUTO_SUBMIT_SKIPPED",
   "FALLBACK_STARTED", "RUN_FINISHED", "RUN_FAILED"
@@ -44,6 +45,7 @@ const PHASE_LABELS = {
   evidence_review: "证据诊断",
   reflection_audit: "反思审计",
   growth_plan: "成长计划",
+  growth_audit: "成长计划终审",
   fallback: "生成降级报告",
   completed: "复盘完成",
   failed: "执行失败",
@@ -60,11 +62,12 @@ const PARSE_PHASE_LABELS = {
   failed: "解析失败"
 };
 const AGENT_LABELS = {
-  Supervisor: "PlanSolve 复盘主管",
-  "ReActAgent ParseAgent": "ReAct 材料解析主管",
-  EvidenceAnalyst: "ReAct 证据分析师",
-  QualityAuditor: "Reflection 质量审计员",
-  GrowthPlanner: "PlanSolve 成长教练"
+  Supervisor: "复盘主管",
+  "ReActAgent ParseAgent": "材料解析",
+  EvidenceAnalyst: "证据分析",
+  QualityAuditor: "逐题质量审计",
+  GrowthPlanner: "成长计划",
+  GrowthPlanAuditor: "成长计划终审"
 };
 const CONFIRMATION_REASON_LABELS = {
   QUESTION_BOUNDARY_UNCERTAIN: "问题边界不明确",
@@ -89,12 +92,17 @@ const EVENT_LABELS = {
   TOPIC_ANALYSIS_COMPLETED: "主题分析完成",
   SUBMISSION_REJECTED: "结构化提交被拒",
   CHECKPOINT_SAVED: "检查点已保存",
-  AUDIT_STARTED: "Reflection 审计开始",
-  AUDIT_COMPLETED: "Reflection 审计完成",
+  AUDIT_STARTED: "逐题审计开始",
+  AUDIT_COMPLETED: "逐题审计完成",
   AUDIT_RECOVERY_STARTED: "审计恢复开始",
   REVISION_REQUIRED: "主题需要修订",
   TOPIC_REVISION_COMPLETED: "主题修订完成",
   GROWTH_PLAN_COMPLETED: "成长计划完成",
+  GROWTH_AUDIT_STARTED: "成长计划终审开始",
+  GROWTH_AUDIT_COMPLETED: "成长计划终审完成",
+  GROWTH_REVISION_REQUIRED: "成长计划需要修订",
+  GROWTH_PLAN_REVISED: "成长计划修订完成",
+  GROWTH_AUDIT_ROUND_RETRY: "成长计划终审继续执行",
   AGENT_STARTED: "Agent 开始执行",
   AGENT_FINISHED: "Agent 执行结束",
   TOOL_STARTED: "工具开始执行",
@@ -200,7 +208,10 @@ async function loadRouteData() {
       record.phase = run.phase;
       record.status = run.status === "COMPLETED" ? "waiting_confirmation" : run.status === "FAILED" ? "failed" : "parsing";
       if (run.status === "COMPLETED") await loadParseResult(record);
-      if (run.status === "FAILED") record.parseError = run.error || "解析失败";
+      if (run.status === "FAILED") {
+        record.failureSource = "parse";
+        record.parseError = run.error || "解析失败";
+      }
       saveRecord(record);
     } catch (error) {
       state.error = readableError(error);
@@ -217,6 +228,7 @@ async function loadRouteData() {
       record.degraded = Boolean(run.degraded);
       record.runError = run.error || "";
       record.failureCode = run.failure_code || "";
+      record.failureSource = run.status === "FAILED" ? "review" : "";
       record.agentArtifacts = run.artifacts || [];
       saveRecord(record);
       if (run.status === "COMPLETED" && !record.report) await loadReport(record);
@@ -254,7 +266,7 @@ function render() {
   app.innerHTML = `
     <div class="app-shell">
       ${renderSidebar()}
-      <main class="main">${state.error ? `<div class="error">${escapeHtml(state.error)}</div>` : ""}${renderRoute()}</main>
+      <main class="main">${state.error ? `<div class="error-message">${escapeHtml(state.error)}</div>` : ""}${renderRoute()}</main>
     </div>
     <div class="toast-host" id="toastHost"></div>`;
   bindCommonEvents();
@@ -327,8 +339,9 @@ function renderHomePage() {
 }
 
 function renderRecordRow(record) {
-  const route = record.status === "completed" ? `#/review/${record.id}` : ["reviewing", "auditing"].includes(record.status) && record.runId ? `#/run/${record.id}/${record.runId}` : `#/parse/${record.id}${record.report ? "?from=report" : ""}`;
-  const primaryActionLabel = record.status === "completed" ? "查看报告" : "继续复盘";
+  const failedReview = isFailedReviewRecord(record);
+  const route = recordDestination(record);
+  const primaryActionLabel = record.status === "completed" ? "查看报告" : failedReview ? "查看失败原因" : "继续复盘";
   const primaryActionIcon = record.status === "completed" ? "file-text" : "arrow-right";
   const interviewDate = record.interviewDate || "未填写日期";
   const reportGeneratedAt = record.report?.interview?.latestAIMetadata?.generatedAt;
@@ -345,6 +358,21 @@ function renderRecordRow(record) {
   </div>`;
 }
 
+function isFailedReviewRecord(record) {
+  if (String(record.status).toLowerCase() !== "failed" || !record.runId) return false;
+  if (record.failureSource) return record.failureSource === "review";
+  return !record.parseError;
+}
+
+function recordDestination(record) {
+  const status = String(record.status || "draft").toLowerCase();
+  if (status === "completed") return `#/review/${record.id}`;
+  if (record.runId && (["reviewing", "auditing"].includes(status) || isFailedReviewRecord(record))) {
+    return `#/run/${record.id}/${record.runId}`;
+  }
+  return `#/parse/${record.id}${record.report ? "?from=report" : ""}`;
+}
+
 function renderLucideIcon(name) {
   const paths = {
     "arrow-right": '<path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path>',
@@ -352,11 +380,13 @@ function renderLucideIcon(name) {
     "check": '<path d="M20 6 9 17l-5-5"></path>',
     "chevron-down": '<path d="m6 9 6 6 6-6"></path>',
     "chevron-up": '<path d="m18 15-6-6-6 6"></path>',
+    "circle": '<circle cx="12" cy="12" r="9"></circle>',
     "circle-check": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><path d="m9 11 3 3L22 4"></path>',
     "file-text": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" x2="16" y1="13" y2="13"></line><line x1="8" x2="16" y1="17" y2="17"></line>',
     "plus": '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
     "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.34-6.36L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.34 6.36L21 16"></path><path d="M16 16h5v5"></path>',
     "locate-fixed": '<line x1="2" x2="5" y1="12" y2="12"></line><line x1="19" x2="22" y1="12" y2="12"></line><line x1="12" x2="12" y1="2" y2="5"></line><line x1="12" x2="12" y1="19" y2="22"></line><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle>',
+    "loader-circle": '<path d="M21 12a9 9 0 1 1-6.22-8.56"></path>',
     "git-merge": '<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M6 21V9a9 9 0 0 0 9 9"></path>',
     "pencil": '<path d="M21.17 6.17 17.83 2.83a2.83 2.83 0 0 0-4 0L3 13.66V21h7.34L21.17 10.17a2.83 2.83 0 0 0 0-4Z"></path><path d="m12.5 4.5 7 7"></path>',
     "settings-2": '<path d="M20 7h-9"></path><path d="M14 17H5"></path><circle cx="17" cy="17" r="3"></circle><circle cx="7" cy="7" r="3"></circle>',
@@ -530,7 +560,7 @@ function renderParseProgress(record) {
       const status = record.status === "failed" && phase === record.phase ? "failed" : current > index || record.phase === "completed" ? "done" : current === index ? "active" : "pending";
       return `<div class="parse-stage ${status}"><span class="parse-stage-index">${status === "done" ? "✓" : index + 1}</span><div><strong>${PARSE_PHASE_LABELS[phase]}</strong><span>${skipped ? "文字来源自动跳过" : status === "active" ? "正在处理" : status === "done" ? "已完成" : "等待中"}</span></div></div>`;
     }).join("")}</div>
-    ${record.parseError ? `<div class="error">${escapeHtml(record.parseError)}</div>` : ""}
+    ${record.parseError ? `<div class="error-message">${escapeHtml(record.parseError)}</div>` : ""}
     <section class="surface agent-timeline"><div class="section-title">解析轨迹</div>${record.parseEvents?.length ? record.parseEvents.map(renderEvent).join("") : `<div class="empty"><div class="empty-title">等待 ParseAgent 事件</div><p>这里只显示阶段、工具、数量和错误，不展示模型隐藏思考。</p></div>`}</section>
   </section>`;
 }
@@ -668,8 +698,8 @@ function renderReviewDialog(record, reviewedCount, unresolvedCount) {
       <button type="button" class="icon-button" data-close-review-dialog aria-label="关闭复盘设置">${renderLucideIcon("x")}</button>
     </div>
     <div class="review-dialog-body">
-      ${state.error ? `<div class="error review-dialog-error">${escapeHtml(state.error)}</div>` : ""}
-      ${reportContractReady ? "" : `<div class="error review-dialog-error"><strong>后端仍在运行旧版报告协议</strong><span>请重启本地服务并刷新页面，再开始复盘，避免生成缺少结构化字段的报告。</span></div>`}
+      ${state.error ? `<div class="error-message review-dialog-error">${escapeHtml(state.error)}</div>` : ""}
+      ${reportContractReady ? "" : `<div class="error-message review-dialog-error"><strong>后端仍在运行旧版报告协议</strong><span>请重启本地服务并刷新页面，再开始复盘，避免生成缺少结构化字段的报告。</span></div>`}
       ${directReportRerun ? `<p class="review-dialog-context">将基于当前题卡重新运行 Agent，生成新的复盘报告。原报告记录仍会保留。</p>` : ""}
       <div class="review-dialog-status ${requiresAcknowledgement ? "warning" : "success"}">
         <span class="review-dialog-status-icon" aria-hidden="true">${requiresAcknowledgement ? "!" : renderLucideIcon("circle-check")}</span>
@@ -862,41 +892,109 @@ function renderRunPage() {
   const phase = record.phase || "queued";
   const terminal = ["completed", "failed", "cancelled"].includes(record.status);
   const progress = record.runProgress || {};
+  const checkpoint = progress.checkpoint || {};
   const completedTopics = Number(progress.completedTopics || progress.checkpoint?.completedTopicIds?.length || 0);
   const totalTopics = Number(record.topics?.length || record.questionCount || 0);
-  const auditRound = Number(progress.auditRound || 0);
+  const latestAuditEvent = [...state.events].reverse().find(item => ["AUDIT_STARTED", "AUDIT_COMPLETED"].includes(item.type));
+  const latestGrowthAuditEvent = [...state.events].reverse().find(item => ["GROWTH_AUDIT_STARTED", "GROWTH_AUDIT_COMPLETED"].includes(item.type));
+  const latestGrowthAuditCompleted = [...state.events].reverse().find(item => item.type === "GROWTH_AUDIT_COMPLETED");
+  const auditRound = Math.max(Number(progress.auditRound || checkpoint.auditRound || 0), Number(latestAuditEvent?.data?.round || 0));
   const revisionCount = Number(progress.revisionCount || 0);
-  const checkpoint = progress.checkpoint || {};
+  const growthAuditRound = Math.max(Number(progress.growthAuditRound || checkpoint.growthAuditRound || 0), Number(latestGrowthAuditEvent?.data?.round || 0));
+  const growthRevisionCount = Number(progress.growthRevisionCount || checkpoint.growthRevisionCount || 0);
+  const growthWarningCount = Number(latestGrowthAuditCompleted?.data?.warningCount || 0);
+  const lastGrowthRevisionRequest = state.events.reduce((latest, item, index) => item.type === "GROWTH_REVISION_REQUIRED" ? index : latest, -1);
+  const lastGrowthRevision = state.events.reduce((latest, item, index) => item.type === "GROWTH_PLAN_REVISED" ? index : latest, -1);
+  const growthRevisionPending = lastGrowthRevisionRequest > lastGrowthRevision;
   const modeLabel = record.agentMode === "fixture" ? "演示模式" : record.degraded ? "确定性降级" : "实时 Agent";
   const modeClass = record.agentMode === "fixture" ? "fixture" : record.degraded ? "degraded" : "live";
-  let stageStatus = {};
-  if (record.status === "failed") {
-    const evidenceComplete = Boolean(checkpoint.evidenceComplete) || (totalTopics > 0 && completedTopics >= totalTopics);
-    const auditAccepted = Boolean(checkpoint.auditAccepted);
-    stageStatus = {
-      evidence_review: evidenceComplete ? "done" : "error",
-      reflection_audit: !evidenceComplete ? "pending" : auditAccepted ? "done" : "error",
-      growth_plan: !auditAccepted ? "pending" : "error"
-    };
+  const stageKeys = ["evidence_review", "reflection_audit", "growth_plan", "growth_audit"];
+  const stageTitles = {
+    evidence_review: "证据诊断",
+    reflection_audit: "逐题质量审计",
+    growth_plan: "成长计划",
+    growth_audit: "成长计划终审"
+  };
+  const evidenceComplete = Boolean(checkpoint.evidenceComplete) || (totalTopics > 0 && completedTopics >= totalTopics);
+  const auditAccepted = Boolean(checkpoint.auditAccepted);
+  const growthComplete = Boolean(checkpoint.growthComplete);
+  const growthAuditAccepted = Boolean(progress.growthAuditAccepted || checkpoint.growthAuditAccepted);
+  const stageStatus = {
+    evidence_review: evidenceComplete ? "done" : "pending",
+    reflection_audit: auditAccepted ? "done" : "pending",
+    growth_plan: growthComplete ? "done" : "pending",
+    growth_audit: growthAuditAccepted ? "done" : "pending"
+  };
+  if (record.status === "completed") {
+    stageKeys.forEach(key => { stageStatus[key] = "done"; });
+  } else if (record.status === "failed") {
+    const failedKey = stageKeys.includes(phase) ? phase : stageKeys.find(key => stageStatus[key] !== "done");
+    if (failedKey) stageStatus[failedKey] = "error";
+  } else if (stageKeys.includes(phase)) {
+    stageStatus[phase] = "active";
+  } else if (["resuming", "fallback"].includes(phase)) {
+    const resumedKey = stageKeys.find(key => stageStatus[key] !== "done");
+    if (resumedKey) stageStatus[resumedKey] = "active";
   }
-  const growthDetail = checkpoint.growthComplete
-    ? "下一步行动计划已提交"
-    : record.status === "failed" && phase === "growth_plan"
-      ? (record.failureCode === "AGENT_TIMEOUT" ? "执行超时，可从检查点恢复" : "提交失败，可从检查点恢复")
-      : checkpoint.auditAccepted
-        ? "已完成审计，等待生成计划"
-        : "等待质量审计";
+
+  const evidenceDetail = stageStatus.evidence_review === "error"
+    ? `${completedTopics}/${totalTopics} 主题 · 执行失败`
+    : `${completedTopics}/${totalTopics} 主题`;
+  const auditDetail = stageStatus.reflection_audit === "pending"
+    ? "等待中"
+    : stageStatus.reflection_audit === "active"
+      ? `第 ${auditRound || 1} 轮审计中${revisionCount ? ` · 已修订 ${revisionCount} 次` : ""}`
+      : stageStatus.reflection_audit === "error"
+        ? `第 ${auditRound || 1} 轮审计失败 · 可恢复`
+        : `${auditRound || 1} 轮通过${revisionCount ? ` · 修订 ${revisionCount} 次` : ""}`;
+  const growthDetail = stageStatus.growth_plan === "pending"
+    ? "等待中"
+    : stageStatus.growth_plan === "active"
+      ? (growthRevisionPending || growthAuditRound > 0 ? "根据审计意见修订中" : "生成中")
+      : stageStatus.growth_plan === "error"
+        ? `${growthRevisionPending ? "修订" : "生成"}失败 · 可恢复`
+        : growthRevisionCount ? `已修订 ${growthRevisionCount} 次` : "已生成";
+  const growthAuditDetail = stageStatus.growth_audit === "pending"
+    ? "等待中"
+    : stageStatus.growth_audit === "active"
+      ? `第 ${growthAuditRound || 1} 轮终审中`
+      : stageStatus.growth_audit === "error"
+        ? `第 ${growthAuditRound || 1} 轮终审未通过 · 可恢复`
+        : `${growthAuditRound || 1} 轮通过${growthWarningCount ? ` · ${growthWarningCount} 条提醒` : ""}`;
+
+  const evidenceRatio = totalTopics > 0 ? Math.min(1, completedTopics / totalTopics) : 0;
+  let overallProgress = Math.round(evidenceRatio * 55);
+  if (stageStatus.evidence_review === "done") overallProgress = 55;
+  if (["active", "error"].includes(stageStatus.reflection_audit)) overallProgress = 55 + (auditRound > 1 ? 16 : 8);
+  if (stageStatus.reflection_audit === "done") overallProgress = 75;
+  if (["active", "error"].includes(stageStatus.growth_plan)) overallProgress = 82;
+  if (stageStatus.growth_plan === "done") overallProgress = 90;
+  if (["active", "error"].includes(stageStatus.growth_audit)) overallProgress = 90 + (growthAuditRound > 1 ? 8 : 4);
+  if (stageStatus.growth_audit === "done") overallProgress = 100;
+  const currentStageKey = stageKeys.find(key => ["active", "error"].includes(stageStatus[key]));
+  const currentStageLabel = record.status === "completed"
+    ? "复盘已完成"
+    : currentStageKey
+      ? `${stageTitles[currentStageKey]}${stageStatus[currentStageKey] === "error" ? "未完成" : ""}`
+      : "准备开始";
   return `
     <section class="page">
       ${renderSteps(3)}
       <div class="page-header"><div><span class="eyebrow">AGENT WORKFLOW</span><h1 class="page-title">多 Agent 正在复盘</h1><p class="page-desc">${escapeHtml(record.company)} · ${escapeHtml(record.position)} · ${escapeHtml(PHASE_LABELS[phase] || phase)}</p></div><div class="run-header-actions">${record.status === "failed" ? `<button class="button secondary" id="fallbackRun">生成降级报告</button><button class="button" id="resumeRun">从检查点恢复</button>` : terminal && record.status === "completed" ? `<button class="button" id="openReport">查看报告</button>` : `<span class="live-indicator"><span></span>实时执行</span>`}</div></div>
-      <div class="agent-run-summary"><span class="agent-mode-mark ${modeClass}">${escapeHtml(modeLabel)}</span><div><strong>${completedTopics}/${totalTopics} 个主题已提交</strong><span>Reflection 审计 ${auditRound}/2 轮 · 已修订 ${revisionCount} 次</span></div></div>
-      ${record.status === "failed" ? `<div class="run-failure"><strong>${escapeHtml(record.failureCode || "AGENT_FAILED")}</strong><span>${escapeHtml(publicRuntimeText(record.runError || "Agent 阶段未完成，可从最近检查点恢复或主动生成降级报告。"))}</span></div>` : ""}
-      <div class="agent-stage-grid">
-        ${agentStage("evidence_review", "ReAct", "证据诊断", phase, `${completedTopics}/${totalTopics} 个主题`, stageStatus.evidence_review)}
-        ${agentStage("reflection_audit", "Reflection", "质量审计", phase, `${auditRound}/2 轮 · ${revisionCount} 次修订`, stageStatus.reflection_audit)}
-        ${agentStage("growth_plan", "PlanSolve", "成长计划", phase, growthDetail, stageStatus.growth_plan)}
+      <div class="agent-run-summary" aria-label="复盘执行进度">
+        <div class="run-progress-heading">
+          <div class="run-progress-current"><span class="agent-mode-mark ${modeClass}">${escapeHtml(modeLabel)}</span><div><span>当前阶段</span><strong>${escapeHtml(currentStageLabel)}</strong></div></div>
+          <div class="run-progress-total"><span>流程完成度</span><strong>${overallProgress}%</strong></div>
+        </div>
+        <div class="run-progress-track" role="progressbar" aria-label="复盘流程完成度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallProgress}"><span style="width:${overallProgress}%"></span></div>
+        <div class="agent-stage-grid" role="list" aria-label="复盘阶段">
+          ${agentStage("证据诊断", evidenceDetail, stageStatus.evidence_review)}
+          ${agentStage("逐题质量审计", auditDetail, stageStatus.reflection_audit)}
+          ${agentStage("成长计划", growthDetail, stageStatus.growth_plan)}
+          ${agentStage("成长计划终审", growthAuditDetail, stageStatus.growth_audit)}
+        </div>
       </div>
+      ${record.status === "failed" ? `<div class="run-failure"><strong>${escapeHtml(record.failureCode || "AGENT_FAILED")}</strong><span>${escapeHtml(publicRuntimeText(record.runError || "Agent 阶段未完成，可从最近检查点恢复或主动生成降级报告。"))}</span></div>` : ""}
       <section class="surface agent-timeline">
         <div class="section-title">执行轨迹</div>
         ${state.events.length ? compactRunEvents(state.events).map(renderEvent).join("") : `<div class="empty"><div class="empty-title">等待任务事件</div><p>连接建立后会显示阶段和工具状态，不展示模型隐藏思考。</p></div>`}
@@ -904,13 +1002,9 @@ function renderRunPage() {
     </section>`;
 }
 
-function agentStage(key, agent, title, phase, detail = "", statusOverride = "") {
-  const order = ["queued", "evidence_review", "reflection_audit", "growth_plan", "completed"];
-  const current = order.indexOf(phase);
-  const target = order.indexOf(key);
-  const status = statusOverride || (current > target ? "done" : current === target ? "active" : "pending");
-  const statusLabel = { done: "已完成", active: "执行中", error: "执行失败", pending: "等待中" }[status] || "等待中";
-  return `<div class="agent-stage ${status}"><span class="agent-kicker">${agent}</span><strong>${title}</strong><span>${statusLabel}${detail ? ` · ${escapeHtml(detail)}` : ""}</span></div>`;
+function agentStage(title, detail, status = "pending") {
+  const icon = status === "done" ? "check" : status === "active" ? "loader-circle" : status === "error" ? "x" : "circle";
+  return `<div class="agent-stage ${status}" role="listitem"${status === "active" ? ' aria-current="step"' : ""}><span class="agent-stage-marker">${renderLucideIcon(icon)}</span><strong>${escapeHtml(title)}</strong><span class="agent-stage-detail">${escapeHtml(detail)}</span></div>`;
 }
 
 function renderEvent(event) {
@@ -1261,10 +1355,24 @@ function compactReportText(value, limit = 220) {
 function renderAuditSection(interview) {
   const notes = Array.isArray(interview.auditNotes) ? interview.auditNotes.filter(Boolean) : [];
   const revisions = Number(interview.auditRevisionCount || 0);
-  const hasWarnings = notes.some(note => /无法|失败|占位|缺少|警告|冲突|未通过/.test(String(note)));
-  const statusTitle = hasWarnings ? "审计完成，包含系统说明" : "证据与结构检查已完成";
-  const statusText = hasWarnings ? "详细技术记录已收起，不影响报告主体阅读。" : "引用、评分与改写结果已进入 Reflection 审计记录。";
-  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">REFLECTION AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">修订 ${revisions} 次</span></div><div class="audit-summary ${hasWarnings ? "warning" : ""}">${renderLucideIcon(hasWarnings ? "triangle-alert" : "circle-check")}<div><strong>${statusTitle}</strong><p>${statusText}</p></div></div>${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(publicRuntimeText(note))}</li>`).join("")}</ol></details>` : ""}</section>`;
+  const topicAuditRound = Number(interview.auditRound || 1);
+  const growthAudit = interview.growthPlanAudit && typeof interview.growthPlanAudit === "object" ? interview.growthPlanAudit : null;
+  const growthFindings = Array.isArray(growthAudit?.findings) ? growthAudit.findings : [];
+  const growthWarnings = growthFindings.filter(item => item.severity === "warning");
+  const growthNoteTexts = new Set([
+    growthAudit?.summary,
+    ...growthFindings.map(item => item.message)
+  ].filter(Boolean).map(String));
+  const topicNotes = notes.filter(note => !growthNoteTexts.has(String(note)));
+  const topicHasWarnings = topicNotes.some(note => /无法|失败|占位|缺少|警告|冲突|未通过/.test(String(note)));
+  const topicSummary = topicNotes[0] || "逐题引用、评分和优化回答已完成一致性检查。";
+  const growthSummary = growthAudit
+    ? growthAudit.summary || "成长计划终审已完成。"
+    : "该报告生成时未启用成长计划终审。";
+  const growthMeta = growthAudit
+    ? `第 ${Number(growthAudit.round || 1)} 轮 · 修订 ${Number(growthAudit.revisionCount || 0)} 次${growthWarnings.length ? ` · ${growthWarnings.length} 条提醒` : ""}`
+    : "旧版报告兼容信息";
+  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">QUALITY AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">逐题修订 ${revisions} 次 · 计划修订 ${Number(growthAudit?.revisionCount || 0)} 次</span></div><div class="audit-summary-grid"><div class="audit-summary ${topicHasWarnings ? "warning" : ""}">${renderLucideIcon(topicHasWarnings ? "triangle-alert" : "circle-check")}<div><strong>逐题复盘审计</strong><p>${escapeHtml(publicRuntimeText(topicSummary))}</p><small>第 ${topicAuditRound} 轮 · 修订 ${revisions} 次${topicHasWarnings ? " · 包含提醒" : ""}</small></div></div><div class="audit-summary ${growthWarnings.length || !growthAudit ? "warning" : ""}">${renderLucideIcon(growthWarnings.length || !growthAudit ? "triangle-alert" : "circle-check")}<div><strong>成长计划终审</strong><p>${escapeHtml(publicRuntimeText(growthSummary))}</p><small>${escapeHtml(growthMeta)}</small></div></div></div>${growthWarnings.length ? `<div class="growth-audit-warnings"><strong>随报告保留的提醒</strong><ul>${growthWarnings.map(item => `<li>${escapeHtml(publicRuntimeText(item.message || ""))}</li>`).join("")}</ul></div>` : ""}${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(publicRuntimeText(note))}</li>`).join("")}</ol></details>` : ""}</section>`;
 }
 
 function reviewBlock(title, content) {
@@ -1486,15 +1594,26 @@ function bindCommonEvents() {
   document.querySelectorAll("[data-nav]").forEach(button => button.addEventListener("click", () => { location.hash = button.dataset.nav; }));
   document.querySelectorAll("[data-delete]").forEach(button => button.addEventListener("click", async () => {
     if (!confirm("将删除本机中的面试材料、音频、题卡、报告和对应的成长趋势记录，确定继续吗？")) return;
+    const interviewId = button.dataset.delete;
+    button.disabled = true;
+    button.classList.add("is-loading");
+    button.setAttribute("aria-busy", "true");
+    button.dataset.tooltip = "正在删除";
+    button.innerHTML = renderLucideIcon("loader-circle");
+    state.error = "";
+    toast("正在删除面试记录…");
     try {
-      await api(`/api/v1/interviews/${button.dataset.delete}`, { method: "DELETE" });
-      state.records = state.records.filter(item => item.id !== button.dataset.delete);
-      state.trends = state.trends.filter(item => item.interview_id !== button.dataset.delete);
+      await api(`/api/v1/interviews/${interviewId}`, { method: "DELETE" });
+      state.records = state.records.filter(item => item.id !== interviewId);
+      state.trends = state.trends.filter(item => item.interview_id !== interviewId);
       state.selectedTrendIds = state.selectedTrendIds.filter(id => state.trends.some(item => item.id === id));
       persistRecords();
-      toast("面试记录及对应成长趋势已删除");
       render();
+      requestAnimationFrame(() => toast("面试记录已删除，关联缓存正在清理"));
     } catch (error) {
+      button.disabled = false;
+      button.classList.remove("is-loading");
+      button.removeAttribute("aria-busy");
       setError(readableError(error));
     }
   }));
@@ -1991,6 +2110,7 @@ async function startAgentRun() {
     record.reviewMode = reviewMode;
     record.status = "reviewing";
     record.phase = "queued";
+    record.failureSource = "";
     record.runError = "";
     record.failureCode = "";
     record.updatedAt = new Date().toISOString();
@@ -2017,6 +2137,7 @@ async function loadParseResult(record) {
   record.unresolvedCount = Number(result.unresolvedCount || 0);
   record.status = record.report && !record.reportEditDirty ? "completed" : "waiting_confirmation";
   record.phase = "completed";
+  record.failureSource = "";
   record.parseError = "";
   syncFlatQuestions(record);
   if (!state.selectedQuestionId && record.topics.length) state.selectedQuestionId = record.topics[0].id;
@@ -2034,6 +2155,7 @@ function connectParseEventSource() {
     if (type === "PARSE_FAILED") {
       record.status = "failed";
       record.phase = "failed";
+      record.failureSource = "parse";
       record.parseError = item.data.message || "解析失败";
       closeEventSource();
     }
@@ -2059,6 +2181,7 @@ async function retryParse() {
     record.parseRunId = run.parseRunId;
     record.parseEvents = [];
     record.parseError = "";
+    record.failureSource = "";
     record.status = "parsing";
     record.phase = "queued";
     saveRecord(record);
@@ -2282,15 +2405,37 @@ function connectEventSource() {
       record.runProgress ||= {};
       record.runProgress.completedTopics = Number(item.data.completed || record.runProgress.completedTopics || 0);
     }
-    if (type === "AUDIT_COMPLETED") {
+    if (type === "AUDIT_STARTED" || type === "AUDIT_COMPLETED") {
       record.runProgress ||= {};
       record.runProgress.auditRound = Number(item.data.round || 0);
       record.runProgress.checkpoint ||= {};
-      if (item.data.accepted) record.runProgress.checkpoint.auditAccepted = true;
+      record.runProgress.checkpoint.auditRound = Number(item.data.round || 0);
+      if (type === "AUDIT_COMPLETED" && item.data.accepted) record.runProgress.checkpoint.auditAccepted = true;
+    }
+    if (type === "GROWTH_PLAN_COMPLETED" || type === "GROWTH_PLAN_REVISED") {
+      record.runProgress ||= {};
+      record.runProgress.checkpoint ||= {};
+      record.runProgress.checkpoint.growthComplete = true;
+      if (item.data.artifactId) record.runProgress.checkpoint.growthArtifactId = item.data.artifactId;
+      if (type === "GROWTH_PLAN_REVISED") {
+        record.runProgress.growthRevisionCount = Number(item.data.revisionCount || 1);
+        record.runProgress.checkpoint.growthRevisionCount = Number(item.data.revisionCount || 1);
+      }
+    }
+    if (type === "GROWTH_AUDIT_STARTED" || type === "GROWTH_AUDIT_COMPLETED") {
+      record.runProgress ||= {};
+      record.runProgress.checkpoint ||= {};
+      record.runProgress.growthAuditRound = Number(item.data.round || 0);
+      record.runProgress.checkpoint.growthAuditRound = Number(item.data.round || 0);
+      if (type === "GROWTH_AUDIT_COMPLETED" && item.data.accepted) {
+        record.runProgress.growthAuditAccepted = true;
+        record.runProgress.checkpoint.growthAuditAccepted = true;
+      }
     }
     if (type === "RUN_RESUMED") {
       record.status = "reviewing";
       record.phase = "resuming";
+      record.failureSource = "";
       record.runError = "";
       record.failureCode = "";
       state.error = "";
@@ -2304,10 +2449,12 @@ function connectEventSource() {
       record.degraded = true;
       record.status = "reviewing";
       record.phase = "fallback";
+      record.failureSource = "";
     }
     if (type === "RUN_FAILED") {
       record.status = "failed";
       record.phase = item.data.phase || record.phase || "failed";
+      record.failureSource = "review";
       record.failureCode = item.data.code || "AGENT_FAILED";
       record.runError = item.data.message || "Agent 执行失败";
       closeEventSource();
@@ -2325,6 +2472,7 @@ function connectEventSource() {
     if (type === "RUN_FINISHED") {
       record.status = "completed";
       record.phase = "completed";
+      record.failureSource = "";
       closeEventSource();
       await loadReport(record);
       saveRecord(record);
@@ -2355,6 +2503,7 @@ async function resumeRun() {
     state.events = latest.events || state.events;
     record.status = "reviewing";
     record.phase = "resuming";
+    record.failureSource = "";
     record.runError = "";
     record.failureCode = "";
     state.error = "";
@@ -2376,6 +2525,7 @@ async function openCompletedRun(record, run) {
   state.events = run.events || state.events;
   record.status = "completed";
   record.phase = "completed";
+  record.failureSource = "";
   record.runProgress = run.progress || record.runProgress || {};
   record.runError = "";
   record.failureCode = "";
@@ -2393,6 +2543,7 @@ async function fallbackRun() {
     await api(`/api/v1/runs/${record.runId}/fallback`, { method: "POST" });
     record.status = "reviewing";
     record.phase = "fallback";
+    record.failureSource = "";
     record.agentMode = "deterministic_fallback";
     record.degraded = true;
     record.runError = "";
@@ -2606,7 +2757,15 @@ function readableError(error) {
 }
 
 function publicRuntimeText(value) {
-  return String(value ?? "").replace(/hello[\s-]*agents/gi, "Agent 服务");
+  return String(value ?? "")
+    .replace(/hello[\s-]*agents/gi, "Agent 服务")
+    .replace(/growth_reflection/gi, "成长计划终审")
+    .replace(/ReflectionAgent/gi, "质量审计服务")
+    .replace(/\bReflection\b/gi, "逐题质量审计")
+    .replace(/ReActAgent/gi, "证据分析服务")
+    .replace(/\bReAct\b/gi, "证据分析")
+    .replace(/PlanSolveAgent/gi, "计划生成服务")
+    .replace(/\bPlanSolve\b/gi, "计划生成");
 }
 
 function escapeHtml(value) {

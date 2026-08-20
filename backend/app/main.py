@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,7 +34,7 @@ from backend.app.services.document_parser import DocumentParseError, DocumentPar
 from backend.app.services.evidence import EvidenceReviewService
 from backend.app.services.knowledge import KnowledgeBase
 from backend.app.services.parse_workflow import ParseWorkflow
-from backend.app.services.workflow import REPORT_SCHEMA_VERSION, ReviewWorkflow
+from backend.app.services.workflow import REPORT_SCHEMA_VERSION, ReviewWorkflow, public_artifact_receipt
 
 
 settings.ensure_directories()
@@ -127,6 +127,21 @@ def remove_agent_files_for_identifiers(root: Path, identifiers: list[str]) -> in
     return removed
 
 
+def cleanup_deleted_interview_files(interview_id: str, cleanup: dict[str, list[str]]) -> None:
+    """Remove private files after the database record has disappeared from the UI."""
+    for stored_path in cleanup["storagePaths"]:
+        candidate = resolve_material_path(stored_path)
+        uploads = (settings.data_dir / "uploads").resolve()
+        if uploads in candidate.parents:
+            candidate.unlink(missing_ok=True)
+    upload_dir = settings.data_dir / "uploads" / interview_id
+    shutil.rmtree(upload_dir, ignore_errors=True)
+    for parse_run_id in cleanup["parseRunIds"]:
+        shutil.rmtree(settings.data_dir / "parse-runs" / parse_run_id, ignore_errors=True)
+    remove_agent_files_for_identifiers(settings.data_dir / "sessions", cleanup["identifiers"])
+    remove_agent_files_for_identifiers(settings.data_dir / "traces", cleanup["identifiers"])
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
@@ -155,20 +170,11 @@ def list_interviews() -> list[dict[str, Any]]:
 
 
 @app.delete("/api/v1/interviews/{interview_id}")
-def delete_interview(interview_id: str) -> dict[str, bool]:
-    get_interview_or_404(interview_id)
+def delete_interview(interview_id: str, background_tasks: BackgroundTasks) -> dict[str, bool]:
+    # Deletion is intentionally idempotent so stale browser records and retried
+    # requests can still clear any private artifacts left on disk.
     cleanup = database.delete_interview(interview_id)
-    for stored_path in cleanup["storagePaths"]:
-        candidate = resolve_material_path(stored_path)
-        uploads = (settings.data_dir / "uploads").resolve()
-        if uploads in candidate.parents:
-            candidate.unlink(missing_ok=True)
-    upload_dir = settings.data_dir / "uploads" / interview_id
-    shutil.rmtree(upload_dir, ignore_errors=True)
-    for parse_run_id in cleanup["parseRunIds"]:
-        shutil.rmtree(settings.data_dir / "parse-runs" / parse_run_id, ignore_errors=True)
-    remove_agent_files_for_identifiers(settings.data_dir / "sessions", cleanup["identifiers"])
-    remove_agent_files_for_identifiers(settings.data_dir / "traces", cleanup["identifiers"])
+    background_tasks.add_task(cleanup_deleted_interview_files, interview_id, cleanup)
     return {"deleted": True}
 
 
@@ -500,16 +506,17 @@ async def create_review_run(interview_id: str, payload: ReviewRunCreate | None =
 def get_run(run_id: str) -> dict[str, Any]:
     run = get_run_or_404(run_id)
     artifacts = database.get_stage_artifacts(run_id)
-    run["artifacts"] = [
-        {key: item[key] for key in ("id", "phase", "topic_id", "version", "status", "agent_type", "model", "session_id", "duration_seconds", "token_count", "created_at")}
-        for item in artifacts
-    ]
+    run["artifacts"] = [public_artifact_receipt(item) for item in artifacts]
     accepted_topics = {item["topic_id"] for item in artifacts if item["phase"] == "evidence_review" and item["status"] == "ACCEPTED"}
+    checkpoint = run.get("checkpoint", {})
     run["progress"] = {
         "completedTopics": len(accepted_topics),
         "auditRound": run.get("audit_round", 0),
         "revisionCount": run.get("revision_count", 0),
-        "checkpoint": run.get("checkpoint", {}),
+        "growthAuditRound": int(checkpoint.get("growthAuditRound") or 0),
+        "growthRevisionCount": int(checkpoint.get("growthRevisionCount") or 0),
+        "growthAuditAccepted": bool(checkpoint.get("growthAuditAccepted")),
+        "checkpoint": checkpoint,
     }
     return run
 

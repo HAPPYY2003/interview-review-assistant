@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from backend.app.config import Settings
 from backend.app.domain.scoring import DIMENSIONS, scores_from_levels
-from backend.app.schemas import AuditSubmission, GrowthPlanSubmission, TopicReviewSubmission
+from backend.app.schemas import AuditSubmission, GrowthAuditSubmission, GrowthPlanSubmission, TopicReviewSubmission
 from backend.app.services.knowledge import KnowledgeBase
 
 try:
@@ -79,6 +79,10 @@ CHINESE_NUMBER_SUFFIXES = (
     "个", "位", "名", "家", "条", "次", "年", "月", "日", "天", "周", "秒",
     "元", "人", "项", "层", "步", "类", "种", "轮", "分", "倍",
 )
+STRUCTURAL_NUMBER_SUFFIX_PATTERN = re.compile(
+    r"\s*(?:(?:个|项|种|类|层|步|段|点|轮)\s*)?"
+    r"(?:层次|方面|部分|步骤|要点|环节|阶段|维度|原则|模块|类别|类型|板块|子项|条线|段落|模式|路径|方式|原因|状态|次性)"
+)
 
 
 def _template_placeholder_paths(value: Any, path: str = "$") -> list[str]:
@@ -143,43 +147,118 @@ def _chinese_decimal(token: str) -> Decimal | None:
     return Decimal(f"{integer}.{digits}")
 
 
-def _numeric_claims(text: str) -> set[str]:
-    """Return comparable numeric claims across Chinese and Arabic notation."""
+def _is_structural_number(text: str, start: int, end: int) -> bool:
+    """Ignore ordering and answer-outline counts while retaining factual quantities."""
+    before = text[max(0, start - 4):start]
+    after = text[end:end + 12]
+    if re.search(r"第\s*$", before):
+        return True
+    if re.match(r"\s*[.、)）]", after):
+        line_start = max(text.rfind("\n", 0, start), text.rfind("。", 0, start), text.rfind("；", 0, start))
+        if not text[line_start + 1:start].strip():
+            return True
+    return bool(STRUCTURAL_NUMBER_SUFFIX_PATTERN.match(after))
+
+
+def _numeric_claim_spans(text: str) -> tuple[str, list[tuple[int, int, str]]]:
+    """Return normalized text and factual numeric spans with comparable values."""
     normalized = unicodedata.normalize("NFKC", str(text or "")).replace("％", "%")
-    claims: set[str] = set()
+    spans: list[tuple[int, int, str]] = []
+    occupied: list[tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(start < existing_end and end > existing_start for existing_start, existing_end in occupied)
 
     percentage_pattern = re.compile(rf"百分之(?P<number>{CHINESE_NUMBER_PATTERN})")
     for match in percentage_pattern.finditer(normalized):
         value = _chinese_decimal(match.group("number"))
         if value is not None:
-            claims.add(f"{_canonical_decimal(value)}%")
-    without_chinese_percentages = percentage_pattern.sub(" ", normalized)
+            spans.append((match.start(), match.end(), f"{_canonical_decimal(value)}%"))
+            occupied.append((match.start(), match.end()))
 
-    for match in re.finditer(r"\d+(?:\.\d+)?%?", without_chinese_percentages):
+    for match in re.finditer(r"\d+(?:\.\d+)?%?", normalized):
+        if overlaps(match.start(), match.end()):
+            continue
         token = match.group(0)
         suffix = "%" if token.endswith("%") else ""
+        if not suffix and _is_structural_number(normalized, match.start(), match.end()):
+            continue
         number = token[:-1] if suffix else token
         try:
-            claims.add(f"{_canonical_decimal(Decimal(number))}{suffix}")
+            spans.append((match.start(), match.end(), f"{_canonical_decimal(Decimal(number))}{suffix}"))
+            occupied.append((match.start(), match.end()))
         except InvalidOperation:
             continue
 
-    for match in re.finditer(CHINESE_NUMBER_PATTERN, without_chinese_percentages):
+    for match in re.finditer(CHINESE_NUMBER_PATTERN, normalized):
+        if overlaps(match.start(), match.end()):
+            continue
         token = match.group(0)
-        before = without_chinese_percentages[max(0, match.start() - 1):match.start()]
-        after = without_chinese_percentages[match.end():match.end() + 5]
+        before = normalized[max(0, match.start() - 1):match.start()]
+        after = normalized[match.end():match.end() + 5]
         has_numeric_unit = any(char in token for char in "十百千万亿点")
         has_counter = any(after.startswith(suffix) for suffix in CHINESE_NUMBER_SUFFIXES)
-        is_ordinal = before == "第"
         is_plain_digit_sequence = len(token) > 1 and all(char in CHINESE_DIGITS for char in token)
         if token == "一" and before == "进" and after.startswith("步"):
             continue
-        if not (has_numeric_unit or has_counter or is_ordinal or is_plain_digit_sequence):
+        if _is_structural_number(normalized, match.start(), match.end()):
+            continue
+        if not (has_numeric_unit or has_counter or is_plain_digit_sequence):
             continue
         value = _chinese_decimal(token)
         if value is not None:
-            claims.add(_canonical_decimal(value))
-    return claims
+            spans.append((match.start(), match.end(), _canonical_decimal(value)))
+            occupied.append((match.start(), match.end()))
+    return normalized, sorted(spans, key=lambda item: item[0])
+
+
+def _numeric_claims(text: str) -> set[str]:
+    """Return comparable numeric claims across Chinese and Arabic notation."""
+    return {claim for _, _, claim in _numeric_claim_spans(text)[1]}
+
+
+def sanitize_unsupported_numeric_claims(payload: dict[str, Any], registry: dict[str, dict[str, Any]]) -> list[str]:
+    """Replace unsupported factual numbers in a recommended answer before strict validation."""
+    recommended = payload.get("recommendedAnswer")
+    if not isinstance(recommended, dict):
+        return []
+    framework = recommended.get("framework")
+    sections = framework.get("sections", []) if isinstance(framework, dict) else []
+    evidence_ids = list(recommended.get("evidenceIds") or [])
+    for section in sections if isinstance(sections, list) else []:
+        if isinstance(section, dict):
+            evidence_ids.extend(section.get("evidenceIds") or [])
+    source_text = " ".join(
+        str(registry[evidence_id].get("quote", ""))
+        for evidence_id in dict.fromkeys(str(item) for item in evidence_ids)
+        if evidence_id in registry and registry[evidence_id].get("sourceType") in {"transcript", "resume"}
+    )
+    allowed = _numeric_claims(source_text)
+    removed: set[str] = set()
+
+    def clean(value: Any) -> Any:
+        if not isinstance(value, str) or not value:
+            return value
+        normalized, spans = _numeric_claim_spans(value)
+        unsupported = [(start, end, claim) for start, end, claim in spans if claim not in allowed]
+        for start, end, claim in reversed(unsupported):
+            normalized = normalized[:start] + "待补充" + normalized[end:]
+            removed.add(claim)
+        return normalized
+
+    recommended["fullAnswer"] = clean(recommended.get("fullAnswer"))
+    for section in sections if isinstance(sections, list) else []:
+        if isinstance(section, dict):
+            section["draft"] = clean(section.get("draft"))
+    if removed:
+        missing = recommended.get("missingInformation")
+        if not isinstance(missing, list):
+            missing = []
+        reminder = "补充可回查的量化数据"
+        if reminder not in missing:
+            missing.append(reminder)
+        recommended["missingInformation"] = missing
+    return sorted(removed)
 
 
 def _evidence_id(source_type: str, source_id: str, quote: str, locator: str) -> str:
@@ -395,9 +474,18 @@ class SubmitTopicReviewTool(Tool):
         return [ToolParameter(name="review_json", type="string", description="符合 TopicReviewSubmission Schema 的 JSON 字符串", required=True)]
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
+        if self.last_submission is not None:
+            return ToolResponse.success(
+                text="当前主题复盘此前已经接收，本次重复提交已忽略。请立即结束任务。",
+                data={"accepted": True, "locked": True, "topicId": self.last_submission["topicId"]},
+            )
         try:
-            payload = TopicReviewSubmission.model_validate_json(str(parameters.get("review_json", "{}")))
-        except ValidationError as exc:
+            raw_input = json.loads(str(parameters.get("review_json", "{}")))
+            if not isinstance(raw_input, dict):
+                raise ValueError("提交内容必须是 JSON 对象")
+            self._normalize_interviewer_signal_turns(raw_input)
+            payload = TopicReviewSubmission.model_validate(raw_input)
+        except (ValidationError, ValueError, TypeError) as exc:
             return self._reject(f"结构化主题复盘未通过 Schema：{exc}")
         raw = payload.model_dump(by_alias=True)
         placeholder_paths = _template_placeholder_paths(raw)
@@ -432,7 +520,7 @@ class SubmitTopicReviewTool(Tool):
             return self._reject("回答逻辑只能引用面试原文证据")
         turn_questions = {
             str(turn["id"]): str(turn.get("interviewerQuestion") or "").strip()
-            for turn in [self.topic, *self.topic.get("followUpTurns", [])]
+            for turn in self.topic.get("followUpTurns", [])
         }
         for signal in payload.interviewer_signals:
             if signal.turn_id not in turn_questions:
@@ -520,6 +608,48 @@ class SubmitTopicReviewTool(Tool):
         }
         return ToolResponse.success(text="主题复盘已通过结构、版本和证据校验", data={"accepted": True, "topicId": payload.topic_id, "topicVersion": payload.topic_version, "scores": scores})
 
+    def _normalize_interviewer_signal_turns(self, raw: dict[str, Any]) -> None:
+        """Map visible timestamps to follow-up UUIDs only when evidence proves the match."""
+        signals = raw.get("interviewerSignals")
+        questions = {
+            str(item["id"]): str(item.get("interviewerQuestion") or "").strip()
+            for item in self.topic.get("followUpTurns", [])
+        }
+        if not questions:
+            raw["interviewerSignals"] = []
+            return
+        if not isinstance(signals, list):
+            return
+
+        normalized: list[Any] = []
+        for original in signals:
+            if not isinstance(original, dict):
+                normalized.append(original)
+                continue
+            signal = dict(original)
+            turn_id = str(signal.get("turnId") or signal.get("turn_id") or "")
+            if turn_id not in questions:
+                evidence_ids = signal.get("evidenceIds") or signal.get("evidence_ids") or []
+                candidates = []
+                for candidate_id, question in questions.items():
+                    if not question:
+                        continue
+                    if any(
+                        (ref := self.registry.get(str(evidence_id)))
+                        and ref.get("sourceType") == "transcript"
+                        and (
+                            question in str(ref.get("quote", ""))
+                            or str(ref.get("quote", "")) in question
+                        )
+                        for evidence_id in evidence_ids
+                    ):
+                        candidates.append(candidate_id)
+                if len(candidates) == 1:
+                    signal["turnId"] = candidates[0]
+                    signal.pop("turn_id", None)
+            normalized.append(signal)
+        raw["interviewerSignals"] = normalized
+
     @staticmethod
     def _legacy_star(payload: TopicReviewSubmission) -> dict[str, Any]:
         sections = {item.key.upper(): item.draft for item in payload.recommended_answer.framework.sections}
@@ -550,11 +680,18 @@ class JsonSnapshotTool(Tool):
     def __init__(self, name: str, description: str, payload: Any):
         super().__init__(name=name, description=description, expandable=False)
         self.payload = payload
+        self.read_count = 0
 
     def get_parameters(self) -> list[ToolParameter]:
         return []
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
+        self.read_count += 1
+        if self.read_count > 1:
+            return ToolResponse.success(
+                text="该只读数据已经返回，请使用第一次读取结果继续任务，不要再次读取。",
+                data={"alreadyRead": True, "readCount": self.read_count},
+            )
         return ToolResponse.success(text="已返回只读结构化数据", data={"payload": self.payload})
 
 
@@ -639,6 +776,7 @@ class SubmitPlanTool(Tool):
                 type="string",
                 description=(
                     "完整成长计划 JSON 字符串。顶层必须包含 overallEvaluation、capabilityGaps、actionItems；"
+                    "overallEvaluation.strengths 和 risks 各包含 1 至 3 项；"
                     "缺口 ID 使用 gap-1 格式；topicIds 和 evidenceIds 只能引用已审计报告中的真实 ID；"
                     "actionItems 必须包含 3 至 7 项，并用 order 从 1 开始连续编号；行动不绑定日期。"
                 ),
@@ -647,6 +785,15 @@ class SubmitPlanTool(Tool):
         ]
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
+        if self.last_submission is not None:
+            return ToolResponse.success(
+                text="成长计划此前已经接收，本次重复提交已忽略。请立即结束任务。",
+                data={
+                    "accepted": True,
+                    "locked": True,
+                    "actionCount": len(self.last_submission.get("actionItems", [])),
+                },
+            )
         try:
             if "plan_json" in parameters:
                 payload = GrowthPlanSubmission.model_validate_json(str(parameters.get("plan_json", "{}")))
@@ -758,11 +905,89 @@ class SubmitPlanTool(Tool):
         return ToolResponse.partial(text=message, data={"accepted": False})
 
 
+class SubmitGrowthAuditTool(Tool):
+    def __init__(
+        self,
+        plan: dict[str, Any],
+        topic_ids: set[str],
+        evidence_ids: set[str],
+        required_reads: list[JsonSnapshotTool] | None = None,
+    ):
+        super().__init__(name="SubmitGrowthAudit", description="提交成长计划最终审计决定和结构化发现。", expandable=False)
+        self.plan = plan
+        self.topic_ids = topic_ids
+        self.evidence_ids = evidence_ids
+        self.gap_ids = {str(item.get("id")) for item in plan.get("capabilityGaps", []) if item.get("id")}
+        self.action_ids = {str(item.get("id")) for item in plan.get("actionItems", []) if item.get("id")}
+        self.required_reads = list(required_reads or [])
+        self.last_submission: dict[str, Any] | None = None
+        self.last_error = ""
+
+    def get_parameters(self) -> list[ToolParameter]:
+        return [ToolParameter(name="audit_json", type="string", description="符合 GrowthAuditSubmission Schema 的 JSON 字符串", required=True)]
+
+    def run(self, parameters: dict[str, Any]) -> ToolResponse:
+        if self.last_submission is not None:
+            return ToolResponse.success(
+                text="成长计划终审结果此前已经接收，本次重复提交已忽略。请立即结束任务。",
+                data={
+                    "accepted": True,
+                    "locked": True,
+                    "decision": self.last_submission["decision"],
+                    "findingCount": len(self.last_submission["findings"]),
+                },
+            )
+        unread = [tool.name for tool in self.required_reads if tool.read_count < 1]
+        if unread:
+            return self._reject(f"提交终审前必须先读取：{', '.join(unread)}")
+        try:
+            payload = GrowthAuditSubmission.model_validate_json(str(parameters.get("audit_json", "{}")))
+        except ValidationError as exc:
+            return self._reject(f"成长计划终审未通过 Schema：{exc}")
+
+        for finding in payload.findings:
+            if finding.target_type == "overall_evaluation" and finding.target_id != "overall-evaluation":
+                return self._reject("综合评价 finding 的 targetId 必须为 overall-evaluation")
+            if finding.target_type == "capability_gap" and finding.target_id not in self.gap_ids:
+                return self._reject(f"成长计划终审包含未知缺口：{finding.target_id}")
+            if finding.target_type == "action_item" and finding.target_id not in self.action_ids:
+                return self._reject(f"成长计划终审包含未知行动：{finding.target_id}")
+
+        invalid_topics = sorted({item for finding in payload.findings for item in finding.topic_ids} - self.topic_ids)
+        invalid_evidence = sorted({item for finding in payload.findings for item in finding.evidence_ids} - self.evidence_ids)
+        if invalid_topics:
+            return self._reject(f"成长计划终审包含未知主题：{', '.join(invalid_topics[:5])}")
+        if invalid_evidence:
+            return self._reject(f"成长计划终审包含未知证据：{', '.join(invalid_evidence[:5])}")
+
+        self.last_submission = payload.model_dump(by_alias=True)
+        self.last_error = ""
+        critical_count = sum(item.severity == "critical" for item in payload.findings)
+        warning_count = sum(item.severity == "warning" for item in payload.findings)
+        return ToolResponse.success(
+            text=f"成长计划终审结果已接收：{payload.decision}",
+            data={
+                "accepted": True,
+                "decision": payload.decision,
+                "findingCount": len(payload.findings),
+                "criticalCount": critical_count,
+                "warningCount": warning_count,
+            },
+        )
+
+    def _reject(self, message: str) -> ToolResponse:
+        self.last_error = message
+        return ToolResponse.partial(text=message, data={"accepted": False})
+
+
 def build_evidence_agent_tools(knowledge: KnowledgeBase, context: dict[str, Any], settings: Settings, topic: dict[str, Any]) -> tuple[list[Tool], SubmitTopicReviewTool, dict[str, dict[str, Any]]]:
     registry: dict[str, dict[str, Any]] = {}
     catalog = build_evidence_catalog(context)
     submit = SubmitTopicReviewTool(topic, registry, has_jd=bool(str(context.get("job_description", "")).strip()))
-    return [EvidenceLookupTool(catalog, registry), KnowledgeSearchTool(knowledge), ScoreTool(), WebVerifyTool(settings, registry), submit], submit, registry
+    # SubmitTopicReview performs the deterministic five-dimension score mapping.
+    # Keeping Score out of the Agent tool loop saves a model round trip without
+    # changing any scoring rule or report value.
+    return [EvidenceLookupTool(catalog, registry), KnowledgeSearchTool(knowledge), WebVerifyTool(settings, registry), submit], submit, registry
 
 
 def build_audit_agent_tools(draft: list[dict[str, Any]], registry: dict[str, dict[str, Any]]) -> tuple[list[Tool], SubmitAuditTool]:
@@ -783,6 +1008,29 @@ def build_growth_agent_tools(draft: list[dict[str, Any]], history: list[dict[str
         JsonSnapshotTool("GetAuditedReview", "读取已通过 Reflection 审计的复盘结果。", draft),
         JsonSnapshotTool("GetGrowthHistory", "读取同岗位优先的脱敏成长趋势。", history),
         KnowledgeSearchTool(knowledge),
+        submit,
+    ], submit
+
+
+def build_growth_audit_agent_tools(
+    plan_artifact: dict[str, Any],
+    audit_context: dict[str, Any],
+    registry: dict[str, dict[str, Any]],
+) -> tuple[list[Tool], SubmitGrowthAuditTool]:
+    plan = dict(plan_artifact.get("payload", {}).get("plan") or {})
+    topic_ids = {str(item.get("topicId")) for item in audit_context.get("topics", []) if item.get("topicId")}
+    plan_snapshot = {
+        "artifactId": plan_artifact.get("id", ""),
+        "version": int(plan_artifact.get("version") or 1),
+        "plan": plan,
+    }
+    get_plan = JsonSnapshotTool("GetGrowthPlan", "读取当前候选成长计划、artifact ID 和版本。", plan_snapshot)
+    get_context = JsonSnapshotTool("GetGrowthAuditContext", "读取压缩后的逐题诊断、五维得分和证据目录。", audit_context)
+    submit = SubmitGrowthAuditTool(plan, topic_ids, set(registry), [get_plan, get_context])
+    return [
+        get_plan,
+        get_context,
+        VerifyEvidenceTool(registry),
         submit,
     ], submit
 

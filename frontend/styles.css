@@ -924,7 +924,7 @@ button:disabled {
   color: #1e3a8a;
 }
 
-.error {
+.error-message {
   padding: 12px 14px;
   border: 1px solid #fecaca;
   border-radius: var(--radius);
@@ -3085,34 +3085,78 @@ button:disabled {
 
 .agent-stage-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 16px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: start;
+  gap: 0;
+  width: 100%;
+  margin-top: 20px;
 }
 
 .agent-run-summary {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 12px;
-  padding: 12px 14px;
+  margin-bottom: 16px;
+  padding: 18px;
   border: 1px solid var(--border-default);
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--bg-surface);
 }
 
-.agent-run-summary > div {
+.run-progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.run-progress-current {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 12px;
+}
+
+.run-progress-current > div,
+.run-progress-total {
   display: grid;
-  gap: 2px;
+  gap: 1px;
 }
 
-.agent-run-summary strong {
-  font-size: 13px;
-}
-
-.agent-run-summary > div span {
+.run-progress-current > div > span,
+.run-progress-total > span {
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
+}
+
+.run-progress-current strong {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.run-progress-total {
+  flex: 0 0 auto;
+  justify-items: end;
+}
+
+.run-progress-total strong {
+  color: var(--brand-primary);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.run-progress-track {
+  overflow: hidden;
+  width: 100%;
+  height: 5px;
+  margin-top: 14px;
+  border-radius: 3px;
+  background: var(--bg-subtle);
+}
+
+.run-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand-primary);
+  transition: width 220ms ease;
 }
 
 .agent-mode-mark {
@@ -3150,45 +3194,103 @@ button:disabled {
 }
 
 .agent-stage {
+  position: relative;
   display: grid;
-  gap: 4px;
-  min-height: 104px;
-  padding: 16px;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 30px auto auto;
+  justify-items: center;
+  row-gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 0 12px;
+  text-align: center;
+}
+
+.agent-stage:not(:last-child)::after {
+  position: absolute;
+  z-index: 0;
+  top: 14px;
+  right: calc(-50% + 15px);
+  left: calc(50% + 15px);
+  height: 1px;
+  background: var(--border-strong);
+  content: "";
+}
+
+.agent-stage.done:not(:last-child)::after {
+  background: #86efac;
+}
+
+.agent-stage-marker {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-row: 1;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
   background: var(--bg-surface);
+  color: var(--text-disabled);
+}
+
+.agent-stage-marker .lucide-icon {
+  width: 15px;
+  height: 15px;
 }
 
 .agent-stage strong {
-  font-size: 16px;
+  min-width: 0;
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
 }
 
-.agent-stage > span:last-child,
-.agent-kicker {
+.agent-stage-detail {
+  min-width: 0;
   color: var(--text-muted);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
-.agent-stage.active {
-  border-color: #7dd3fc;
-  background: #f0f9ff;
-  box-shadow: inset 3px 0 0 var(--info);
+.agent-stage.active .agent-stage-marker {
+  border-color: var(--brand-primary);
+  background: var(--brand-primary);
+  color: #fff;
 }
 
-.agent-stage.done {
-  border-color: #bbf7d0;
-  background: #f0fdf4;
-  box-shadow: inset 3px 0 0 var(--success);
+.agent-stage.active .agent-stage-marker .lucide-icon {
+  animation: run-stage-spin 900ms linear infinite;
 }
 
-.agent-stage.error {
-  border-color: #fecaca;
-  background: #fef2f2;
-  box-shadow: inset 3px 0 0 var(--danger);
+.agent-stage.active strong {
+  color: var(--brand-primary);
 }
 
-.agent-stage.error > span:last-child {
+.agent-stage.done .agent-stage-marker {
+  border-color: var(--success);
+  background: var(--success);
+  color: #fff;
+}
+
+.agent-stage.error .agent-stage-marker {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+
+.agent-stage.error strong,
+.agent-stage.error .agent-stage-detail {
   color: #b91c1c;
+}
+
+@keyframes run-stage-spin {
+  to { transform: rotate(360deg); }
+}
+
+.record-action.is-loading svg {
+  animation: run-stage-spin 900ms linear infinite;
 }
 
 .live-indicator {
@@ -3290,6 +3392,36 @@ button:disabled {
   border-radius: 6px;
   background: #f0fdf4;
   color: #166534;
+}
+
+.audit-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.audit-summary-grid .audit-summary {
+  margin-top: 14px;
+}
+
+.audit-summary small {
+  color: inherit;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.growth-audit-warnings {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-left: 2px solid #f59e0b;
+  background: #fffbeb;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.growth-audit-warnings ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
 }
 
 .audit-summary.warning {
@@ -5244,8 +5376,7 @@ button.topic-source-locator:hover {
     align-items: stretch;
   }
 
-  .run-header-actions,
-  .agent-run-summary {
+  .run-header-actions {
     align-items: stretch;
     flex-direction: column;
   }
@@ -5258,6 +5389,48 @@ button.topic-source-locator:hover {
   .parse-layout,
   .material-grid,
   .agent-stage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-stage-grid {
+    gap: 0;
+  }
+
+  .agent-stage {
+    grid-template-columns: 30px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    justify-items: stretch;
+    column-gap: 10px;
+    row-gap: 2px;
+    min-height: 62px;
+    padding: 0 0 18px;
+    text-align: left;
+  }
+
+  .agent-stage-marker {
+    grid-row: 1 / span 2;
+  }
+
+  .agent-stage strong {
+    align-self: end;
+    margin-top: 0;
+    padding-right: 8px;
+  }
+
+  .agent-stage-detail {
+    padding-right: 8px;
+  }
+
+  .agent-stage:not(:last-child)::after {
+    top: 30px;
+    right: auto;
+    bottom: 0;
+    left: 14px;
+    width: 1px;
+    height: auto;
+  }
+
+  .audit-summary-grid {
     grid-template-columns: 1fr;
   }
 
@@ -5396,6 +5569,18 @@ button.topic-source-locator:hover {
 
   .steps {
     gap: 4px;
+  }
+
+  .run-progress-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .run-progress-total {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
   }
 
   .step {

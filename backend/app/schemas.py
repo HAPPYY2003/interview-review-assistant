@@ -400,6 +400,37 @@ class GrowthPlanSubmission(StrictModel):
         return self
 
 
+class GrowthAuditFinding(StrictModel):
+    target_type: Literal["overall_evaluation", "capability_gap", "action_item"] = Field(alias="targetType")
+    target_id: str = Field(min_length=1, max_length=100, alias="targetId")
+    code: Literal[
+        "unsupported_overall_evaluation", "overall_score_conflict", "unsupported_gap",
+        "gap_priority_mismatch", "action_gap_mismatch", "duplicate_action",
+        "action_not_executable", "criterion_not_verifiable", "learning_preparation_mismatch",
+        "invented_claim", "prohibited_probability", "invalid_reference",
+        "high_priority_gap_uncovered", "other",
+    ]
+    severity: Literal["critical", "warning"]
+    field: str = Field(default="", max_length=200)
+    message: str = Field(min_length=2, max_length=600)
+    topic_ids: list[str] = Field(default_factory=list, alias="topicIds")
+    evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
+
+
+class GrowthAuditSubmission(StrictModel):
+    decision: Literal["pass", "revise"]
+    summary: str = Field(min_length=2, max_length=800)
+    findings: list[GrowthAuditFinding] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "GrowthAuditSubmission":
+        if self.decision == "revise" and not self.findings:
+            raise ValueError("revise 必须至少包含一条成长计划审计发现")
+        if self.decision == "pass" and any(item.severity == "critical" for item in self.findings):
+            raise ValueError("存在 critical 问题时不能通过成长计划终审")
+        return self
+
+
 class ReviewBatch(StrictModel):
     reviews: list[TopicReviewSubmission]
     summary: str
