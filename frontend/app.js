@@ -367,9 +367,8 @@ function renderSidebar() {
       </nav>
       <div class="runtime-panel">
         <span class="runtime-dot ${fixture ? "fixture" : "live"}"></span>
-        <div><strong>${fixture ? "稳定演示模式" : "实时分析模式"}</strong><span>${fixture ? "不调用真实模型" : "服务端模型已连接"}</span></div>
+        <div><strong>${fixture ? "稳定演示模式" : "实时分析模式"}</strong><span>${fixture ? "不调用真实模型" : "服务已连接"}</span></div>
       </div>
-      <div class="sidebar-footer">材料保存在本机 SQLite；模型密钥只从服务端环境变量读取，不进入浏览器。</div>
     </aside>`;
 }
 
