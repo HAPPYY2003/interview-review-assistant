@@ -1,142 +1,143 @@
 # Changelog
 
-本项目使用语义化版本号。重要变更记录在此文件中。
+This project follows Semantic Versioning. Notable changes are documented in this file.
 
 ## [Unreleased]
 
 ### Added
 
-- 追问题型双层分类：主题保留主问题题型，追问独立记录考察重点。
-- 当前报告内“进行中的练习”会话列表，支持刷新后恢复多个草稿、生成中和评价中任务。
-- 面向产品经理求职展示的项目 README、产品决策说明和界面截图。
+- Two-layer follow-up classification: topics retain the main-question type while follow-ups store an independent probe focus.
+- A current-report active-practice list that restores multiple drafts, generating sessions, and reviewing sessions after refresh.
+- A product-manager-focused README with product decisions, screenshots, and a fast local onboarding path.
 
 ### Changed
 
-- 产品对外名称统一为“面试复盘助手”，移除前端与公开文档中的旧品牌。
-- 无角色转写稿使用结构置信度与语义提示分层，可靠追问不再因题型歧义阻断确认。
+- Standardized the public product name as Interview Review Assistant and removed the previous brand from the frontend and public documentation.
+- Layered structural confidence and semantic notices for transcripts without speaker labels, so reliable follow-ups are no longer blocked by type ambiguity.
 
 ### Fixed
 
-- 修复时间轴混入问题和回答、追问题型误报、连续发言过度拆分及练习抽屉轮询导致滚动位置跳回的问题。
+- Prevented timeline markers from entering questions and answers.
+- Reduced follow-up type false positives and excessive splitting of consecutive speaker turns.
+- Prevented practice-drawer polling from resetting the user's scroll position.
 
 ## [0.5.0] - 2026-08-20
 
 ### Added
 
-- 报告内行动练习：每项成长行动均可进入口述表达、追问演练、案例补充或知识自测。
-- 个性化练习 Brief、草稿保存、多次尝试、分项反馈、事实风险标记和用户确认完成流程。
-- `practice_sessions` 与 `practice_attempts` 持久化表，以及创建、读取、保存、提交和失败重试接口。
-- Fixture 模式下的确定性练习与反馈，自动测试不调用真实模型。
+- Report-level action practice with oral-answer, follow-up-drill, case-builder, and knowledge-quiz modes.
+- Personalized practice briefs, draft persistence, multiple attempts, rubric feedback, factual-risk labels, and user-confirmed completion.
+- `practice_sessions` and `practice_attempts` persistence, plus create, read, save, submit, and retry APIs.
+- Deterministic practice and feedback in fixture mode; automated tests do not call a real model.
 
 ### Changed
 
-- 下一步行动卡增加练习状态和入口；桌面端使用右侧抽屉，移动端使用全屏练习界面。
-- 练习内容按点击懒生成，不增加正式面试拆题和复盘耗时。
-- 真实反馈首次结构化失败时自动执行一次收尾；仍失败则保留用户答案并允许重试。
+- Added practice status and entry points to next-action cards, using a right-side drawer on desktop and a full-screen experience on mobile.
+- Generated practice content lazily so it does not increase formal parsing or review time.
+- Added one structured finalization attempt when real-model feedback submission fails; a second failure preserves the answer and allows retry.
 
 ### Fixed
 
-- 修复同步 API 路由启动后台练习任务时缺少事件循环的问题。
-- 删除面试时同步清理练习会话、尝试记录及其聚合状态。
-- 修复移动端原生 dialog 宽度限制、练习轮询竞态和报告导航等待问题。
+- Fixed missing event-loop context when synchronous API routes started background practice tasks.
+- Cascaded interview deletion to practice sessions, attempts, and aggregate status.
+- Fixed native-dialog width constraints on mobile, practice polling races, and report navigation waits.
 
 ## [0.4.1] - 2026-08-20
 
 ### Added
 
-- 成长行动进度服务端持久化，支持状态、练习备注、完成证据和自评记录。
-- 成长计划读取与行动进度更新接口，并在报告和成长趋势中合并最新状态。
+- Server-side growth-action progress with status, practice notes, completion evidence, and self-assessment.
+- Growth-plan read and action-progress update APIs, with current state merged into reports and trend views.
 
 ### Changed
 
-- 优化下一步行动计划卡片的信息层级、内容展开、状态编辑与移动端布局。
-- 统一报告页与成长趋势中的行动和评分数据来源，避免本地状态漂移。
+- Improved information hierarchy, content expansion, status editing, and mobile layout for next-action cards.
+- Unified action and score data sources across reports and growth trends to avoid client-side state drift.
 
 ### Fixed
 
-- 修复面试删除后关联行动进度残留、运行恢复状态不一致和部分证据校验误报。
-- 修复结构化复盘兼容字段、行动完成时间和旧报告行动状态读取问题。
+- Fixed orphaned action progress after interview deletion, inconsistent recovery state, and several evidence-validation false positives.
+- Fixed structured-review compatibility fields, action completion timestamps, and legacy report action-state reads.
 
 ## [0.4.0] - 2026-08-20
 
 ### Added
 
-- 报告 V3 成长计划终审：支持结构化 finding、一次定向修订、第二轮严重问题拦截和告警随报告发布。
-- 成长计划终审的只读工具、五类 SSE 事件、四阶段执行页和双审计报告摘要。
-- 自适应追问识别与连续候选人话轮合并，提升无角色、口语化转写稿的主题组织质量。
+- Report V3 growth-plan final audit with structured findings, one targeted revision, second-round critical blocking, and warning publication.
+- Read-only growth-audit tools, five SSE event types, a four-stage execution page, and separate audit summaries.
+- Adaptive follow-up recognition and consecutive candidate-turn merging for transcripts without speaker labels.
 
 ### Changed
 
-- 断点恢复会复用最新成长计划 artifact，只重试尚未完成的修订或终审轮次。
-- 公开 artifact 元数据使用产品角色名，不暴露底层 Agent 框架类名。
-- 证据诊断支持主题并发、结构化快速路径、预取证据包和精简工具调用，缩短长面试复盘时间。
-- 执行页使用四阶段均分进度轨道，并保留失败阶段和检查点恢复状态。
+- Checkpoint recovery now reuses the latest growth-plan artifact and retries only incomplete revision or final-audit work.
+- Public artifact metadata uses product role names without exposing underlying agent framework class names.
+- Evidence review now supports topic concurrency, a structured fast path, prefetched evidence packets, and fewer tool calls for long interviews.
+- The execution page now uses an evenly distributed four-stage progress track and preserves failed-stage recovery state.
 
 ### Fixed
 
-- 修复模型返回包裹或二次编码 JSON 时无法识别的问题，并自动约束错误证据 ID、话轮 ID 与无依据数字。
-- 修复 GrowthPlanner 优势/风险数量越界及终审重复读取大对象导致的额外工具循环。
-- 修复失败任务从面试记录重新进入时回到题卡编辑页、删除记录无效及旧错误状态残留问题。
-- 修复语音转写连续发言被过度拆分、追问识别不足和原文引用校验误报问题。
+- Added parsing for wrapped or double-encoded JSON and constrained invalid evidence IDs, turn IDs, and unsupported numbers.
+- Fixed GrowthPlanner strength/risk count violations and unnecessary tool loops caused by repeated reads of large audit objects.
+- Fixed failed runs reopening on the editing page, ineffective interview deletion, and stale error state after recovery.
+- Fixed excessive splitting of continuous transcript turns, missed follow-ups, and source-reference false positives.
 
 ## [0.3.0] - 2026-08-19
 
 ### Added
 
-- 复盘报告 V2：面试综合评价、技能 / 知识缺口、下一步行动计划和逐题五视图深度复盘。
-- 回答逻辑、面试官信号、问题诊断、优化回答与独立证据引用视图。
-- QualityAuditor 对成长计划的最终审计，以及审计检查点和超时快速恢复。
-- “自我介绍”独立题型，贯通语义拆题、人工校对、结构化存储和正式复盘。
-- 跨岗位复杂产品经理合成演示材料，用于长文本、多追问和无说话人场景展示。
+- Report V2 with overall evaluation, capability gaps, next actions, and five-view topic analysis.
+- Answer logic, interviewer signals, diagnosis, improved answer, and independent evidence views.
+- Final growth-plan auditing, audit checkpoints, and fast recovery from audit timeouts.
+- A dedicated self-introduction question type across parsing, verification, persistence, and formal review.
+- Synthetic cross-role product-manager cases for long transcripts, multiple follow-ups, and missing speaker labels.
 
 ### Changed
 
-- 下一步行动计划不再强制每天一项，聚焦任务、关联缺口、提升维度与完成标准。
-- 题目数量统一按主问题与全部追问的总和展示。
-- 优化报告页、题卡、证据按钮、流程步骤和移动端响应式布局。
-- 前端隐藏底层 Agent 框架品牌信息，保留面向用户的阶段与执行状态。
+- Replaced the forced one-action-per-day plan with task-focused actions, linked gaps, improvement dimensions, and completion criteria.
+- Standardized question counts as main questions plus all follow-ups.
+- Improved report, question-card, evidence-button, process-step, and mobile responsive layouts.
+- Removed underlying agent framework branding from the frontend while preserving user-facing stages and execution status.
 
 ### Fixed
 
-- 修复结构化主题提交中的模板占位、字段类型漂移、非法数字引用和字符串对象混用问题。
-- 修复 QualityAuditor 非法空审计、重复提交、执行超时及 GrowthPlanner 恢复失败问题。
-- 修复检查点恢复沿用旧错误状态、报告与成长趋势分数不一致及题目计数不一致问题。
-- 修复追问原文缺失、原文引用校验误报和面试记录级联删除不完整问题。
+- Fixed template placeholders, field-type drift, unsupported numeric references, and string/object mismatches in structured topic submissions.
+- Fixed invalid empty audits, duplicate submissions, execution timeouts, and GrowthPlanner recovery failures.
+- Fixed stale errors after checkpoint recovery, report/trend score mismatches, and inconsistent question counts.
+- Fixed missing follow-up source text, source-reference false positives, and incomplete cascading interview deletion.
 
 ## [0.2.1] - 2026-08-14
 
 ### Added
 
-- Deepgram `nova-3` 音频转写，支持 MP3、M4A、WAV、FLAC 和 OGG。
-- ReAct ParseAgent 与 SimpleAgent Worker 组成的分块语义拆题管线。
-- 原始片段、人工修订、主题和追问的双轨数据模型与引用定位。
-- 异步解析状态、SSE 进度、失败重试和版本化 Agent artifact。
-- 三组跨岗位合成面试案例，以及音频、拆题、题型和工作流回归测试。
+- Deepgram `nova-3` transcription for MP3, M4A, WAV, FLAC, and OGG.
+- A chunked semantic parsing pipeline using a coordinator agent and worker agents.
+- Dual-track raw segments, human edits, topics, follow-ups, and source locations.
+- Asynchronous parsing states, SSE progress, retry handling, and versioned artifacts.
+- Three synthetic cross-role interview cases and regression coverage for audio, parsing, question types, and workflows.
 
 ### Changed
 
-- 新建复盘页升级为粘贴文字、上传文字稿和上传音频三种互斥来源。
-- 人工确认页按主题聚合主问题与追问，并支持片段校对和主题调整。
-- 报告和面试记录界面优化信息层级、证据呈现、响应式布局和操作入口。
-- Windows 启动环境统一使用 UTF-8，避免 Agent 日志中的 Unicode 字符触发 GBK 编码错误。
+- Upgraded New Review to mutually exclusive pasted-text, transcript-upload, and audio-upload sources.
+- Grouped main questions and follow-ups by topic on the verification page, with segment correction and topic editing.
+- Improved information hierarchy, evidence display, responsive layout, and actions in reports and interview records.
+- Standardized Windows startup on UTF-8 to prevent Unicode agent logs from triggering GBK encoding errors.
 
 ### Fixed
 
-- 修复日期输入格式、文件选择区域误触、记录列表列错位和操作样式不一致问题。
-- 修复低置信度题卡、追问折叠、报告失效和断点恢复相关边界行为。
+- Fixed date-input formatting, oversized file-picker hit areas, record-list column alignment, and inconsistent action styles.
+- Fixed edge cases involving low-confidence cards, follow-up expansion, report invalidation, and checkpoint recovery.
 
 ## [0.1.0] - 2026-08-06
 
 ### Added
 
-- FastAPI、SQLite 与 Vanilla JS 组成的面试复盘 MVP。
-- ParseAgent、Supervisor、EvidenceAnalyst、QualityAuditor 与 GrowthPlanner 工作流。
-- TXT、PDF、DOCX 文档解析与人工题卡确认。
-- 五维评分、证据引用、Reflection 审计和七天成长计划。
-- SSE 进度事件、会话恢复、Trace 脱敏与 fixture 演示模式。
-- Docker、本地启动脚本和基础回归测试。
+- An interview-review MVP built with FastAPI, SQLite, and Vanilla JavaScript.
+- Parsing, supervision, evidence analysis, quality audit, and growth-planning roles.
+- TXT, PDF, and DOCX parsing with human question-card confirmation.
+- Five-dimension scoring, evidence references, reflection audit, and a seven-day growth plan.
+- SSE progress events, session recovery, redacted traces, fixture mode, Docker, startup scripts, and regression tests.
 
 ### Changed
 
-- 优化桌面端字号、流程步骤、文件上传交互和卡片间距。
-- 演示数据按钮支持填入与清除两种状态。
+- Improved desktop typography, process steps, file-upload interaction, and card spacing.
+- Added toggle behavior for filling and clearing demo data.

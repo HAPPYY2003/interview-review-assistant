@@ -1,20 +1,20 @@
-# 面试复盘助手完整检测材料
+# Complete Interview Review Test Cases
 
-本目录中的内容全部为虚构数据，不包含真实个人信息，可用于本地功能测试。
+All content in this directory is fictional and contains no real personal information. It is intended for local product testing.
 
-每个案例包含：
+Each case contains:
 
-- `profile.json`：公司、岗位、轮次、日期、复盘目标和建议检查点。
-- `job_description.txt`：岗位 JD，可粘贴或作为 TXT 上传。
-- `resume.txt`：候选人简历材料，可粘贴或作为 TXT 上传。
-- `transcript.txt`：面试文字稿，可粘贴或作为 TXT 上传。
+- `profile.json`: company, role, interview round, date, review goal, and suggested checkpoints.
+- `job_description.txt`: a synthetic job description that can be pasted or uploaded as TXT.
+- `resume.txt`: a synthetic candidate resume that can be pasted or uploaded as TXT.
+- `transcript.txt`: a synthetic interview transcript that can be pasted or uploaded as TXT.
 
-## 案例说明
+## Cases
 
-1. `case-01-product-manager`：回答证据较完整，包含连续追问、量化结果和跨团队决策，适合检查主题聚合与高质量报告。
-2. `case-02-data-analyst-asr`：模拟语音转写文本，使用 `speaker_0/speaker_1` 标签，部分回答较模糊，适合检查说话人校对、低置信度确认和证据不足提示。
-3. `case-03-backend-engineer`：包含设备噪声、技术追问和前后矛盾，适合检查噪声排除、追问影响标签与 Reflection 审计。
+1. `case-01-product-manager`: evidence-rich answers with consecutive follow-ups, quantified results, and cross-functional decisions. Use it to test topic grouping and a strong report.
+2. `case-02-data-analyst-asr`: an ASR-style transcript with `speaker_0` and `speaker_1` labels and several ambiguous answers. Use it to test speaker correction, low-confidence verification, and insufficient-evidence notices.
+3. `case-03-backend-engineer`: device noise, technical follow-ups, and contradictions. Use it to test noise exclusion, follow-up impact labels, and quality auditing.
 
-## 使用方式
+## How to Use
 
-打开“新建复盘”，根据 `profile.json` 填写基本信息，再分别上传或粘贴 JD、简历和文字稿。所有案例均应选择“粘贴文字”或“上传文字稿”，不需要调用 Deepgram。
+Open New Review, enter the metadata from `profile.json`, and upload or paste the job description, resume, and transcript. Use pasted-text or transcript-upload mode for these cases; Deepgram is not required.

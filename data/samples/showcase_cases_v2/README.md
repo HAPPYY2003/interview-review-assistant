@@ -1,32 +1,32 @@
-# 面试复盘助手高信息密度展示案例 V2
+# High-Information-Density Showcase Cases V2
 
-本目录提供 5 份可直接用于面试复盘助手 Demo 的完整面试材料。每份转写稿均包含 15 轮问题与回答，回答刻意保留项目背景、个人行动、关键取舍、量化证据、失败与反思，适合展示题卡聚合、证据引用、五维评分、质量审计和成长计划。
+This directory contains five complete interview datasets for product demonstrations. Every transcript includes 15 question-and-answer turns with deliberate project context, individual actions, tradeoffs, quantified evidence, failures, and reflection. The cases are suitable for demonstrating topic grouping, evidence references, five-dimension scoring, quality audits, and growth planning.
 
-## 隐私与真实性
+## Privacy and Authenticity
 
-- 候选人、前雇主、客户、项目名称、项目数据和面试回答均为合成内容，不对应真实个人。
-- 飞书、美团、腾讯云、Microsoft 和 AWS 仅用于建立公开可理解的目标岗位背景。
-- 模拟 JD 根据公开官网、产品文档和技术文章重新编写，不代表相关公司当前正式招聘要求。
-- 本案例集不应作为真实公司面经传播，也不能用来推断相关公司的内部架构或评价标准。
+- Candidates, former employers, customers, projects, metrics, and interview answers are synthetic and do not represent real people.
+- Feishu, Meituan, Tencent Cloud, Microsoft, and AWS provide only publicly understandable target-role context.
+- Synthetic job descriptions are rewritten from public websites, product documentation, and technical articles. They are not official current requirements.
+- These cases must not be shared as genuine interview experiences or used to infer internal architecture or hiring criteria.
 
-## 案例清单
+## Case Matrix
 
-| 目录 | 岗位 | 主要考察点 | 输入特点 |
-|---|---|---|---|
-| `case-01-feishu-ai-product-manager` | 飞书 AI 产品经理 | 场景价值、Agent 工作流、评测、权限、成本、商业化 | 标准角色与时间戳 |
-| `case-02-meituan-strategy-analyst-asr` | 美团履约策略分析师 | 指标树、因果推断、区域实验、业务推动 | `speaker_0/1` ASR 风格 |
-| `case-03-tencent-cloud-sre` | 腾讯云 SRE 稳定性工程师 | SLO、告警治理、事故响应、灰度、容量、演练 | 含系统噪声与事故追问 |
-| `case-04-microsoft-product-designer` | Microsoft 365 产品设计师 | 研究、信息架构、无障碍、设计系统、数据验证 | 作品集深挖 |
-| `case-05-aws-customer-solutions-manager` | AWS 客户解决方案经理 | 云采用、治理、高层沟通、风险、FinOps、规模化 | 中英术语混合 |
+| Directory | Role | Primary focus | Input characteristics |
+| --- | --- | --- | --- |
+| `case-01-feishu-ai-product-manager` | Feishu AI Product Manager | Scenario value, agent workflows, evaluation, permissions, cost, and monetization | Speaker labels and timestamps |
+| `case-02-meituan-strategy-analyst-asr` | Meituan Delivery Strategy Analyst | Metric trees, causal inference, regional experiments, and business influence | `speaker_0/1` ASR style |
+| `case-03-tencent-cloud-sre` | Tencent Cloud SRE | SLOs, alerting, incidents, canary releases, capacity, and drills | System noise and incident follow-ups |
+| `case-04-microsoft-product-designer` | Microsoft 365 Product Designer | Research, information architecture, accessibility, design systems, and data validation | Portfolio deep dive |
+| `case-05-aws-customer-solutions-manager` | AWS Customer Solutions Manager | Cloud adoption, governance, executive communication, risk, FinOps, and scaling | Mixed Chinese and English terminology |
 
-## 每份案例包含
+## Files in Each Case
 
-- `profile.json`：公司、岗位、面试轮次、复盘目标和预期检查点。
-- `job_description.txt`：模拟岗位 JD。
-- `resume.txt`：脱敏合成候选人简历。
-- `transcript.txt`：15 轮高信息密度面试转写稿。
-- `sources.md`：公开参考来源以及事实、推断、合成假设的边界。
+- `profile.json`: company, role, interview round, review goal, and expected checkpoints.
+- `job_description.txt`: synthetic job description.
+- `resume.txt`: de-identified synthetic candidate resume.
+- `transcript.txt`: high-information-density transcript with 15 turns.
+- `sources.md`: public references and the boundary between fact, inference, and synthetic assumption.
 
-## 推荐演示顺序
+## Recommended Demo Order
 
-先使用案例 1 展示稳定的完整复盘，再使用案例 2 展示无角色转写与人工确认，使用案例 3 展示噪声排除和事故审计，最后用案例 4 或 5 展示系统对非产品岗位的泛化能力。
+Start with Case 1 for a stable end-to-end review. Use Case 2 for unlabeled transcripts and human verification, Case 3 for noise exclusion and incident auditing, and Case 4 or 5 to demonstrate transfer beyond product-management roles.

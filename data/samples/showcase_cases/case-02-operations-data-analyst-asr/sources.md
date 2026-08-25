@@ -1,19 +1,19 @@
-# 公开参考与合成边界
+# Public References and Synthesis Boundaries
 
-检索日期：2026-08-21
+Retrieved: 2026-08-21
 
-## Fact｜公开事实
+## Fact
 
-- [美团招聘官网](https://zhaopin.meituan.com/)：用于确认公司、业务与招聘环境的公开背景。
-- [如何提供一个可信的 A/B 测试解决方案](https://tech.meituan.com/2023/08/24/AB-test-practice-in-meituan.html)：公开讨论了实验假设、设计、运行、分析、决策，以及履约场景中的区域差异、溢出和统计陷阱。
-- [美团配送 A/B 评估体系建设实践](https://tech.meituan.com/2020/05/28/Peisong-A-B-Test.html)：公开说明了履约中效率、成本、体验与数据实验闭环。
+- [Meituan Careers](https://zhaopin.meituan.com/): used only for public company, business, and recruiting context.
+- [Building a Credible A/B Testing Solution](https://tech.meituan.com/2023/08/24/AB-test-practice-in-meituan.html): publicly discusses hypotheses, design, execution, analysis, decisions, regional differences, spillover, and statistical pitfalls.
+- [Meituan Delivery A/B Evaluation Practice](https://tech.meituan.com/2020/05/28/Peisong-A-B-Test.html): publicly discusses efficiency, cost, experience, and experiment loops in delivery scenarios.
 
-## Inference｜设计推断
+## Product Design Inference
 
-- 模拟 JD 将公开技术文章中的实验与履约问题转化为数据分析岗位常见职责，用于测试因果解释、实验边界和行动转化。
-- 无角色、带口语词的文本是对 ASR 常见输出形式的测试设计，不来源于真实录音。
+- The synthetic role maps public experiment and delivery problems to common data-analysis responsibilities for testing causal explanation, experiment boundaries, and action planning.
+- The unlabeled spoken-language transcript is an ASR simulation and does not come from a real recording.
 
-## Assumption｜合成假设
+## Synthetic Assumption
 
-- 候选人 B、前雇主、暴雨项目、商圈数量、提升幅度和补贴数据全部为虚构。
-- 转写稿不代表美团真实面试题、面试流程或用人标准。
+- Candidate B, the former employer, weather project, district counts, lift, and subsidy metrics are fictional.
+- The transcript does not represent Meituan interview questions, processes, or hiring criteria.

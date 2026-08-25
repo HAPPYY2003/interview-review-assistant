@@ -1,19 +1,19 @@
-# 公开参考与合成边界
+# Public References and Synthesis Boundaries
 
-检索日期：2026-08-21
+Retrieved: 2026-08-21
 
-## Fact｜公开事实
+## Fact
 
-- [飞书多维表格 AI 功能介绍](https://www.feishu.cn/content/article/7579168498044161238)：公开介绍了 AI 字段、总结、搜索、数据分析、工具调用和工作流节点等能力。
-- [飞书多维表格智能体介绍](https://www.feishu.cn/content/article/7657782356450741223)：公开说明了多维表格智能体的多种使用入口、工具及权限相关信息。
-- [字节跳动社会招聘](https://jobs.bytedance.com/experienced)：用于确认公司与岗位环境的公开背景。
+- [Feishu Base AI features](https://www.feishu.cn/content/article/7579168498044161238): publicly describes AI fields, summarization, search, data analysis, tool calls, and workflow nodes.
+- [Feishu Base agents](https://www.feishu.cn/content/article/7657782356450741223): publicly describes agent entry points, tools, and permission-related behavior.
+- [ByteDance Careers](https://jobs.bytedance.com/experienced): used only for public company and recruiting context.
 
-## Inference｜设计推断
+## Product Design Inference
 
-- 模拟 JD 将企业协作 AI 产品常见责任归纳为场景定义、Agent 工作流、评测、权限和商业化。该结构是为测试面试复盘助手的五维复盘而设计，不等同于飞书真实岗位要求。
-- 面试问题围绕公开产品方向延伸，但没有复制网络面经或招聘页面原句。
+- The synthetic job description groups common enterprise AI responsibilities into scenario definition, agent workflows, evaluation, permissions, and monetization. It is designed to test the product's five-dimension review and is not an official Feishu role specification.
+- Interview questions extend from public product direction without copying interview reports or recruiting pages.
 
-## Assumption｜合成假设
+## Synthetic Assumption
 
-- 候选人 A、前雇主、客户数量、准确率、激活率、付费结果和事故数据全部为虚构。
-- 转写稿为人工合成，不代表字节跳动或飞书真实面试流程与评价标准。
+- Candidate A, the former employer, customer counts, accuracy, activation, revenue, and incident metrics are fictional.
+- The transcript does not represent ByteDance or Feishu interviews, processes, or hiring criteria.

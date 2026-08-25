@@ -1,20 +1,20 @@
-# 公开参考与合成边界
+# Public References and Synthesis Boundaries
 
-检索日期：2026-08-21
+Retrieved: 2026-08-21
 
-## Fact｜公开事实
+## Fact
 
-- [Microsoft Careers 产品设计搜索页](https://jobs.careers.microsoft.com/global/en/search?keywords=product+design)：用于 Microsoft 招聘与使命背景。
-- [Fluent 2 Design Principles](https://fluent2.microsoft.design/design-principles)：公开介绍跨平台自然、聚焦、包容和一致性设计原则。
-- [Fluent 2 Accessibility](https://fluent2.microsoft.design/accessibility)：公开说明 WCAG 2.1 AA、键盘、焦点、对比度、响应式和缩放等要求。
-- [Microsoft Inclusive Design](https://inclusive.microsoft.design/)：公开介绍识别排斥、向多样性学习和为一人解决并惠及更多人的方法。
+- [Microsoft Careers product design search](https://jobs.careers.microsoft.com/global/en/search?keywords=product+design): used for public recruiting and mission context.
+- [Fluent 2 Design Principles](https://fluent2.microsoft.design/design-principles): publicly describes natural, focused, inclusive, and consistent cross-platform design.
+- [Fluent 2 Accessibility](https://fluent2.microsoft.design/accessibility): publicly describes WCAG 2.1 AA, keyboard, focus, contrast, responsive, and zoom requirements.
+- [Microsoft Inclusive Design](https://inclusive.microsoft.design/): publicly describes recognizing exclusion, learning from diversity, and extending a solution designed for one person.
 
-## Inference｜设计推断
+## Product Design Inference
 
-- 模拟 JD 将公开原则转化为企业产品设计师的研究、交付和数据验证职责。
-- 搜索项目是通用合成场景，不表示 Microsoft 365 的真实设计或产品计划。
+- The synthetic role maps public principles to common enterprise-product research, delivery, and data-validation responsibilities.
+- The search project is a generic scenario and does not describe Microsoft 365 design or product plans.
 
-## Assumption｜合成假设
+## Synthetic Assumption
 
-- 候选人 D、前雇主、研究、项目和全部数据均为虚构。
-- 转写稿不代表 Microsoft 真实面试题、流程或录用标准。
+- Candidate D, the former employer, research, projects, and all metrics are fictional.
+- The transcript does not represent Microsoft interview questions, processes, or hiring criteria.

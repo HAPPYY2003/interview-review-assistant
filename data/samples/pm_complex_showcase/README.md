@@ -1,32 +1,32 @@
-# 字节跳动飞书 AI 产品经理复杂面试案例
+# Complex Feishu AI Product Manager Interview Case
 
-本目录是一套用于面试复盘助手展示和测试的合成材料。目标公司与产品名称采用真实公开信息，岗位描述经过重新组织；候选人姓名、任职公司、项目经历、业务数据和面试内容全部为虚构，不代表字节跳动或飞书的真实招聘结论。
+This directory contains synthetic material for product demonstrations and regression testing. Real public company and product names provide understandable context; the job description is reorganized from public information. The candidate, employer, projects, business metrics, and interview content are entirely fictional and do not represent ByteDance or Feishu hiring decisions.
 
-## 文件说明
+## Files
 
-- `profile.json`：新建复盘时使用的公司、岗位、轮次、日期和复盘目标。
-- `job_description.txt`：基于公开招聘信息和飞书官方产品资料整理的模拟 JD。
-- `resume.txt`：虚构候选人的完整项目型简历，与 JD 存在较高匹配度，同时保留可被追问的风险和不足。
-- `transcript_with_roles.txt`：20 轮问答，包含时间戳、面试官和候选人角色标注。
-- `transcript_without_roles.txt`：与有角色版保持相同语义和顺序，只删除说话人角色，用于测试说话人推断和低置信度确认。
-- `sources.md`：构造岗位和产品背景时参考的公开网页及使用边界。
+- `profile.json`: company, role, interview round, date, and review goal.
+- `job_description.txt`: a synthetic job description based on public recruiting and product information.
+- `resume.txt`: a fictional project-based resume with strong role fit and deliberate risks for deeper follow-up.
+- `transcript_with_roles.txt`: 20 question-and-answer turns with timestamps and explicit interviewer/candidate labels.
+- `transcript_without_roles.txt`: the same content and order with speaker labels removed, for speaker-inference and confidence testing.
+- `sources.md`: public references and the boundaries of their use.
 
-## 推荐展示路径
+## Recommended Demo
 
-1. 在“新建复盘”中填入 `profile.json` 的基本信息。
-2. 上传或粘贴 `job_description.txt` 与 `resume.txt`。
-3. 第一次使用 `transcript_with_roles.txt`，展示稳定拆题、追问聚合、证据引用和报告生成。
-4. 第二次使用 `transcript_without_roles.txt`，展示低置信度提示、说话人校对和人工确认节点。
-5. 对比两份报告时，应重点说明输入质量如何影响确认成本，而不是声称模型对无角色文本能够百分之百正确识别。
+1. Enter the metadata from `profile.json` on New Review.
+2. Upload or paste `job_description.txt` and `resume.txt`.
+3. Start with `transcript_with_roles.txt` to demonstrate stable parsing, follow-up grouping, evidence references, and report generation.
+4. Then use `transcript_without_roles.txt` to demonstrate confidence notices, speaker correction, and human verification.
+5. When comparing reports, explain how input quality changes verification effort. Do not claim perfect recognition for transcripts without speaker labels.
 
-## 预期检查点
+## Expected Checkpoints
 
-- 两个版本都包含 20 轮问题与回答，内容顺序一一对应。
-- 有角色版应识别出 20 个问题，并将部分连续追问聚合到同一主题。
-- 无角色版不包含“面试官”“候选人”“Q”“A”等角色标注，系统应将角色和边界标记为需要确认。
-- 报告应识别候选人在企业 AI、Agent 工作流、效果评估、权限安全、增长和商业化方面的匹配证据。
-- Reflection 应关注样本量较小、续约指标不能直接归因、自动写入事故以及指标口径边界。
+- Both transcripts contain 20 question-and-answer turns in the same order.
+- The labeled version should identify 20 questions and group several consecutive follow-ups into topics.
+- The unlabeled version contains no interviewer, candidate, Q, or A markers; speaker roles and boundaries should be presented for verification.
+- The report should identify evidence related to enterprise AI, agent workflows, evaluation, permissions, growth, and monetization.
+- The audit should examine small samples, unsupported renewal attribution, an automatic-write incident, and metric-definition boundaries.
 
-## 使用边界
+## Usage Boundary
 
-本案例仅用于产品演示、功能回归和面试练习，不应作为真实候选人材料、真实招聘 JD 或字节跳动内部信息对外传播。
+This case is only for product demos, regression testing, and interview practice. It must not be presented as a real candidate profile, an official job description, or internal ByteDance/Feishu information.

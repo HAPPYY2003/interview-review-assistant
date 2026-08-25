@@ -1,30 +1,30 @@
-# 面试复盘助手展示案例集
+# Interview Review Assistant Showcase Cases
 
-本目录包含 5 份可用于面试复盘助手 Demo 的完整测试资料。所有候选人姓名、前雇主、项目名称、业务数据和面试回答均为合成内容，不对应真实个人，也不应当作为任何公司的真实面经传播。
+This directory contains five complete datasets for product demonstrations. Candidate names, former employers, projects, business metrics, and interview answers are synthetic. They do not represent real people and must not be shared as genuine interview experiences.
 
-真实公司名称仅用于提供公开可理解的岗位背景。模拟 JD 参考官方招聘、产品文档或技术文章后重新编写，不代表相关公司的当前正式招聘要求。公开资料的来源和“事实 / 推断 / 假设”边界记录在各案例的 `sources.md` 中。
+Real company names provide understandable public role context. Synthetic job descriptions are rewritten from public recruiting pages, product documentation, or technical articles and do not represent current official requirements. Each `sources.md` records the boundary between public fact, design inference, and synthetic assumption.
 
-## 目录结构
+## Case Matrix
 
-| 案例 | 岗位 | 输入特征 | 主要展示点 |
-|---|---|---|---|
-| `case-01-ai-product-manager` | 飞书 AI 产品经理 | 标准角色 + 时间戳 | Agent 边界、评测、权限、商业化与失败复盘 |
-| `case-02-operations-data-analyst-asr` | 美团履约数据分析师 | 无角色 ASR 风格 | 说话人推断、口语噪声、因果分析与实验设计 |
-| `case-03-cloud-backend-engineer` | 腾讯云后端工程师 | 标准角色 + 系统噪声 | 微服务治理、事故追问、容量与数据一致性 |
-| `case-04-enterprise-product-designer` | Microsoft 365 产品设计师 | 双面试官语境 | 用户研究、设计系统、无障碍和跨团队冲突 |
-| `case-05-cloud-customer-solutions-manager` | AWS 客户解决方案经理 | 中英术语混合 | 云迁移、项目治理、业务价值和高层沟通 |
+| Directory | Role | Input characteristics | Primary demonstration focus |
+| --- | --- | --- | --- |
+| `case-01-ai-product-manager` | Feishu AI Product Manager | Speaker labels and timestamps | Agent boundaries, evaluation, permissions, monetization, and failure review |
+| `case-02-operations-data-analyst-asr` | Meituan Delivery Data Analyst | Unlabeled ASR style | Speaker inference, spoken-language noise, causal analysis, and experiment design |
+| `case-03-cloud-backend-engineer` | Tencent Cloud Backend Engineer | Speaker labels and system noise | Microservice governance, incident follow-up, capacity, and data consistency |
+| `case-04-enterprise-product-designer` | Microsoft 365 Product Designer | Two-interviewer context | User research, design systems, accessibility, and cross-functional conflict |
+| `case-05-cloud-customer-solutions-manager` | AWS Customer Solutions Manager | Mixed Chinese and English terminology | Cloud migration, program governance, business value, and executive communication |
 
-## 每份案例包含
+## Files in Each Case
 
-- `profile.json`：新建复盘时填写的基本信息和建议检查点。
-- `job_description.txt`：模拟岗位 JD。
-- `resume.txt`：脱敏且完全虚构的候选人项目简历。
-- `transcript.txt`：约 15 轮问题与回答的合成转写稿。
-- `sources.md`：公开参考来源、使用方式和合成边界。
+- `profile.json`: interview metadata and suggested checkpoints.
+- `job_description.txt`: synthetic job description.
+- `resume.txt`: de-identified, fully fictional project resume.
+- `transcript.txt`: synthetic transcript with approximately 15 question-and-answer turns.
+- `sources.md`: public references, usage, and synthesis boundaries.
 
-## 使用建议
+## Suggested Use
 
-1. 在“新建复盘”中按照 `profile.json` 填写公司、岗位、轮次、日期和复盘目标。
-2. 分别粘贴或上传 JD、简历和转写稿。所有材料都是 TXT，不需要调用 Deepgram。
-3. 案例 2 刻意不写“面试官 / 候选人”，适合演示说话人识别和人工确认；其他案例适合稳定演示主问题与追问聚合。
-4. 报告生成后重点查看证据回查、追问影响、岗位匹配、Reflection 修订记录和七天成长计划。
+1. Enter company, role, round, date, and review goal from `profile.json`.
+2. Paste or upload the job description, resume, and transcript. All files are TXT, so Deepgram is not required.
+3. Case 2 intentionally omits interviewer/candidate labels and is suitable for speaker inference and human verification. The other cases are designed for stable main-question and follow-up grouping.
+4. After report generation, inspect source traceability, follow-up impact, role fit, audit revisions, and next actions.

@@ -1,19 +1,19 @@
-# 公开参考与合成边界
+# Public References and Synthesis Boundaries
 
-检索日期：2026-08-21
+Retrieved: 2026-08-21
 
-## Fact｜公开事实
+## Fact
 
-- [美团招聘官网](https://zhaopin.meituan.com/)：用于公司和招聘环境背景。
-- [如何提供一个可信的 A/B 测试解决方案](https://tech.meituan.com/2023/08/24/AB-test-practice-in-meituan.html)：公开讨论实验假设、设计、分析、决策，以及履约场景中的区域差异、溢出、小样本和统计陷阱。
-- [美团配送 A/B 评估体系建设实践](https://tech.meituan.com/2020/05/28/Peisong-A-B-Test.html)：公开讨论履约效率、成本、体验和实验闭环。
+- [Meituan Careers](https://zhaopin.meituan.com/): used only for public company and recruiting context.
+- [Building a Credible A/B Testing Solution](https://tech.meituan.com/2023/08/24/AB-test-practice-in-meituan.html): publicly discusses hypotheses, design, analysis, decisions, regional differences, spillover, small samples, and statistical pitfalls.
+- [Meituan Delivery A/B Evaluation Practice](https://tech.meituan.com/2020/05/28/Peisong-A-B-Test.html): publicly discusses delivery efficiency, cost, experience, and experiment loops.
 
-## Inference｜设计推断
+## Product Design Inference
 
-- 模拟 JD 将公开实验问题转化为履约策略分析师常见职责。
-- ASR 形式、问题和回答均为合成，不来自真实录音或网络面经。
+- The synthetic job description maps public experiment problems to common delivery-strategy analysis responsibilities.
+- The ASR format, questions, and answers are synthetic and do not come from recordings or online interview reports.
 
-## Assumption｜合成假设
+## Synthetic Assumption
 
-- 候选人 B、前雇主、商圈、项目和全部数据均为虚构。
-- 转写稿不代表美团真实面试题、内部策略或录用标准。
+- Candidate B, the former employer, districts, projects, and all metrics are fictional.
+- The transcript does not represent Meituan interview questions, internal strategy, or hiring criteria.
