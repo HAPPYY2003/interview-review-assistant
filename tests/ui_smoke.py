@@ -278,7 +278,13 @@ def run() -> None:
                 assert page.locator(".follow-up-answer").count() == 0
                 follow_ups.first.click()
                 assert page.locator(".follow-up-answer").count() == 1
-                follow_ups.first.click()
+                assert page.locator(".follow-up-turn.expanded .probe-focus-row em").count() >= 1
+                page.locator(".follow-up-turn.expanded [data-edit-turn]").click()
+                probe_options = page.locator('.turn-edit-form [data-probe-focus]')
+                assert probe_options.count() == 11
+                assert page.locator('.turn-edit-form [data-probe-focus]:checked').count() <= 2
+                page.locator("[data-cancel-edit]").click()
+                page.locator(".follow-up-question").first.click()
             source_turns = page.locator(".topic-source-turn")
             assert source_turns.count() >= 1, "current topic sources should be visible below the review"
             assert page.locator(".source-drawer").count() == 0, "topic sources should not open in a drawer"
@@ -428,6 +434,8 @@ def run() -> None:
             assert page.locator(".audit-summary").count() == 2
             assert "逐题复盘审计" in page.locator(".audit-band").inner_text()
             assert "成长计划终审" in page.locator(".audit-band").inner_text()
+            assert "包含提醒" not in page.locator(".audit-band").inner_text()
+            assert page.locator(".audit-summary.warning").count() == 0
             assert page.locator(".action-item").count() == 3
             assert page.locator(".practice-entry").count() == 3
             assert page.locator(".action-deliverable").count() == 0
@@ -437,6 +445,20 @@ def run() -> None:
             assert page.locator(".gap-topics").evaluate_all(
                 "groups => groups.every(group => { const labels = [...group.querySelectorAll('button')].map(button => button.innerText); return labels.length === new Set(labels).size; })"
             ), "gap topic actions need distinct labels within each gap"
+            assert page.locator(".gap-topics button").evaluate_all(
+                """buttons => buttons.every(button => {
+                    const buttonBox = button.getBoundingClientRect();
+                    const labelBox = button.querySelector('span').getBoundingClientRect();
+                    return buttonBox.width < 116
+                        && getComputedStyle(button).justifyContent === 'center'
+                        && getComputedStyle(button).alignItems === 'center'
+                        && Math.abs((buttonBox.left + buttonBox.width / 2) - (labelBox.left + labelBox.width / 2)) <= 1;
+                })"""
+            ), "gap topic buttons should remain compact and centered"
+            action_card_heights = page.locator(".action-item").evaluate_all(
+                "cards => cards.slice(0, 2).map(card => Math.round(card.getBoundingClientRect().height))"
+            )
+            assert max(action_card_heights) - min(action_card_heights) <= 1, "action cards in one row should align"
             page.locator(".practice-entry").first.click()
             practice_drawer = page.locator("#practiceDialog")
             practice_drawer.wait_for(state="visible")
@@ -445,23 +467,96 @@ def run() -> None:
             assert page.locator(".practice-steps li").count() >= 3
             assert page.locator(".practice-response textarea").is_visible()
             assert_no_overflow(page, "desktop practice drawer")
+            topic_links = page.locator(".practice-topic-links")
+            if topic_links.count():
+                title_box = topic_links.locator(":scope > strong").bounding_box()
+                first_link_box = topic_links.locator("button").first.bounding_box()
+                assert title_box and first_link_box and first_link_box["y"] >= title_box["y"] + title_box["height"]
             practice_text = (
                 "我会先直接说明项目目标，再交代自己负责的判断、方案和推进动作。"
                 "回答时区分个人贡献与团队成果，并说明结果如何验证。"
                 "对于当前没有原始材料支持的细节，我会明确标记为待补充，不把推测写成事实。"
                 "最后我会根据完成标准再口头复述一次，检查回答是否聚焦、结构清楚且可以回查。"
             )
-            page.locator("#practiceResponse").fill(practice_text)
+            with page.expect_response(
+                lambda response: "/api/v1/practice-sessions/" in response.url
+                and response.request.method == "PATCH"
+            ) as autosave_response:
+                page.locator("#practiceResponse").fill(practice_text)
+            assert autosave_response.value.ok, "practice draft autosave should succeed"
+            page.reload(wait_until="networkidle")
+            launcher = page.locator(".practice-session-launcher")
+            launcher.wait_for(timeout=8_000)
+            assert page.locator(".action-item").first.locator(".practice-entry").inner_text().strip() == "继续练习"
+            assert "进行中的练习" in launcher.inner_text()
+            assert launcher.locator(".practice-session-trigger > strong").inner_text() == "1"
+            launcher.locator("[data-toggle-practice-sessions]").click()
+            first_session_row = page.locator("[data-open-practice-session]").first
+            first_session_id = first_session_row.get_attribute("data-open-practice-session")
+            assert first_session_id
+            assert "草稿已保存" in first_session_row.inner_text()
+            first_session_row.click()
+            practice_drawer = page.locator("#practiceDialog")
+            practice_drawer.wait_for(state="visible")
+            page.locator(".practice-brief").wait_for(timeout=8_000)
+            assert page.locator("#practiceResponse").input_value() == practice_text
+            if page.locator(".practice-topic-links button").count():
+                linked_topic_id = page.locator(".practice-topic-links button").first.get_attribute("data-open-topic")
+                page.locator(".practice-topic-links button").first.click()
+                practice_drawer.wait_for(state="detached")
+                assert page.locator(".practice-session-launcher").is_visible()
+                assert "expanded" in (page.locator(f'[data-topic-review="{linked_topic_id}"]').get_attribute("class") or "")
+                page.locator("[data-toggle-practice-sessions]").click()
+                page.locator(f'[data-open-practice-session="{first_session_id}"]').click()
+                practice_drawer = page.locator("#practiceDialog")
+                practice_drawer.wait_for(state="visible")
+                assert page.locator("#practiceResponse").input_value() == practice_text
+
+            current_mode = page.locator(".practice-mode-control button.active").get_attribute("data-practice-mode")
+            second_mode = "follow_up_drill" if current_mode != "follow_up_drill" else "case_builder"
+            page.locator(f'[data-practice-mode="{second_mode}"]').click()
+            page.locator(".practice-brief").wait_for(timeout=8_000)
+            second_practice_text = "这是第二种练习模式的草稿，用于验证多个会话可以分别恢复。"
+            with page.expect_response(
+                lambda response: "/api/v1/practice-sessions/" in response.url
+                and response.request.method == "PATCH"
+            ) as second_autosave_response:
+                page.locator("#practiceResponse").fill(second_practice_text)
+            assert second_autosave_response.value.ok
+            page.locator("[data-minimize-practice]").click()
+            launcher = page.locator(".practice-session-launcher")
+            launcher.wait_for(timeout=8_000)
+            assert launcher.locator(".practice-session-trigger > strong").inner_text() == "2"
+            launcher.locator("[data-toggle-practice-sessions]").click()
+            assert page.locator("[data-open-practice-session]").count() == 2
+            assert page.locator(".practice-session-row.current").count() == 1
+            page.screenshot(path=OUTPUT_DIR / "ui-practice-list-desktop.png", full_page=True)
+            page.locator(f'[data-open-practice-session="{first_session_id}"]').click()
+            practice_drawer = page.locator("#practiceDialog")
+            practice_drawer.wait_for(state="visible")
+            assert page.locator("#practiceResponse").input_value() == practice_text
             page.locator("[data-save-practice-draft]").click()
             page.locator("#practiceResponse").wait_for(state="visible")
             assert page.locator("#practiceResponse").input_value() == practice_text
+            drawer_body = page.locator("#practiceDialog .practice-drawer-body")
+            scroll_top = drawer_body.evaluate(
+                "element => { const max = element.scrollHeight - element.clientHeight; element.scrollTop = Math.min(max, 360); return element.scrollTop; }"
+            )
+            assert scroll_top > 80, "practice drawer needs enough content to verify scroll restoration"
             page.locator("[data-submit-practice]").click()
             page.locator(".practice-rubric-list").wait_for(timeout=8_000)
+            assert drawer_body.evaluate("element => element.scrollTop") > 80, "practice feedback polling must not reset drawer scroll"
             assert page.locator(".practice-rubric-list > div").count() >= 2
             assert page.locator(".practice-attempt-tabs button").count() == 1
             page.screenshot(path=OUTPUT_DIR / "ui-practice-desktop.png", full_page=True)
-            page.locator("[data-close-practice]").click()
+            page.locator("[data-minimize-practice]").click()
             practice_drawer.wait_for(state="detached")
+            launcher = page.locator(".practice-session-launcher")
+            launcher.wait_for(timeout=8_000)
+            assert launcher.locator(".practice-session-trigger > strong").inner_text() == "1"
+            launcher.locator("[data-toggle-practice-sessions]").click()
+            assert page.locator("[data-open-practice-session]").count() == 1
+            launcher.locator("[data-toggle-practice-sessions]").click()
             rerun_review = page.locator("#rerunReview")
             assert rerun_review.is_visible()
             assert rerun_review.inner_text().strip() == "重新面试复盘"
@@ -477,7 +572,8 @@ def run() -> None:
             assert rerun_dialog.locator("#startRun").is_enabled()
             rerun_dialog.get_by_role("button", name="取消").click()
             rerun_dialog.wait_for(state="hidden")
-            page.locator(".accordion-button").first.click()
+            if page.locator(".accordion-panel").count() == 0:
+                page.locator(".accordion-button").first.click()
             page.locator(".accordion-panel").wait_for()
             tabs = page.locator(".question-review-tabs .question-review-tab")
             assert tabs.count() == 5
@@ -561,7 +657,17 @@ def run() -> None:
             assert mobile_practice_drawer.evaluate("node => Math.abs(node.getBoundingClientRect().width - innerWidth) <= 1")
             assert_no_overflow(page, "mobile practice drawer")
             page.screenshot(path=OUTPUT_DIR / "ui-practice-mobile.png", full_page=True)
-            page.locator("[data-close-practice]").click()
+            page.locator("[data-minimize-practice]").click()
+            mobile_launcher = page.locator(".practice-session-launcher")
+            mobile_launcher.wait_for(timeout=8_000)
+            mobile_launcher.locator("[data-toggle-practice-sessions]").click()
+            mobile_panel = page.locator(".practice-session-panel")
+            assert mobile_panel.is_visible()
+            assert mobile_panel.evaluate(
+                "node => node.getBoundingClientRect().left >= 0 && node.getBoundingClientRect().right <= innerWidth"
+            )
+            page.screenshot(path=OUTPUT_DIR / "ui-practice-list-mobile.png", full_page=True)
+            mobile_launcher.locator("[data-toggle-practice-sessions]").click()
             page.screenshot(path=OUTPUT_DIR / "ui-report-mobile.png", full_page=True)
             page.set_viewport_size({"width": 1440, "height": 900})
             page.goto(f"{BASE_URL}/#/trends", wait_until="networkidle")

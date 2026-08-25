@@ -1,0 +1,20 @@
+{
+  "company": "美团",
+  "position": "履约策略分析师",
+  "round": "专业二面",
+  "interviewDate": "2026-08-19",
+  "reviewGoal": "检查指标拆解、数据质量、因果推断、区域实验、业务决策和跨团队推动，并演示无角色 ASR 文本的语义拆题",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "transcriptStyle": "speaker_ids_with_asr_fillers",
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "requiresSpeakerConfirmation": true
+  },
+  "expectedFocus": [
+    "speaker_0 应映射为 interviewer，speaker_1 应映射为 candidate",
+    "不能把口语纠正和回答中的分析性语句误拆成新问题",
+    "重点核验区域溢出、样本量、护栏指标和归因限制"
+  ]
+}

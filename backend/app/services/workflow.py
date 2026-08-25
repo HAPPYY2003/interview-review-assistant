@@ -252,6 +252,11 @@ class ReviewWorkflow:
             "capabilityGaps": growth["capabilityGaps"],
             "actionItems": growth["actionItems"],
             "nextFocus": growth["nextFocus"],
+            "topicReviewAudit": {
+                **audit,
+                "round": int(self.db.get_run(run_id).get("audit_round") or 1),
+                "revisionCount": int(self.db.get_run(run_id).get("revision_count") or 0),
+            },
             "growthPlanAudit": {
                 **growth_audit,
                 "round": int(self.db.get_run(run_id).get("checkpoint", {}).get("growthAuditRound") or 1),
@@ -571,6 +576,7 @@ class ReviewWorkflow:
             "下方证据包已经登记，可以直接引用，不要重复搜索同一内容。"
             "evidenceIds 只能填写 EvidenceLookup 返回且以 ev- 开头的 evidenceId；题卡、片段、话轮和原子编号都不是证据 ID。"
             "回答逻辑只引用候选人回答；面试官信号只引用对应问题片段，不能猜测面试官心理。"
+            "追问中的 probeFocus 是考察重点，用它判断应重点核查实验、归因、决策或复盘证据；它不改变主题题型和五维评分权重。"
             "interviewerSignals 和 followUpAssessments 只能使用当前追问的 UUID；没有追问时必须输出空数组，绝不能把时间戳当作话轮 ID。"
             "根据题型选择 STAR、PREP、THREE_W、FIT_EVIDENCE_MOTIVATION、DIRECT 或 CUSTOM；"
             "自我介绍题优先使用 FIT_EVIDENCE_MOTIVATION，突出岗位匹配、经历证据和求职动机。"
@@ -1770,7 +1776,9 @@ class ReviewWorkflow:
     def _save_fixture_artifacts(self, run_id: str, batch: dict[str, Any], trace_path: Path, *, agent_type: str) -> None:
         for review in batch["reviews"]:
             self.db.save_stage_artifact(run_id, "evidence_review", {"review": review, "evidenceRefs": review.get("evidenceRefs", [])}, topic_id=review["id"], agent_type=agent_type, model="deterministic-evidence-v1")
-        self.db.save_stage_artifact(run_id, "reflection_audit", {"audit": {"decision": "pass", "summary": "确定性引用校验完成", "findings": []}, "round": 1, "accepted": True}, agent_type=agent_type, model="deterministic-evidence-v1")
+        topic_audit = {"decision": "pass", "summary": "确定性引用校验完成", "findings": []}
+        self.db.save_stage_artifact(run_id, "reflection_audit", {"audit": topic_audit, "round": 1, "accepted": True}, agent_type=agent_type, model="deterministic-evidence-v1")
+        batch["topicReviewAudit"] = {**topic_audit, "round": 1, "revisionCount": 0}
         plan = {
             "summary": batch["summary"], "topRisks": batch["topRisks"],
             "overallEvaluation": batch.get("overallEvaluation", {}), "capabilityGaps": batch.get("capabilityGaps", []),
@@ -1875,6 +1883,7 @@ class ReviewWorkflow:
             "actionItems": batch.get("actionItems", []),
             "nextFocus": batch.get("nextFocus", ""),
             "auditNotes": batch.get("auditNotes", []),
+            "topicReviewAudit": batch.get("topicReviewAudit"),
             "growthPlanAudit": batch.get("growthPlanAudit"),
             "artifactIds": [item["id"] for item in artifacts],
             "auditRevisionCount": int(self.db.get_run(run_id).get("revision_count") or 0),
@@ -1915,6 +1924,7 @@ class ReviewWorkflow:
             "status": "completed", "reviewMode": run.get("review_mode", "full"), "summary": meta.get("summary", ""), "overallScores": meta.get("overallScores", {}),
             "topRisks": meta.get("topRisks", []), "auditNotes": meta.get("auditNotes", []), "nextFocus": meta.get("nextFocus", ""),
             "overallEvaluation": overall_evaluation, "capabilityGaps": capability_gaps,
+            "topicReviewAudit": meta.get("topicReviewAudit"),
             "growthPlanAudit": meta.get("growthPlanAudit"),
             "agentMode": run.get("agent_mode", "legacy"), "degraded": bool(run.get("degraded")),
             "auditRound": int(run.get("audit_round") or 1),
@@ -1965,6 +1975,7 @@ class ReviewWorkflow:
     def _turn_digest(turn: dict[str, Any]) -> dict[str, Any]:
         return {key: turn.get(key) for key in (
             "id", "version", "interviewerQuestion", "candidateAnswer", "questionType", "confirmed", "needsConfirmation",
+            "probeFocus", "probeFocusConfidence",
         )}
 
     @staticmethod

@@ -4,8 +4,11 @@ import {
   GAP_CATEGORY_LABELS,
   modeLabel,
   normalizeInterviewRecord,
+  normalizeProbeFocus,
   normalizeQuestionRecord,
   normalizeReportRecord,
+  PROBE_FOCUS_VALUES,
+  questionTypeFromProbeFocus,
   SIGNAL_TYPE_LABELS,
   SCORE_LABELS
 } from "./data-model.js";
@@ -20,6 +23,7 @@ const PRACTICE_MODE_LABELS = {
   case_builder: "案例补充",
   knowledge_quiz: "知识自测"
 };
+const RESTORABLE_PRACTICE_STATUSES = new Set(["generating", "ready", "draft", "reviewing", "failed"]);
 const REVIEW_TEMPLATE_PLACEHOLDERS = new Set([
   "综合诊断", "至少两个字的判断依据", "至少两个字的追问判断", "有证据的优点", "有证据的问题",
   "原回答路径概括", "步骤名称", "原回答内容", "逻辑缺口", "框架选择原因", "表达建议",
@@ -84,6 +88,7 @@ const CONFIRMATION_REASON_LABELS = {
   FOLLOWUP_PARENT_UNCERTAIN: "追问归属不明确",
   QUESTION_TYPE_UNCERTAIN: "题型分类不确定",
   TOPIC_GROUPING_UNCERTAIN: "主题归并不确定",
+  PROBE_FOCUS_UNCERTAIN: "追问考察重点不确定",
   SOURCE_QUALITY_LOW: "原始文稿结构较弱",
   ANSWER_MISSING: "未识别到回答",
   CHUNK_OVERLAP_CONFLICT: "分块结果冲突",
@@ -164,16 +169,32 @@ const state = {
   practiceDraft: "",
   practiceSelfRating: "",
   practiceSelectedAttemptId: "",
-  practiceLoading: false
+  practiceLoading: false,
+  practiceSessionSummaries: [],
+  practiceSessionListLoaded: false,
+  practiceSessionListOpen: false,
+  practiceSessionListError: "",
+  practiceSessionListRunId: ""
 };
 let activeSource = null;
 let toastTimer = null;
 let practicePollTimer = null;
+let practiceSummaryPollTimer = null;
+let practiceDraftSaveTimer = null;
 let practiceOriginScrollY = 0;
+let practiceDrawerScrollTop = 0;
+
+window.addEventListener("pagehide", flushPracticeDraftOnPageHide);
+window.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || !state.practiceSessionListOpen || state.practiceDialogOpen) return;
+  state.practiceSessionListOpen = false;
+  render();
+});
 
 window.addEventListener("hashchange", async () => {
   closeEventSource();
   closePracticeDialog(false);
+  resetPracticeSessionList();
   state.route = parseRoute();
   state.error = "";
   state.expandedQuestionId = null;
@@ -256,6 +277,7 @@ async function loadRouteData() {
   if (state.route.name === "review" && record?.runId) {
     try {
       await loadReport(record);
+      await loadPracticeSessionSummaries({ shouldRender: false, silent: true });
     } catch (error) {
       state.error = readableError(error);
     }
@@ -287,6 +309,7 @@ function parseRoute() {
 }
 
 function render() {
+  if (state.practiceDialogOpen) capturePracticeDrawerScroll();
   app.innerHTML = `
     <div class="app-shell">
       ${renderSidebar()}
@@ -313,8 +336,20 @@ function render() {
     requestAnimationFrame(() => {
       const dialog = document.querySelector("#practiceDialog");
       if (dialog && !dialog.open) dialog.showModal();
+      restorePracticeDrawerScroll();
     });
   }
+}
+
+function capturePracticeDrawerScroll() {
+  const body = document.querySelector("#practiceDialog .practice-drawer-body");
+  if (body) practiceDrawerScrollTop = body.scrollTop;
+}
+
+function restorePracticeDrawerScroll() {
+  const body = document.querySelector("#practiceDialog .practice-drawer-body");
+  if (!body) return;
+  body.scrollTop = Math.min(practiceDrawerScrollTop, Math.max(0, body.scrollHeight - body.clientHeight));
 }
 
 function renderSidebar() {
@@ -322,8 +357,8 @@ function renderSidebar() {
   return `
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">OR</div>
-        <div><p class="brand-title">Offer Radar</p><div class="brand-subtitle">Agent 面试复盘工作台</div></div>
+        <div class="brand-mark">复</div>
+        <div><p class="brand-title">面试复盘助手</p><div class="brand-subtitle">智能面试复盘工作台</div></div>
       </div>
       <nav class="nav" aria-label="主导航">
         ${navButton("home", "#/", "◎", "面试记录")}
@@ -607,6 +642,9 @@ function renderTopicEditor(topic, record) {
   const reviewed = topicIsReviewed(topic);
   const reviewReasons = topicReviewReasons(topic, record);
   const visibleReasons = reviewReasons.slice(0, 2);
+  const questionTypeSuggested = (root.confidenceDetails?.semanticNotices || []).some(
+    item => item.code === "QUESTION_TYPE_UNCERTAIN"
+  );
   return `<form id="topicEditor" data-id="${topic.id}" class="section topic-editor">
     <div class="topic-editor-heading">
       <div class="topic-title-control">
@@ -619,7 +657,7 @@ function renderTopicEditor(topic, record) {
         </div>
       </div>
       <div class="topic-heading-controls">
-        <label class="topic-type-control"><span>题型</span><select class="select" name="questionType" data-topic-type>${QUESTION_TYPES.map(type => `<option ${type === selectedQuestionType ? "selected" : ""}>${type}</option>`).join("")}</select></label>
+        <label class="topic-type-control"><span>题型${questionTypeSuggested ? `<small>建议确认</small>` : ""}</span><select class="select" name="questionType" data-topic-type>${QUESTION_TYPES.map(type => `<option ${type === selectedQuestionType ? "selected" : ""}>${type}</option>`).join("")}</select></label>
         ${mergeTargets.length ? `<details class="topic-merge">
           <summary class="button secondary compact" id="openMergeTopic">${renderLucideIcon("git-merge")}合并主题</summary>
           <div class="topic-merge-panel">
@@ -665,6 +703,7 @@ function renderTurnEditForm(turn, label) {
   return `<div class="turn-edit-form" data-turn-editor="${turn.id}">
     <label class="field"><span>${label}</span><textarea class="textarea editor-question" data-edit-field="question" required>${escapeHtml(turn.editedQuestion || turn.interviewerQuestion)}</textarea></label>
     <label class="field"><span>用于评分的回答</span><textarea class="textarea editor-answer" data-edit-field="answer">${escapeHtml(turn.editedAnswer || turn.candidateAnswer)}</textarea></label>
+    ${turn.turnType === "follow_up" ? `<fieldset class="probe-focus-editor"><legend>考察重点 <small>最多选择 2 项</small></legend><div>${PROBE_FOCUS_VALUES.map(focus => `<label><input type="checkbox" data-probe-focus value="${focus}" ${(turn.probeFocus || []).includes(focus) ? "checked" : ""}><span>${focus}</span></label>`).join("")}</div></fieldset>` : ""}
     <div class="edit-actions"><button type="button" class="button ghost compact" data-cancel-edit>取消</button><button type="submit" class="button secondary compact">保存修改</button></div>
   </div>`;
 }
@@ -675,10 +714,12 @@ function renderFollowUpTurn(turn, index) {
   const status = turnReviewState(turn);
   const reason = turnConfirmationReasons(turn)[0];
   const answer = turn.candidateAnswer || "未识别到回答";
+  const focuses = normalizeProbeFocus(turn.probeFocus, turn.interviewerQuestion);
+  const focusUncertain = (turn.confidenceDetails?.semanticNotices || []).some(item => item.code === "PROBE_FOCUS_UNCERTAIN");
   return `<section class="follow-up-turn ${expanded ? "expanded" : ""}">
     <span class="thread-node"></span>
     <button type="button" class="follow-up-question" data-toggle-followup="${turn.id}" aria-expanded="${expanded}">
-      <span class="follow-up-question-copy"><small>追问 ${index + 1}${reason ? ` · ${escapeHtml(reason)}` : ""}</small><span class="follow-up-question-line"><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问内容")}</strong><span class="follow-up-question-meta"><span class="topic-state ${status.key}">${status.label}</span>${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span></span></span>
+      <span class="follow-up-question-copy"><small>追问 ${index + 1}${reason ? ` · ${escapeHtml(reason)}` : ""}</small><span class="follow-up-question-line"><strong>${escapeHtml(turn.interviewerQuestion || "未识别到追问内容")}</strong><span class="follow-up-question-meta"><span class="topic-state ${status.key}">${status.label}</span>${renderLucideIcon(expanded ? "chevron-up" : "chevron-down")}</span></span><span class="probe-focus-row"><span>考察重点</span>${focuses.map(focus => `<em>${escapeHtml(focus)}</em>`).join("")}${focusUncertain ? `<small>建议确认</small>` : ""}</span></span>
     </button>
     ${editing ? renderTurnEditForm(turn, `追问 ${index + 1}`) : expanded ? `<div class="follow-up-answer"><span>候选人回答${turn.editedAnswer ? `<em>人工修订</em>` : ""}</span><p>${escapeHtml(answer)}</p><div class="follow-up-actions"><button type="button" class="text-action" data-edit-turn="${turn.id}">${renderLucideIcon("pencil")}编辑追问</button><button type="button" class="text-action" data-split-followup="${turn.id}">${renderLucideIcon("split")}拆为独立主题</button></div></div>` : ""}
   </section>`;
@@ -1113,6 +1154,7 @@ function renderReviewPage() {
       <div class="metadata-line">报告生成 ${formatDateMinute(interview.latestAIMetadata?.generatedAt)}</div>
       ${renderReviewDialog(record, reviewedCount, unresolvedCount)}
       ${renderPracticeDrawer(record, actions, gapMap, questions)}
+      ${renderPracticeSessionLauncher(actions)}
     </section>`;
 }
 
@@ -1152,7 +1194,7 @@ function renderGapSection(gaps, questions = []) {
   return `<section class="report-band gap-band"><div class="band-header"><div><span class="eyebrow">CAPABILITY GAPS</span><h2>技能 / 知识缺口</h2></div>${gaps.length ? `<span class="section-count">${gaps.length} 项</span>` : ""}</div><div class="gap-list">${gaps.length ? gaps.map((gap, index) => `
     <article class="gap-row">
       <span class="risk-rank">${String(index + 1).padStart(2, "0")}</span>
-      <div class="gap-copy"><div class="gap-heading"><span class="gap-category">${escapeHtml(GAP_CATEGORY_LABELS[gap.category] || gap.category)}</span><strong>${escapeHtml(gap.title)}</strong>${gap.legacy ? `<small>旧报告兼容</small>` : ""}</div><p>${escapeHtml(gap.description || "暂无缺口说明")}</p><div class="gap-actions">${renderGapItems("学习项", gap.learningItems)}${renderGapItems("准备项", gap.preparationItems)}</div>${gap.topicIds?.length ? `<div class="gap-topics"><span>对应题目</span>${[...new Set(gap.topicIds)].map((id, buttonIndex) => { const number = topicIndex.get(id) || buttonIndex + 1; return `<button type="button" data-open-topic="${escapeHtml(id)}" title="${escapeHtml(questions[number - 1]?.interviewerQuestion || "查看对应题目")}"><span>查看题目 ${String(number).padStart(2, "0")}</span>${renderLucideIcon("arrow-down")}</button>`; }).join("")}</div>` : ""}</div>
+      <div class="gap-copy"><div class="gap-heading"><span class="gap-category">${escapeHtml(GAP_CATEGORY_LABELS[gap.category] || gap.category)}</span><strong>${escapeHtml(gap.title)}</strong>${gap.legacy ? `<small>旧报告兼容</small>` : ""}</div><p>${escapeHtml(gap.description || "暂无缺口说明")}</p><div class="gap-actions">${renderGapItems("学习项", gap.learningItems)}${renderGapItems("准备项", gap.preparationItems)}</div>${gap.topicIds?.length ? `<div class="gap-topics"><span>对应题目</span>${[...new Set(gap.topicIds)].map((id, buttonIndex) => { const number = topicIndex.get(id) || buttonIndex + 1; return `<button type="button" data-open-topic="${escapeHtml(id)}" title="${escapeHtml(questions[number - 1]?.interviewerQuestion || "查看对应题目")}"><span>查看题目 ${String(number).padStart(2, "0")}</span></button>`; }).join("")}</div>` : ""}</div>
       <span class="risk-level ${escapeHtml(gap.priority || "medium")}">${gap.priority === "high" ? "高优先级" : "中优先级"}</span>
     </article>`).join("") : `<div class="risk-empty">${renderLucideIcon("circle-check")}<div><strong>暂无可靠的技能或知识缺口</strong><span>本场没有足够证据支持单独列出能力缺口。</span></div></div>`}</div></section>`;
 }
@@ -1213,19 +1255,24 @@ function renderPracticeActionBar(action) {
   const count = Math.max(0, Number(action.practiceCount || 0));
   const result = String(action.latestPracticeResult || "");
   const status = String(action.latestPracticeStatus || "");
+  const hasSession = Boolean(action.latestPracticeSessionId);
   let label = "尚未练习";
   if (status === "generating") label = "正在准备练习";
   else if (status === "reviewing") label = "正在生成反馈";
   else if (result === "draft" || status === "draft") label = "草稿已保存";
+  else if (status === "ready") label = "练习已准备，可继续";
   else if (count && result === "met") label = `已练习 ${count} 次 · 最近已达标`;
   else if (count && result === "partially_met") label = `已练习 ${count} 次 · 最近部分达标`;
   else if (count && result === "not_met") label = `已练习 ${count} 次 · 建议继续练习`;
   else if (count) label = `已练习 ${count} 次`;
   else if (status === "failed") label = "练习生成失败，可重试";
-  const buttonLabel = status === "draft" || result === "draft" ? "继续练习" : count ? "查看反馈" : "开始练习";
+  const buttonLabel = ["generating", "reviewing"].includes(status) ? "查看进度"
+    : status === "failed" ? "重新尝试"
+      : status === "ready" || status === "draft" || result === "draft" ? "继续练习"
+        : count ? "查看反馈" : "开始练习";
   return `<div class="action-practice-bar">
     <div><span class="practice-status-dot ${escapeHtml(status || "idle")}"></span><span>${escapeHtml(label)}</span></div>
-    <button type="button" class="practice-entry" data-open-practice="${escapeHtml(action.id)}">${renderLucideIcon(count ? "arrow-right" : "play")}<span>${buttonLabel}</span></button>
+    <button type="button" class="practice-entry" data-open-practice="${escapeHtml(action.id)}">${renderLucideIcon(hasSession ? "arrow-right" : "play")}<span>${buttonLabel}</span></button>
   </div>`;
 }
 
@@ -1244,7 +1291,7 @@ function renderPracticeDrawer(record, actions, gapMap, questions) {
   return `<dialog class="practice-drawer" id="practiceDialog" aria-labelledby="practiceDrawerTitle">
     <div class="practice-drawer-header">
       <div><span>行动练习</span><h2 id="practiceDrawerTitle">${escapeHtml(action.title)}</h2></div>
-      <button type="button" class="icon-button" data-close-practice aria-label="关闭练习">${renderLucideIcon("x")}</button>
+      <button type="button" class="icon-button" data-minimize-practice aria-label="收起练习" title="收起练习">${renderLucideIcon("x")}</button>
     </div>
     <div class="practice-drawer-body">
       <section class="practice-context">
@@ -1259,6 +1306,46 @@ function renderPracticeDrawer(record, actions, gapMap, questions) {
       ${renderPracticeSessionContent(session, action, questionMap, selectedAttempt, busy)}
     </div>
   </dialog>`;
+}
+
+function renderPracticeSessionLauncher(actions) {
+  const sessions = state.practiceSessionSummaries || [];
+  if (state.practiceDialogOpen || !sessions.length) return "";
+  const actionMap = new Map(actions.map((action, index) => [action.id, { ...action, order: action.order || action.day || index + 1 }]));
+  const busy = sessions.some(item => ["generating", "reviewing"].includes(item.status));
+  const panel = state.practiceSessionListOpen ? `<section class="practice-session-panel" aria-label="可继续的行动练习">
+      <div class="practice-session-panel-heading"><div><strong>进行中的练习</strong><span>${sessions.length} 个会话</span></div>${state.practiceSessionListError ? `<small class="practice-session-sync-error">状态更新失败</small>` : `<small>${busy ? "状态自动更新中" : "选择一项继续"}</small>`}</div>
+      <div class="practice-session-list">${sessions.map(session => renderPracticeSessionSummary(session, actionMap.get(session.actionId))).join("")}</div>
+    </section>` : "";
+  return `<aside class="practice-session-launcher ${busy ? "busy" : ""}" aria-label="进行中的行动练习">
+    ${panel}
+    <button type="button" class="practice-session-trigger" data-toggle-practice-sessions aria-expanded="${state.practiceSessionListOpen}">
+      <span class="practice-session-trigger-icon">${renderLucideIcon(busy ? "loader-circle" : "play")}</span>
+      <span>进行中的练习</span><strong>${sessions.length}</strong>${renderLucideIcon(state.practiceSessionListOpen ? "chevron-down" : "chevron-up")}
+    </button>
+  </aside>`;
+}
+
+function renderPracticeSessionSummary(session, action) {
+  const current = state.practiceSession?.id === session.id;
+  const statusLabel = practiceSessionStatusLabel(session);
+  const title = action?.title || `行动 ${action?.order || ""}`.trim() || "行动练习";
+  const mode = PRACTICE_MODE_LABELS[session.mode] || "行动练习";
+  const icon = ["generating", "reviewing"].includes(session.status) ? "loader-circle"
+    : session.status === "failed" ? "triangle-alert" : "arrow-right";
+  return `<button type="button" class="practice-session-row ${current ? "current" : ""} ${escapeHtml(session.status)}" data-open-practice-session="${escapeHtml(session.id)}" data-practice-action-id="${escapeHtml(session.actionId)}">
+    <span class="practice-session-row-icon">${renderLucideIcon(icon)}</span>
+    <span class="practice-session-row-copy"><strong>${escapeHtml(title)}</strong><small><span>${escapeHtml(mode)}</span><span>${escapeHtml(statusLabel)}</span><time>${escapeHtml(formatRelativeTime(session.updatedAt))}</time></small></span>
+    ${current ? `<em>当前练习</em>` : ""}${renderLucideIcon("arrow-right")}
+  </button>`;
+}
+
+function practiceSessionStatusLabel(session) {
+  if (session.status === "generating") return "正在准备";
+  if (session.status === "reviewing") return "正在评价";
+  if (session.status === "failed") return "需要重试";
+  if (session.status === "draft" || session.hasDraft) return "草稿已保存";
+  return "待作答";
 }
 
 function renderPracticeSessionContent(session, action, questionMap, selectedAttempt, busy) {
@@ -1278,7 +1365,7 @@ function renderPracticeSessionContent(session, action, questionMap, selectedAtte
   return `<section class="practice-brief">
       <div class="practice-brief-heading"><div><span>训练目标</span><h3>${escapeHtml(brief.objective || action.title)}</h3></div><small>${Number(brief.estimatedMinutes || 10)} 分钟</small></div>
       <div class="practice-why"><strong>为什么要做</strong><p>${escapeHtml(brief.why || action.description || "")}</p></div>
-      ${linkedTopics.length ? `<div class="practice-topic-links"><strong>关联原题</strong>${linkedTopics.map(item => `<button type="button" data-open-topic="${escapeHtml(item.id)}">题目 ${String(item.index).padStart(2, "0")} · ${escapeHtml(item.interviewerQuestion)}</button>`).join("")}</div>` : ""}
+      ${linkedTopics.length ? `<div class="practice-topic-links"><strong>关联原题</strong><div class="practice-topic-link-list">${linkedTopics.map(item => `<button type="button" data-open-topic="${escapeHtml(item.id)}"><span>题目 ${String(item.index).padStart(2, "0")}</span><span>${escapeHtml(item.interviewerQuestion)}</span>${renderLucideIcon("arrow-down")}</button>`).join("")}</div></div>` : ""}
       <div class="practice-steps"><strong>建议步骤</strong><ol>${(brief.steps || []).map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ol></div>
       <div class="practice-prompt"><span>本次练习</span><p>${escapeHtml(brief.prompt || "")}</p></div>
       <div class="practice-criterion"><strong>完成标准</strong><span>${escapeHtml(brief.successCriterion || action.successCriterion || "")}</span></div>
@@ -1531,8 +1618,10 @@ function compactReportText(value, limit = 220) {
 
 function renderAuditSection(interview) {
   const notes = Array.isArray(interview.auditNotes) ? interview.auditNotes.filter(Boolean) : [];
-  const revisions = Number(interview.auditRevisionCount || 0);
-  const topicAuditRound = Number(interview.auditRound || 1);
+  const topicAudit = interview.topicReviewAudit && typeof interview.topicReviewAudit === "object" ? interview.topicReviewAudit : null;
+  const revisions = Number(topicAudit?.revisionCount || interview.auditRevisionCount || 0);
+  const topicAuditRound = Number(topicAudit?.round || interview.auditRound || 1);
+  const topicAuditFindings = Array.isArray(topicAudit?.findings) ? topicAudit.findings : [];
   const growthAudit = interview.growthPlanAudit && typeof interview.growthPlanAudit === "object" ? interview.growthPlanAudit : null;
   const growthFindings = Array.isArray(growthAudit?.findings) ? growthAudit.findings : [];
   const growthWarnings = growthFindings.filter(item => item.severity === "warning");
@@ -1541,15 +1630,18 @@ function renderAuditSection(interview) {
     ...growthFindings.map(item => item.message)
   ].filter(Boolean).map(String));
   const topicNotes = notes.filter(note => !growthNoteTexts.has(String(note)));
-  const topicHasWarnings = topicNotes.some(note => /无法|失败|占位|缺少|警告|冲突|未通过/.test(String(note)));
-  const topicSummary = topicNotes[0] || "逐题引用、评分和优化回答已完成一致性检查。";
+  const topicWarnings = topicAudit
+    ? topicAuditFindings.filter(item => item.severity === "warning")
+    : topicNotes.slice(1).map(message => ({ message }));
+  const topicHasWarnings = topicWarnings.length > 0;
+  const topicSummary = topicAudit?.summary || topicNotes[0] || "逐题引用、评分和优化回答已完成一致性检查。";
   const growthSummary = growthAudit
     ? growthAudit.summary || "成长计划终审已完成。"
     : "该报告生成时未启用成长计划终审。";
   const growthMeta = growthAudit
     ? `第 ${Number(growthAudit.round || 1)} 轮 · 修订 ${Number(growthAudit.revisionCount || 0)} 次${growthWarnings.length ? ` · ${growthWarnings.length} 条提醒` : ""}`
     : "旧版报告兼容信息";
-  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">QUALITY AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">逐题修订 ${revisions} 次 · 计划修订 ${Number(growthAudit?.revisionCount || 0)} 次</span></div><div class="audit-summary-grid"><div class="audit-summary ${topicHasWarnings ? "warning" : ""}">${renderLucideIcon(topicHasWarnings ? "triangle-alert" : "circle-check")}<div><strong>逐题复盘审计</strong><p>${escapeHtml(publicRuntimeText(topicSummary))}</p><small>第 ${topicAuditRound} 轮 · 修订 ${revisions} 次${topicHasWarnings ? " · 包含提醒" : ""}</small></div></div><div class="audit-summary ${growthWarnings.length || !growthAudit ? "warning" : ""}">${renderLucideIcon(growthWarnings.length || !growthAudit ? "triangle-alert" : "circle-check")}<div><strong>成长计划终审</strong><p>${escapeHtml(publicRuntimeText(growthSummary))}</p><small>${escapeHtml(growthMeta)}</small></div></div></div>${growthWarnings.length ? `<div class="growth-audit-warnings"><strong>随报告保留的提醒</strong><ul>${growthWarnings.map(item => `<li>${escapeHtml(publicRuntimeText(item.message || ""))}</li>`).join("")}</ul></div>` : ""}${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(publicRuntimeText(note))}</li>`).join("")}</ol></details>` : ""}</section>`;
+  return `<section class="report-band audit-band"><div class="band-header"><div><span class="eyebrow">QUALITY AUDIT</span><h2>质量审计</h2></div><span class="audit-revision-count">逐题修订 ${revisions} 次 · 计划修订 ${Number(growthAudit?.revisionCount || 0)} 次</span></div><div class="audit-summary-grid"><div class="audit-summary ${topicHasWarnings ? "warning" : ""}">${renderLucideIcon(topicHasWarnings ? "triangle-alert" : "circle-check")}<div><strong>逐题复盘审计</strong><p>${escapeHtml(publicRuntimeText(topicSummary))}</p><small>第 ${topicAuditRound} 轮 · 修订 ${revisions} 次${topicHasWarnings ? ` · ${topicWarnings.length} 条提醒` : ""}</small></div></div><div class="audit-summary ${growthWarnings.length || !growthAudit ? "warning" : ""}">${renderLucideIcon(growthWarnings.length || !growthAudit ? "triangle-alert" : "circle-check")}<div><strong>成长计划终审</strong><p>${escapeHtml(publicRuntimeText(growthSummary))}</p><small>${escapeHtml(growthMeta)}</small></div></div></div>${topicWarnings.length ? `<div class="growth-audit-warnings topic-audit-warnings"><strong>逐题审计提醒</strong><ul>${topicWarnings.map(item => `<li>${escapeHtml(publicRuntimeText(item.message || ""))}</li>`).join("")}</ul></div>` : ""}${growthWarnings.length ? `<div class="growth-audit-warnings"><strong>成长计划提醒</strong><ul>${growthWarnings.map(item => `<li>${escapeHtml(publicRuntimeText(item.message || ""))}</li>`).join("")}</ul></div>` : ""}${notes.length ? `<details class="audit-details"><summary>查看审计记录（${notes.length} 条）</summary><ol>${notes.map(note => `<li>${escapeHtml(publicRuntimeText(note))}</li>`).join("")}</ol></details>` : ""}</section>`;
 }
 
 function reviewBlock(title, content) {
@@ -1892,8 +1984,12 @@ async function submitNewInterview(event) {
     const transcript = String(data.get("rawTranscript") || "").trim();
     const transcriptFile = data.get("transcriptFile");
     const audioFile = data.get("audioFile");
+    const resumeFile = data.get("resumeFile");
     if (sourceMode === "paste" && !transcript) throw new Error("请粘贴面试文字稿");
     if (sourceMode === "text" && !transcriptFile?.size) throw new Error("请选择 TXT 面试文字稿");
+    if (sourceMode === "text" && sameSelectedFile(transcriptFile, resumeFile)) {
+      throw new Error("面试文字稿不能与简历使用同一个文件，请重新选择");
+    }
     if (sourceMode === "audio" && !audioFile?.size) throw new Error("请选择面试音频");
     if (sourceMode === "audio" && !data.get("cloudConsent")) throw new Error("请先确认音频授权与 Deepgram 云端转写说明");
     id = crypto.randomUUID();
@@ -1941,6 +2037,13 @@ async function submitNewInterview(event) {
   }
 }
 
+function sameSelectedFile(first, second) {
+  if (!first?.size || !second?.size) return false;
+  return first.name === second.name
+    && first.size === second.size
+    && first.lastModified === second.lastModified;
+}
+
 async function uploadOptional(interviewId, materialType, file, options = {}) {
   if (!file?.size) return;
   const body = new FormData();
@@ -1976,22 +2079,35 @@ function bindParsePage() {
     let contentChanged = false;
     if (metadataChanged) {
       topic.title = nextTitle;
-      topic.mainTurn.topicTitle = nextTitle;
-      topic.mainTurn.questionType = nextQuestionType;
+      [topic.mainTurn, ...topic.followUps].forEach(turn => {
+        turn.topicTitle = nextTitle;
+        turn.questionType = nextQuestionType;
+      });
     }
     event.currentTarget.querySelectorAll("[data-turn-editor]").forEach(editor => {
       const turn = findQuestion(record, editor.dataset.turnEditor);
       if (!turn) return;
       const question = editor.querySelector('[data-edit-field="question"]')?.value.trim() || "";
       const answer = editor.querySelector('[data-edit-field="answer"]')?.value.trim() || "";
-      if (question === String(turn.interviewerQuestion || "").trim() && answer === String(turn.candidateAnswer || "").trim()) return;
+      const nextProbeFocus = turn.turnType === "follow_up"
+        ? [...editor.querySelectorAll('[data-probe-focus]:checked')].map(input => input.value).slice(0, 2)
+        : [];
+      const focusChanged = JSON.stringify(nextProbeFocus) !== JSON.stringify(turn.probeFocus || []);
+      if (question === String(turn.interviewerQuestion || "").trim() && answer === String(turn.candidateAnswer || "").trim() && !focusChanged) return;
       contentChanged = true;
       turn.editedQuestion = question === turn.extractedQuestion ? "" : question;
       turn.editedAnswer = answer === turn.extractedAnswer ? "" : answer;
       turn.interviewerQuestion = question;
       turn.candidateAnswer = answer;
+      if (turn.turnType === "follow_up") {
+        turn.probeFocus = nextProbeFocus.length ? nextProbeFocus : ["补充细节"];
+        turn.probeFocusConfidence = 100;
+        const details = { ...(turn.confidenceDetails || {}) };
+        details.semanticNotices = (details.semanticNotices || []).filter(item => item.code !== "PROBE_FOCUS_UNCERTAIN");
+        turn.confidenceDetails = details;
+      }
       turn.provenanceStatus = turn.editedQuestion || turn.editedAnswer ? "edited" : "source";
-      turn.needsConfirmation = !question;
+      turn.needsConfirmation = !question || !answer;
       turn.confirmed = false;
     });
     if (!metadataChanged && !contentChanged) {
@@ -2018,6 +2134,13 @@ function bindParsePage() {
   topicTitleInput?.addEventListener("change", event => updateTopicMetadata({ title: event.currentTarget.value }));
   document.querySelector("[data-topic-type]")?.addEventListener("change", event => updateTopicMetadata({ questionType: event.currentTarget.value }));
   document.querySelectorAll("[data-edit-turn]").forEach(button => button.addEventListener("click", () => { state.editingTurnId = button.dataset.editTurn; render(); }));
+  document.querySelectorAll("[data-probe-focus]").forEach(input => input.addEventListener("change", event => {
+    const editor = event.currentTarget.closest("[data-turn-editor]");
+    const selected = editor?.querySelectorAll("[data-probe-focus]:checked") || [];
+    if (selected.length <= 2) return;
+    event.currentTarget.checked = false;
+    toast("每条追问最多选择两个考察重点");
+  }));
   document.querySelectorAll("[data-cancel-edit]").forEach(button => button.addEventListener("click", () => { state.editingTurnId = null; render(); }));
   document.querySelectorAll("[data-toggle-followup]").forEach(button => button.addEventListener("click", () => toggleFollowUp(button.dataset.toggleFollowup)));
   document.querySelector("[data-expand-all-followups]")?.addEventListener("click", toggleAllFollowUps);
@@ -2104,14 +2227,14 @@ function updateTopicMetadata(changes) {
     const nextTitle = String(changes.title || topic.title).trim();
     if (nextTitle !== topic.title) {
       topic.title = nextTitle;
-      topic.mainTurn.topicTitle = nextTitle;
+      [topic.mainTurn, ...topic.followUps].forEach(turn => { turn.topicTitle = nextTitle; });
       changed = true;
     }
   }
   if (changes.questionType != null) {
     const nextQuestionType = String(changes.questionType || "其他");
     if (nextQuestionType !== topic.mainTurn.questionType) {
-      topic.mainTurn.questionType = nextQuestionType;
+      [topic.mainTurn, ...topic.followUps].forEach(turn => { turn.questionType = nextQuestionType; });
       changed = true;
     }
   }
@@ -2393,10 +2516,14 @@ function splitFollowUp(questionId) {
   if (!source) return;
   const index = source.followUps.findIndex(item => item.id === questionId);
   const [turn] = source.followUps.splice(index, 1);
+  const suggestedType = turn.confidenceDetails?.agentSuggestedQuestionType;
+  turn.questionType = questionTypeFromProbeFocus(turn.probeFocus, suggestedType || turn.questionType);
   turn.turnType = "main";
   turn.parentQuestionId = null;
   turn.topicRootId = turn.id;
   turn.topicTitle = turn.interviewerQuestion.slice(0, 32);
+  turn.probeFocus = [];
+  turn.probeFocusConfidence = 100;
   record.topics.push({ id: turn.id, title: turn.topicTitle, mainTurn: turn, followUps: [] });
   record.topics.sort((a, b) => a.mainTurn.order - b.mainTurn.order);
   state.selectedQuestionId = turn.id;
@@ -2420,6 +2547,9 @@ function mergeSelectedTopic() {
     turn.turnType = "follow_up";
     turn.parentQuestionId = target.mainTurn.id;
     turn.topicRootId = target.mainTurn.id;
+    turn.questionType = target.mainTurn.questionType;
+    turn.topicTitle = target.title;
+    if (!turn.probeFocus?.length) turn.probeFocus = normalizeProbeFocus([], turn.interviewerQuestion);
   });
   target.followUps.push(...moved);
   target.followUps.sort((a, b) => a.order - b.order);
@@ -2772,7 +2902,7 @@ function bindReviewPage() {
   }));
   document.querySelectorAll("[data-open-topic]").forEach(button => button.addEventListener("click", () => {
     const topicId = button.dataset.openTopic;
-    if (button.closest("#practiceDialog")) closePracticeDialog(false);
+    if (button.closest("#practiceDialog")) minimizePracticeDialog(false);
     state.expandedQuestionId = topicId;
     state.questionReviewTabs[topicId] = "diagnosis";
     state.questionEvidenceFocus = "";
@@ -2878,14 +3008,28 @@ function bindReviewPage() {
 
 function bindPracticeDrawer() {
   document.querySelectorAll("[data-open-practice]").forEach(button => button.addEventListener("click", () => openPractice(button.dataset.openPractice)));
-  document.querySelectorAll("[data-close-practice]").forEach(button => button.addEventListener("click", () => closePracticeDialog()));
+  document.querySelectorAll("[data-minimize-practice]").forEach(button => button.addEventListener("click", () => minimizePracticeDialog()));
+  document.querySelector("[data-toggle-practice-sessions]")?.addEventListener("click", event => {
+    event.stopPropagation();
+    state.practiceSessionListOpen = !state.practiceSessionListOpen;
+    render();
+  });
+  document.querySelectorAll("[data-open-practice-session]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    void openPracticeSession(button.dataset.practiceActionId, button.dataset.openPracticeSession);
+  }));
+  document.querySelector(".main")?.addEventListener("click", event => {
+    if (!state.practiceSessionListOpen || event.target.closest(".practice-session-launcher")) return;
+    state.practiceSessionListOpen = false;
+    render();
+  });
   const dialog = document.querySelector("#practiceDialog");
   dialog?.addEventListener("cancel", event => {
     event.preventDefault();
-    closePracticeDialog();
+    minimizePracticeDialog();
   });
   dialog?.addEventListener("click", event => {
-    if (event.target === dialog) closePracticeDialog();
+    if (event.target === dialog) minimizePracticeDialog();
   });
   document.querySelectorAll("[data-practice-mode]").forEach(button => button.addEventListener("click", () => selectPracticeMode(button.dataset.practiceMode)));
   const response = document.querySelector("#practiceResponse");
@@ -2895,6 +3039,7 @@ function bindPracticeDrawer() {
     if (count) count.textContent = String(state.practiceDraft.length);
     const submit = document.querySelector("[data-submit-practice]");
     if (submit) submit.disabled = !state.practiceDraft.trim();
+    schedulePracticeDraftAutosave();
   });
   document.querySelector("#practiceSelfRating")?.addEventListener("change", event => {
     state.practiceSelfRating = event.currentTarget.value;
@@ -2920,10 +3065,33 @@ async function openPractice(actionId) {
   const record = currentRecord();
   const action = record?.report?.actions?.find(item => item.id === actionId);
   if (!record || !action) return;
-  practiceOriginScrollY = window.scrollY;
+  await openPracticeSession(actionId, action.latestPracticeSessionId || "");
+}
+
+async function openPracticeSession(actionId, sessionId = "") {
+  const record = currentRecord();
+  const action = record?.report?.actions?.find(item => item.id === actionId);
+  if (!record || !action) return;
+  if (sessionId && state.practiceSession?.id === sessionId && state.practiceActionId === actionId) {
+    state.practiceSessionListOpen = false;
+    resumePracticeDialog();
+    return;
+  }
+  try {
+    await persistPracticeDraftBeforeSwitch();
+  } catch (error) {
+    setError(`当前练习草稿保存失败，尚未切换：${readableError(error)}`);
+    return;
+  }
+  clearTimeout(practicePollTimer);
+  practicePollTimer = null;
+  if (!state.practiceDialogOpen) practiceOriginScrollY = window.scrollY;
+  practiceDrawerScrollTop = 0;
+  const summary = state.practiceSessionSummaries.find(item => item.id === sessionId);
   state.practiceDialogOpen = true;
+  state.practiceSessionListOpen = false;
   state.practiceActionId = actionId;
-  state.practiceMode = "";
+  state.practiceMode = summary?.mode || "";
   state.practiceSession = null;
   state.practiceDraft = "";
   state.practiceSelfRating = "";
@@ -2931,15 +3099,16 @@ async function openPractice(actionId) {
   state.practiceLoading = true;
   render();
   try {
-    const session = action.latestPracticeSessionId
-      ? await api(`/api/v1/practice-sessions/${encodeURIComponent(action.latestPracticeSessionId)}`)
+    const session = sessionId
+      ? await api(`/api/v1/practice-sessions/${encodeURIComponent(sessionId)}`)
       : await createPracticeSession(actionId, "");
     acceptPracticeSession(session, false);
     render();
     schedulePracticePoll();
+    schedulePracticeSummaryPoll();
   } catch (error) {
     state.practiceLoading = false;
-    state.practiceSession = { status: "failed", errorMessage: readableError(error) };
+    state.practiceSession = { id: sessionId, actionId, status: "failed", errorMessage: readableError(error) };
     render();
   }
 }
@@ -2956,6 +3125,13 @@ async function createPracticeSession(actionId, mode) {
 
 async function selectPracticeMode(mode) {
   if (!PRACTICE_MODE_LABELS[mode] || ["generating", "reviewing"].includes(state.practiceSession?.status)) return;
+  if (state.practiceSession?.mode === mode) return;
+  try {
+    await persistPracticeDraftBeforeSwitch();
+  } catch (error) {
+    setError(`当前练习草稿保存失败，尚未切换：${readableError(error)}`);
+    return;
+  }
   state.practiceMode = mode;
   state.practiceLoading = true;
   state.practiceSession = null;
@@ -2968,6 +3144,7 @@ async function selectPracticeMode(mode) {
     acceptPracticeSession(session, false);
     render();
     schedulePracticePoll();
+    schedulePracticeSummaryPoll();
   } catch (error) {
     state.practiceLoading = false;
     state.practiceSession = { status: "failed", errorMessage: readableError(error) };
@@ -2984,26 +3161,129 @@ function acceptPracticeSession(session, preserveDraft = false) {
   if (!attempts.some(item => item.id === state.practiceSelectedAttemptId)) {
     state.practiceSelectedAttemptId = attempts.at(-1)?.id || "";
   }
+  syncPracticeSessionSummary(session);
+}
+
+function normalizePracticeSessionSummary(item = {}) {
+  return {
+    id: String(item.id || ""),
+    actionId: String(item.actionId || ""),
+    mode: String(item.mode || "oral_answer"),
+    status: String(item.status || "ready"),
+    hasDraft: Boolean(item.hasDraft),
+    attemptCount: Math.max(0, Number(item.attemptCount || 0)),
+    latestAttemptStatus: String(item.latestAttemptStatus || ""),
+    errorCode: String(item.errorCode || ""),
+    updatedAt: String(item.updatedAt || "")
+  };
+}
+
+function summarizePracticeSession(session = {}) {
+  const attempts = session.attempts || [];
+  return normalizePracticeSessionSummary({
+    id: session.id,
+    actionId: session.actionId || state.practiceActionId,
+    mode: session.mode || state.practiceMode,
+    status: session.status,
+    hasDraft: Boolean(String(session.draftText || state.practiceDraft || "").trim()),
+    attemptCount: attempts.length,
+    latestAttemptStatus: attempts.at(-1)?.status || "",
+    errorCode: session.errorCode || "",
+    updatedAt: session.updatedAt || new Date().toISOString()
+  });
+}
+
+function sortPracticeSessionSummaries(items) {
+  const priority = { generating: 0, reviewing: 0, failed: 1, draft: 2, ready: 2 };
+  return [...items].sort((left, right) => {
+    const priorityDelta = (priority[left.status] ?? 3) - (priority[right.status] ?? 3);
+    if (priorityDelta) return priorityDelta;
+    return String(right.updatedAt || "").localeCompare(String(left.updatedAt || ""));
+  });
+}
+
+function syncPracticeSessionSummary(session) {
+  if (!session?.id) return;
+  const existing = state.practiceSessionSummaries.filter(item => item.id !== session.id);
+  if (RESTORABLE_PRACTICE_STATUSES.has(String(session.status || ""))) {
+    existing.push(summarizePracticeSession(session));
+  }
+  state.practiceSessionSummaries = sortPracticeSessionSummaries(existing);
+  if (!state.practiceSessionSummaries.length) state.practiceSessionListOpen = false;
+}
+
+function practiceSessionListRunId() {
+  const record = currentRecord();
+  return String(record?.report?.run?.id || record?.runId || "");
+}
+
+async function loadPracticeSessionSummaries({ shouldRender = true, silent = false } = {}) {
+  if (state.route.name !== "review") return;
+  const runId = practiceSessionListRunId();
+  if (!runId) return;
+  try {
+    const result = await api(`/api/v1/runs/${encodeURIComponent(runId)}/practice-sessions?status=restorable`);
+    const items = sortPracticeSessionSummaries((result.items || []).map(normalizePracticeSessionSummary));
+    const changed = JSON.stringify(items) !== JSON.stringify(state.practiceSessionSummaries)
+      || state.practiceSessionListError;
+    state.practiceSessionSummaries = items;
+    state.practiceSessionListLoaded = true;
+    state.practiceSessionListRunId = runId;
+    state.practiceSessionListError = "";
+    if (!items.length) state.practiceSessionListOpen = false;
+    if (shouldRender && changed && !state.practiceDialogOpen) render();
+  } catch (error) {
+    state.practiceSessionListLoaded = true;
+    state.practiceSessionListRunId = runId;
+    state.practiceSessionListError = readableError(error);
+    if (!silent && state.practiceSessionListOpen && !state.practiceDialogOpen) render();
+  }
+  schedulePracticeSummaryPoll();
+}
+
+function schedulePracticeSummaryPoll() {
+  clearTimeout(practiceSummaryPollTimer);
+  practiceSummaryPollTimer = null;
+  if (state.route.name !== "review") return;
+  if (!state.practiceSessionSummaries.some(item => ["generating", "reviewing"].includes(item.status))) return;
+  practiceSummaryPollTimer = setTimeout(() => {
+    void loadPracticeSessionSummaries({ shouldRender: true, silent: true });
+  }, 2000);
+}
+
+function resetPracticeSessionList() {
+  clearTimeout(practiceSummaryPollTimer);
+  practiceSummaryPollTimer = null;
+  state.practiceSessionSummaries = [];
+  state.practiceSessionListLoaded = false;
+  state.practiceSessionListOpen = false;
+  state.practiceSessionListError = "";
+  state.practiceSessionListRunId = "";
 }
 
 function schedulePracticePoll() {
   clearTimeout(practicePollTimer);
-  if (!state.practiceDialogOpen || !["generating", "reviewing"].includes(state.practiceSession?.status)) return;
+  if (!state.practiceActionId || !["generating", "reviewing"].includes(state.practiceSession?.status)) return;
   practicePollTimer = setTimeout(pollPracticeSession, 1000);
 }
 
 async function pollPracticeSession() {
-  if (!state.practiceDialogOpen || !state.practiceSession?.id) return;
+  if (!state.practiceActionId || !state.practiceSession?.id) return;
   try {
     const previousStatus = state.practiceSession.status;
     const session = await api(`/api/v1/practice-sessions/${encodeURIComponent(state.practiceSession.id)}`);
     acceptPracticeSession(session, previousStatus === "reviewing");
-    if (!["generating", "reviewing"].includes(session.status)) await refreshPracticeReportActions();
-    render();
+    const finished = !["generating", "reviewing"].includes(session.status);
+    if (finished) {
+      await refreshPracticeReportActions();
+      await loadPracticeSessionSummaries({ shouldRender: false, silent: true });
+    }
+    if (finished || session.status !== previousStatus) render();
     schedulePracticePoll();
   } catch (error) {
     state.practiceLoading = false;
     state.practiceSession = { ...state.practiceSession, status: "failed", errorMessage: readableError(error) };
+    syncPracticeSessionSummary(state.practiceSession);
     render();
   }
 }
@@ -3024,6 +3304,8 @@ async function refreshPracticeReportActions() {
 }
 
 async function savePracticeDraft(silent = false) {
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = null;
   const session = state.practiceSession;
   if (!session?.id || ["generating", "reviewing"].includes(session.status)) return;
   try {
@@ -3033,10 +3315,35 @@ async function savePracticeDraft(silent = false) {
     });
     acceptPracticeSession(updated, true);
     await refreshPracticeReportActions();
+    await loadPracticeSessionSummaries({ shouldRender: false, silent: true });
     render();
     if (!silent) requestAnimationFrame(() => toast("练习草稿已保存"));
   } catch (error) {
     if (!silent) setError(readableError(error));
+  }
+}
+
+function schedulePracticeDraftAutosave() {
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = setTimeout(autosavePracticeDraft, 900);
+}
+
+async function autosavePracticeDraft() {
+  practiceDraftSaveTimer = null;
+  const session = state.practiceSession;
+  const draftText = state.practiceDraft;
+  if (!session?.id || ["generating", "reviewing"].includes(session.status)) return;
+  if (draftText === (session.draftText || "")) return;
+  try {
+    const updated = await api(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}`, {
+      method: "PATCH",
+      body: { draftText }
+    });
+    if (state.practiceSession?.id !== session.id) return;
+    state.practiceSession = { ...state.practiceSession, ...updated, draftText };
+    syncPracticeSessionSummary(state.practiceSession);
+  } catch (error) {
+    console.warn("Failed to autosave practice draft", error);
   }
 }
 
@@ -3057,6 +3364,7 @@ async function submitPracticeAttempt() {
     acceptPracticeSession(updated, true);
     render();
     schedulePracticePoll();
+    schedulePracticeSummaryPoll();
   } catch (error) {
     setError(readableError(error));
   }
@@ -3070,6 +3378,7 @@ async function retryPracticeSession() {
     acceptPracticeSession(session, true);
     render();
     schedulePracticePoll();
+    schedulePracticeSummaryPoll();
   } catch (error) {
     setError(readableError(error));
   }
@@ -3097,12 +3406,11 @@ async function completePracticeAction() {
 function closePracticeDialog(shouldRender = true) {
   clearTimeout(practicePollTimer);
   practicePollTimer = null;
-  if (shouldRender && state.practiceSession?.id && !["generating", "reviewing"].includes(state.practiceSession.status) && state.practiceDraft !== (state.practiceSession.draftText || "")) {
-    void api(`/api/v1/practice-sessions/${encodeURIComponent(state.practiceSession.id)}`, {
-      method: "PATCH", body: { draftText: state.practiceDraft }
-    }).catch(() => {});
-  }
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = null;
+  persistPracticeDraft();
   state.practiceDialogOpen = false;
+  state.practiceSessionListOpen = false;
   state.practiceActionId = "";
   state.practiceMode = "";
   state.practiceSession = null;
@@ -3110,10 +3418,73 @@ function closePracticeDialog(shouldRender = true) {
   state.practiceSelfRating = "";
   state.practiceSelectedAttemptId = "";
   state.practiceLoading = false;
+  practiceDrawerScrollTop = 0;
   if (shouldRender) {
     render();
     requestAnimationFrame(() => window.scrollTo({ top: practiceOriginScrollY }));
   }
+}
+
+function minimizePracticeDialog(restoreScroll = true) {
+  if (!state.practiceActionId) return;
+  capturePracticeDrawerScroll();
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = null;
+  persistPracticeDraft();
+  state.practiceDialogOpen = false;
+  state.practiceSessionListOpen = false;
+  render();
+  schedulePracticePoll();
+  schedulePracticeSummaryPoll();
+  if (restoreScroll) requestAnimationFrame(() => window.scrollTo({ top: practiceOriginScrollY }));
+}
+
+function resumePracticeDialog() {
+  if (!state.practiceActionId) return;
+  practiceOriginScrollY = window.scrollY;
+  state.practiceDialogOpen = true;
+  state.practiceSessionListOpen = false;
+  render();
+  schedulePracticePoll();
+}
+
+async function persistPracticeDraftBeforeSwitch() {
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = null;
+  const session = state.practiceSession;
+  const draftText = state.practiceDraft;
+  if (!session?.id || ["generating", "reviewing"].includes(session.status)) return session;
+  if (draftText === (session.draftText || "")) return session;
+  const updated = await api(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}`, {
+    method: "PATCH", body: { draftText }
+  });
+  if (state.practiceSession?.id === session.id) {
+    state.practiceSession = { ...state.practiceSession, ...updated, draftText };
+  }
+  if (state.route.name === "review" && (!session.runId || session.runId === practiceSessionListRunId())) {
+    syncPracticeSessionSummary({ ...session, ...updated, draftText });
+  }
+  return updated;
+}
+
+function persistPracticeDraft() {
+  void persistPracticeDraftBeforeSwitch().then(() => {
+    if (state.route.name === "review" && !state.practiceDialogOpen) render();
+  }).catch(() => {});
+}
+
+function flushPracticeDraftOnPageHide() {
+  clearTimeout(practiceDraftSaveTimer);
+  practiceDraftSaveTimer = null;
+  const session = state.practiceSession;
+  if (!session?.id || ["generating", "reviewing"].includes(session.status)) return;
+  if (state.practiceDraft === (session.draftText || "")) return;
+  void fetch(`/api/v1/practice-sessions/${encodeURIComponent(session.id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ draftText: state.practiceDraft }),
+    keepalive: true
+  }).catch(() => {});
 }
 
 function exportReport() {
@@ -3228,6 +3599,18 @@ function formatDateMinute(value, fallback = "--") {
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
   return `${day} ${hours}:${minutes}`;
+}
+
+function formatRelativeTime(value) {
+  const date = new Date(value);
+  if (!value || Number.isNaN(date.getTime())) return "刚刚更新";
+  const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (seconds < 60) return "刚刚更新";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return formatDateMinute(value);
 }
 
 function formatDuration(value) {

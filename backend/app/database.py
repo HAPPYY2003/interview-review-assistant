@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from backend.app.services.evidence import QUESTION_TYPES, infer_topic_title, normalize_question_type
+from backend.app.services.evidence import (
+    QUESTION_TYPES,
+    infer_topic_title,
+    normalize_probe_focus,
+    normalize_question_type,
+)
 
 
 def utc_now() -> str:
@@ -73,6 +78,7 @@ class Database:
             follow_up_impact TEXT NOT NULL DEFAULT '', confidence_score REAL NOT NULL DEFAULT 75,
             raw_confidence_score REAL NOT NULL DEFAULT 75, confidence_details_json TEXT NOT NULL DEFAULT '{}',
             confirmation_reasons_json TEXT NOT NULL DEFAULT '[]', parse_method TEXT NOT NULL DEFAULT 'legacy',
+            probe_focus_json TEXT NOT NULL DEFAULT '[]', probe_focus_confidence REAL NOT NULL DEFAULT 100,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(interview_id) REFERENCES interviews(id) ON DELETE CASCADE
         );
@@ -219,6 +225,8 @@ class Database:
                 "confidence_details_json": "TEXT NOT NULL DEFAULT '{}'",
                 "confirmation_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
                 "parse_method": "TEXT NOT NULL DEFAULT 'legacy'",
+                "probe_focus_json": "TEXT NOT NULL DEFAULT '[]'",
+                "probe_focus_confidence": "REAL NOT NULL DEFAULT 100",
             },
             "transcript_segments": {
                 "speaker_confidence": "REAL",
@@ -267,12 +275,63 @@ class Database:
                     "UPDATE question_cards SET topic_title=? WHERE id=?",
                     (infer_topic_title(row["question"], normalized), row["id"]),
                 )
+        Database._repair_waiting_follow_up_classifications(connection)
         connection.execute(
             """UPDATE review_runs SET agent_mode='legacy'
             WHERE agent_mode='fixture' AND NOT EXISTS (
                 SELECT 1 FROM review_stage_artifacts a WHERE a.run_id=review_runs.id
             )"""
         )
+
+    @staticmethod
+    def _repair_waiting_follow_up_classifications(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """SELECT q.*,p.question_type AS parent_type,p.topic_title AS parent_topic,p.turn_type AS parent_turn_type
+            FROM question_cards q
+            JOIN interviews i ON i.id=q.interview_id
+            LEFT JOIN question_cards p ON p.id=q.parent_question_id AND p.interview_id=q.interview_id
+            WHERE i.status='WAITING_CONFIRMATION' AND q.turn_type='follow_up' AND q.confirmed=0
+            AND q.provenance_status<>'edited' AND q.parse_method<>'edited'"""
+        ).fetchall()
+        semantic_codes = {"QUESTION_TYPE_UNCERTAIN", "TOPIC_GROUPING_UNCERTAIN", "PROBE_FOCUS_UNCERTAIN"}
+        for row in rows:
+            if not row["parent_question_id"] or row["parent_turn_type"] != "main":
+                continue
+            try:
+                reasons = json.loads(row["confirmation_reasons_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                reasons = []
+            try:
+                details = json.loads(row["confidence_details_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            notices = list(details.get("semanticNotices") or [])
+            for reason in reasons:
+                if reason.get("code") in semantic_codes and not any(
+                    item.get("code") == reason.get("code") for item in notices
+                ):
+                    notices.append(reason)
+            blocking = [reason for reason in reasons if reason.get("code") not in semantic_codes]
+            details["semanticNotices"] = notices[:4]
+            try:
+                stored_focus = json.loads(row["probe_focus_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                stored_focus = []
+            probe_focus = normalize_probe_focus(stored_focus, row["question"])
+            raw_score = float(row["raw_confidence_score"] or row["confidence_score"] or 75)
+            unresolved = bool(blocking or not str(row["answer"] or "").strip())
+            effective = float(row["confidence_score"] or 75) if unresolved else raw_score
+            confidence = "high" if effective >= 85 and not unresolved else "medium" if effective >= 65 else "low"
+            connection.execute(
+                """UPDATE question_cards SET question_type=?,topic_title=?,probe_focus_json=?,
+                probe_focus_confidence=?,confirmation_reasons_json=?,confidence_details_json=?,
+                needs_confirmation=?,confidence_score=?,confidence=? WHERE id=?""",
+                (
+                    row["parent_type"], row["parent_topic"], json.dumps(probe_focus, ensure_ascii=False),
+                    84, json.dumps(blocking, ensure_ascii=False), json.dumps(details, ensure_ascii=False),
+                    int(unresolved), effective, confidence, row["id"],
+                ),
+            )
 
     def create_interview(self, payload: dict[str, Any]) -> dict[str, Any]:
         interview_id = payload.get("id") or str(uuid.uuid4())
@@ -832,6 +891,14 @@ class Database:
     @staticmethod
     def _replace_questions(connection: sqlite3.Connection, interview_id: str, questions: Iterable[dict[str, Any]]) -> None:
         question_list = list(questions)
+        question_map = {item.get("id"): item for item in question_list}
+        for item in question_list:
+            if item.get("turnType") != "follow_up":
+                continue
+            parent = question_map.get(item.get("parentQuestionId"))
+            if parent and parent.get("turnType", "main") == "main":
+                item["questionType"] = parent.get("questionType", "其他")
+                item["topicTitle"] = parent.get("topicTitle", item.get("topicTitle", ""))
         now = utc_now()
         connection.execute("DELETE FROM question_cards WHERE interview_id=?", (interview_id,))
         for item in question_list:
@@ -851,8 +918,9 @@ class Database:
                 confidence, initial_diagnosis_json, confirmed, version, topic_root_id, parent_question_id,
                 turn_type, extracted_question, extracted_answer, edited_question, edited_answer, topic_title,
                 needs_confirmation, provenance_status, follow_up_impact, confidence_score, raw_confidence_score,
-                confidence_details_json, confirmation_reasons_json, parse_method, created_at, updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                confidence_details_json, confirmation_reasons_json, parse_method, probe_focus_json,
+                probe_focus_confidence, created_at, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     question_id, interview_id, item.get("order", 1), effective_question, effective_answer,
                     question_type, item.get("confidence", "medium"),
@@ -864,7 +932,9 @@ class Database:
                     item.get("followUpImpact", ""), float(item.get("confidenceScore", {"high": 90, "medium": 75, "low": 50}.get(item.get("confidence"), 75))),
                     float(item.get("rawConfidenceScore", item.get("confidenceScore", {"high": 90, "medium": 75, "low": 50}.get(item.get("confidence"), 75)))),
                     json.dumps(item.get("confidenceDetails", {}), ensure_ascii=False),
-                    json.dumps(item.get("confirmationReasons", []), ensure_ascii=False), item.get("parseMethod", "legacy"), now, now,
+                    json.dumps(item.get("confirmationReasons", []), ensure_ascii=False), item.get("parseMethod", "legacy"),
+                    json.dumps(normalize_probe_focus(item.get("probeFocus"), effective_question) if item.get("turnType") == "follow_up" else [], ensure_ascii=False),
+                    float(item.get("probeFocusConfidence", 84 if item.get("turnType") == "follow_up" else 100)), now, now,
                 ),
             )
         for item in question_list:
@@ -1255,6 +1325,7 @@ class Database:
                 "latestPracticeStatus": (practice.get(action_id) or {}).get("latestPracticeStatus", ""),
                 "latestPracticeSessionId": (practice.get(action_id) or {}).get("latestPracticeSessionId", ""),
                 "latestPracticeResult": (practice.get(action_id) or {}).get("latestPracticeResult", ""),
+                "latestPracticeUpdatedAt": (practice.get(action_id) or {}).get("latestPracticeUpdatedAt", ""),
             })
             merged.append(action)
         return merged
@@ -1491,10 +1562,12 @@ class Database:
             current = summaries.setdefault(action_id, {
                 "practiceCount": 0, "latestPracticeStatus": "",
                 "latestPracticeSessionId": "", "latestPracticeResult": "",
+                "latestPracticeUpdatedAt": "",
             })
             current["practiceCount"] += len(session_attempts)
             current["latestPracticeStatus"] = session["status"]
             current["latestPracticeSessionId"] = session["id"]
+            current["latestPracticeUpdatedAt"] = session["updatedAt"]
             latest = session_attempts[-1] if session_attempts else None
             if latest and latest.get("status") == "reviewed":
                 review = latest.get("review") or {}
@@ -1510,6 +1583,42 @@ class Database:
             elif session.get("draftText"):
                 current["latestPracticeResult"] = "draft"
         return summaries
+
+    def list_restorable_practice_sessions(self, run_id: str) -> list[dict[str, Any]]:
+        restorable_statuses = ("generating", "ready", "draft", "reviewing", "failed")
+        placeholders = ",".join("?" for _ in restorable_statuses)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT s.id,s.action_id,s.mode,s.status,s.draft_text,s.error_code,
+                s.updated_at,COUNT(a.id) AS attempt_count,
+                (SELECT latest.status FROM practice_attempts latest
+                 WHERE latest.session_id=s.id
+                 ORDER BY latest.attempt_no DESC LIMIT 1) AS latest_attempt_status
+                FROM practice_sessions s
+                LEFT JOIN practice_attempts a ON a.session_id=s.id
+                WHERE s.run_id=? AND s.status IN ({placeholders})
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC""",
+                (run_id, *restorable_statuses),
+            ).fetchall()
+        items = [
+            {
+                "id": row["id"],
+                "actionId": row["action_id"],
+                "mode": row["mode"],
+                "status": row["status"],
+                "hasDraft": bool(str(row["draft_text"] or "").strip()),
+                "attemptCount": int(row["attempt_count"] or 0),
+                "latestAttemptStatus": row["latest_attempt_status"] or "",
+                "errorCode": row["error_code"] or "",
+                "updatedAt": row["updated_at"],
+            }
+            for row in rows
+        ]
+        priority = {"generating": 0, "reviewing": 0, "failed": 1, "draft": 2, "ready": 2}
+        items.sort(key=lambda item: item["updatedAt"], reverse=True)
+        items.sort(key=lambda item: priority.get(item["status"], 3))
+        return items
 
     def get_growth_trends(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1672,6 +1781,8 @@ class Database:
             "confidenceDetails": json.loads(row["confidence_details_json"] or "{}"),
             "confirmationReasons": json.loads(row["confirmation_reasons_json"] or "[]"),
             "parseMethod": row["parse_method"],
+            "probeFocus": json.loads(row["probe_focus_json"] or "[]"),
+            "probeFocusConfidence": float(row["probe_focus_confidence"]),
         }
 
     @staticmethod

@@ -1,0 +1,19 @@
+{
+  "company": "字节跳动（飞书）",
+  "position": "AI 产品经理",
+  "round": "业务二面",
+  "interviewDate": "2026-08-18",
+  "reviewGoal": "检查企业 AI 场景识别、Agent 工作流、质量评测、权限安全、成本治理、跨团队推动与商业化能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "recommendedTopicCount": 6
+  },
+  "expectedFocus": [
+    "回答中的数字、决策和失败应能定位回原文",
+    "模型负责语义判断，代码与人工负责权限、引用和写操作门槛",
+    "Reflection 应指出模型离线指标与实际业务价值不能画等号"
+  ]
+}

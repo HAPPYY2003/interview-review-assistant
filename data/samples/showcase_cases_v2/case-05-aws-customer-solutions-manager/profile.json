@@ -1,0 +1,19 @@
+{
+  "company": "Amazon Web Services",
+  "position": "Customer Solutions Manager",
+  "round": "综合面试",
+  "interviewDate": "2026-08-20",
+  "reviewGoal": "检查客户导向、云采用路线图、治理、风险、高层沟通、成本价值和方法规模化能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "languageStyle": "zh_CN_with_english_terms"
+  },
+  "expectedFocus": [
+    "区分项目活动、交付产出、采用程度和业务结果",
+    "候选人应承认一次错误的应用依赖判断并承担恢复责任",
+    "技术建议需要转化为高层可决定的业务风险和选项"
+  ]
+}

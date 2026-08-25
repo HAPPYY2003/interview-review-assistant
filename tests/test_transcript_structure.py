@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -8,7 +9,9 @@ from pydantic import ValidationError
 from types import SimpleNamespace
 
 from backend.app.database import Database
+from backend.app.services.evidence import infer_probe_focus
 from backend.app.services.parse_workflow import ParsePipelineContext, ParseWorkflow
+from backend.app.services.transcript import build_question_cards, map_speaker_roles
 from backend.app.services.transcript_structure import (
     ConfidenceAssessment,
     ConfirmationReasonCode,
@@ -36,6 +39,118 @@ def test_profiles_all_supported_transcript_shapes(text: str, expected: str):
     assert profile.profile_type == expected
     assert atoms
     assert all(text[item["startChar"]:item["endChar"]] == item["rawText"] for item in atoms)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[00:00] 面试官：请介绍项目？\n[00:08] 候选人：我负责需求分析。",
+        "[00:00.800] speaker_0: 请介绍项目？\n[00:05.120] speaker_1: 我负责需求分析。",
+        "00:00:06 请介绍项目？\n00:00:15 我负责需求分析。",
+    ],
+)
+def test_timeline_prefixes_are_removed_from_spoken_atoms_and_cards(text: str):
+    profile = profile_transcript(text)
+    atoms = atomize_text(text, profile)
+    utterances = fallback_utterances(atoms, profile, text)
+    map_speaker_roles(utterances)
+    cards = build_question_cards(utterances)
+
+    assert cards
+    assert cards[0]["interviewerQuestion"] == "请介绍项目？"
+    assert cards[0]["candidateAnswer"] == "我负责需求分析。"
+    assert all("00:" not in item["rawText"] for item in [*atoms, *utterances])
+    assert all(text[item["startChar"]:item["endChar"]] == item["rawText"] for item in atoms)
+
+
+def test_subtitle_timeline_and_sequence_lines_are_not_dialogue():
+    text = "\n".join([
+        "1",
+        "00:00:01,000 --> 00:00:04,000",
+        "面试官：请介绍项目？",
+        "2",
+        "00:00:04,500 --> 00:00:08,000",
+        "候选人：我负责需求分析。",
+    ])
+    profile = profile_transcript(text)
+    atoms = atomize_text(text, profile)
+    utterances = fallback_utterances(atoms, profile, text)
+    cards = build_question_cards(utterances)
+
+    assert [item["rawText"] for item in atoms] == ["请介绍项目？", "我负责需求分析。"]
+    assert cards[0]["interviewerQuestion"] == "请介绍项目？"
+    assert cards[0]["candidateAnswer"] == "我负责需求分析。"
+
+
+def test_spoken_clock_time_is_preserved_inside_an_answer():
+    text = "面试官：你每天几点开始工作？\n候选人：我每天 10:30 开始工作。"
+    profile = profile_transcript(text)
+    atoms = atomize_text(text, profile)
+
+    assert atoms[1]["rawText"] == "我每天 10:30 开始工作。"
+
+
+def test_parse_workflow_persists_questions_without_timeline_prefixes(settings_factory):
+    settings = settings_factory()
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "\n".join([
+        "00:00:06 请介绍一下你最近负责的项目？",
+        "00:00:15 我负责履约分析和实验设计。",
+        "00:01:03 你怎么证明分析结论？",
+        "00:01:11 我对比了实验组和对照组。",
+    ])
+    interview = database.create_interview({"id": "timeline-clean-parse", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+
+    ParseWorkflow(database, settings).execute(run["id"])
+
+    completed = database.get_parse_run(run["id"])
+    questions = database.get_questions(interview["id"])
+    segments = database.get_segments(interview["id"])
+    assert completed["status"] == "COMPLETED"
+    assert [item["interviewerQuestion"] for item in questions] == [
+        "请介绍一下你最近负责的项目？",
+        "你怎么证明分析结论？",
+    ]
+    assert [item["candidateAnswer"] for item in questions] == [
+        "我负责履约分析和实验设计。",
+        "我对比了实验组和对照组。",
+    ]
+    assert all("00:" not in item["rawText"] for item in segments)
+    assert all(
+        transcript[item["startChar"]:item["endChar"]] == item["rawText"]
+        for item in segments
+    )
+
+
+def test_parse_workflow_accepts_clear_numbered_speaker_roles(settings_factory):
+    settings = settings_factory()
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "\n".join([
+        "[00:00.000] speaker_0: 请介绍一下你负责的项目？",
+        "[00:05.000] speaker_1: 我负责履约分析和实验设计。",
+        "[00:12.000] speaker_0: 最终结果怎么样？",
+        "[00:18.000] speaker_1: 准时履约率提升了四点八个百分点。",
+    ])
+    interview = database.create_interview({"id": "numbered-speaker-parse", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+
+    ParseWorkflow(database, settings).execute(run["id"])
+
+    questions = database.get_questions(interview["id"])
+    segments = database.get_segments(interview["id"])
+    assert {item["speakerRole"] for item in segments if item["speakerLabel"] == "speaker_0"} == {"interviewer"}
+    assert {item["speakerRole"] for item in segments if item["speakerLabel"] == "speaker_1"} == {"candidate"}
+    assert all(
+        reason.get("code") != "SPEAKER_ROLE_UNCERTAIN"
+        for item in [*segments, *questions]
+        for reason in item.get("confirmationReasons", [])
+    )
+    assert all(item["confidence"] == "high" for item in questions)
 
 
 def test_raw_stream_produces_low_quality_candidate_utterances():
@@ -167,6 +282,134 @@ def test_confidence_engine_attributes_low_score_to_specific_dimensions():
     assert [item["code"] for item in result["confirmationReasons"][:2]] == [
         "QUESTION_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS",
     ]
+
+
+def test_probe_focus_infers_cross_cutting_follow_up_intents():
+    assert infer_probe_focus("为什么以商圈为单位随机，如何处理实验污染？") == ["实验设计", "数据质量"]
+    assert infer_probe_focus("四点八个百分点能完全归因于你设计的策略吗？") == ["结果归因"]
+    assert infer_probe_focus("如果重新做这个项目，你会改变哪三个步骤？") == ["复盘反思"]
+
+
+def test_follow_up_semantic_uncertainty_does_not_require_confirmation():
+    def assessment(
+        score: int,
+        code: ConfirmationReasonCode | None = None,
+    ) -> ConfidenceAssessment:
+        return ConfidenceAssessment(
+            score=score,
+            reason_codes=[code] if code else [],
+            evidence_atom_ids=["A1"] if code else [],
+        )
+
+    result = calculate_turn_confidence(
+        "follow_up",
+        {
+            "speaker": assessment(94),
+            "questionBoundary": assessment(93),
+            "answerBoundary": assessment(92),
+            "qaPairing": assessment(92),
+            "followUp": assessment(84),
+            "questionType": assessment(70, ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN),
+            "topicGrouping": assessment(72, ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN),
+            "probeFocus": assessment(71, ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN),
+        },
+        96,
+    )
+
+    assert result["needsConfirmation"] is False
+    assert result["confirmationReasons"] == []
+    assert {item["code"] for item in result["confidenceDetails"]["semanticNotices"]} == {
+        "QUESTION_TYPE_UNCERTAIN",
+        "TOPIC_GROUPING_UNCERTAIN",
+        "PROBE_FOCUS_UNCERTAIN",
+    }
+
+
+def test_follow_up_with_unreliable_parent_still_requires_confirmation():
+    def assessment(
+        score: int,
+        code: ConfirmationReasonCode | None = None,
+    ) -> ConfidenceAssessment:
+        return ConfidenceAssessment(
+            score=score,
+            reason_codes=[code] if code else [],
+            evidence_atom_ids=["A1"] if code else [],
+        )
+
+    result = calculate_turn_confidence(
+        "follow_up",
+        {
+            "speaker": assessment(94),
+            "questionBoundary": assessment(93),
+            "answerBoundary": assessment(92),
+            "qaPairing": assessment(92),
+            "followUp": assessment(65, ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN),
+            "questionType": assessment(88),
+            "topicGrouping": assessment(88),
+            "probeFocus": assessment(90),
+        },
+        96,
+    )
+
+    assert result["needsConfirmation"] is True
+    assert [item["code"] for item in result["confirmationReasons"]] == ["FOLLOWUP_PARENT_UNCERTAIN"]
+
+
+def test_database_repairs_only_unedited_waiting_follow_up_classification(settings_factory):
+    settings = settings_factory()
+    database = Database(settings.database_path)
+    database.initialize()
+    interview = database.create_interview({"id": "repair-waiting-follow-up"})
+    database.replace_questions(interview["id"], [
+        {
+            "id": "main-question",
+            "order": 1,
+            "interviewerQuestion": "请介绍一次你负责的项目。",
+            "candidateAnswer": "我负责履约策略分析。",
+            "questionType": "项目经历",
+            "topicRootId": "main-question",
+            "turnType": "main",
+            "topicTitle": "履约策略项目",
+        },
+        {
+            "id": "follow-up-question",
+            "order": 2,
+            "interviewerQuestion": "为什么以商圈为单位随机，如何处理实验污染？",
+            "candidateAnswer": "我使用商圈作为随机单元并设置隔离期。",
+            "questionType": "项目经历",
+            "topicRootId": "main-question",
+            "parentQuestionId": "main-question",
+            "turnType": "follow_up",
+            "topicTitle": "履约策略项目",
+        },
+    ])
+    database.update_interview(interview["id"], status="WAITING_CONFIRMATION")
+    semantic_reasons = [
+        {"code": "QUESTION_TYPE_UNCERTAIN", "dimension": "questionType", "score": 70},
+        {"code": "TOPIC_GROUPING_UNCERTAIN", "dimension": "topicGrouping", "score": 72},
+    ]
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE question_cards SET question_type='技术知识',topic_title='实验设计方法',
+            confidence='low',confidence_score=58,raw_confidence_score=86,needs_confirmation=1,
+            confirmation_reasons_json=?,probe_focus_json='[]',probe_focus_confidence=55
+            WHERE id='follow-up-question'""",
+            (json.dumps(semantic_reasons, ensure_ascii=False),),
+        )
+
+    database.initialize()
+    repaired = next(item for item in database.get_questions(interview["id"]) if item["id"] == "follow-up-question")
+
+    assert repaired["questionType"] == "项目经历"
+    assert repaired["topicTitle"] == "履约策略项目"
+    assert repaired["probeFocus"] == ["实验设计", "数据质量"]
+    assert repaired["needsConfirmation"] is False
+    assert repaired["confidence"] == "high"
+    assert repaired["confirmationReasons"] == []
+    assert {item["code"] for item in repaired["confidenceDetails"]["semanticNotices"]} == {
+        "QUESTION_TYPE_UNCERTAIN",
+        "TOPIC_GROUPING_UNCERTAIN",
+    }
 
 
 def test_atoms_persist_and_manual_split_merge_preserve_text(settings_factory):
@@ -373,6 +616,63 @@ def test_confident_raw_stream_uses_only_boundary_worker(settings_factory):
     assert runtime.strategies == ["boundary_first"]
 
 
+def test_text_material_matching_resume_is_rejected_before_agent_work(settings_factory):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+    database = Database(settings.database_path)
+    database.initialize()
+    resume = "教育经历\n某大学统计学硕士\n工作经历\n负责经营分析与指标体系建设"
+    interview = database.create_interview({
+        "id": "resume-selected-as-transcript",
+        "resume_text": resume,
+        "raw_transcript": resume,
+    })
+    material = database.add_material(interview["id"], "transcript", resume, "resume.txt")
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+    context = ParsePipelineContext(ParseWorkflow(database, settings), run, material, interview)
+
+    with pytest.raises(ValueError, match="面试文字稿与简历内容相同"):
+        context.inspect()
+
+
+def test_implausible_single_utterance_does_not_replace_validated_source_segments(settings_factory):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "请介绍你负责的项目\n我负责推荐策略优化\n具体如何验证效果\n我通过对照实验验证"
+    interview = database.create_interview({"id": "reject-collapsed-utterance", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+    context = ParsePipelineContext(ParseWorkflow(database, settings), run, material, interview)
+    context.transcribe()
+    original_segment_ids = [item["id"] for item in context.segments]
+    context.validated = True
+
+    class CollapsingRuntime:
+        strategies = []
+
+        def run_utterance_worker(self, atoms, strategy, _core_start):
+            self.strategies.append(strategy)
+            return {"utterances": [{
+                "atom_ids": [item["id"] for item in atoms],
+                "speaker_role": "candidate",
+                "speaker_assessment": {"score": 95, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+                "boundary_assessment": {"score": 95, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+            }]}
+
+        def run_dialogue_worker(self, _utterances):
+            raise AssertionError("结构不合理的话轮不应进入问答 Worker")
+
+    runtime = CollapsingRuntime()
+    context.runtime = runtime
+
+    result = context.structure()
+
+    assert result["questionCount"] == 2
+    assert runtime.strategies == ["boundary_first", "speaker_first"]
+    assert [item["id"] for item in context.segments] == original_segment_ids
+    assert len(context.segments) == 4
+
+
 def test_dialogue_chunks_are_processed_with_bounded_parallelism(settings_factory):
     settings = settings_factory(
         agent_runtime="helloagents",
@@ -573,6 +873,112 @@ def test_local_relation_repair_recovers_clear_follow_ups_from_conservative_agent
     assert cards[1]["topicRootId"] == cards[0]["id"]
     assert cards[2]["topicRootId"] == cards[0]["id"]
     assert cards[3]["topicRootId"] == cards[3]["id"]
+
+
+def test_reliable_follow_up_inherits_topic_type_and_keeps_probe_focus(settings_factory):
+    settings = settings_factory(agent_runtime="helloagents", llm_api_key="test-key")
+    database = Database(settings.database_path)
+    database.initialize()
+    transcript = "\n".join([
+        "面试官：请介绍一次你负责的项目。",
+        "候选人：我负责履约策略分析。",
+        "面试官：为什么以商圈为单位随机，如何处理实验污染？",
+        "候选人：我使用商圈作为随机单元并设置隔离期。",
+    ])
+    interview = database.create_interview({"id": "probe-focus-inheritance", "raw_transcript": transcript})
+    material = database.add_material(interview["id"], "transcript", transcript)
+    run = database.create_parse_run(interview["id"], material["id"], "text")
+    context = ParsePipelineContext(ParseWorkflow(database, settings), run, material, interview)
+    context.profile = profile_transcript(transcript)
+    context.atoms = [
+        {"id": f"A{index:04d}", "ordinal": index, "rawText": text}
+        for index, text in enumerate([
+            "请介绍一次你负责的项目。",
+            "我负责履约策略分析。",
+            "为什么以商圈为单位随机，如何处理实验污染？",
+            "我使用商圈作为随机单元并设置隔离期。",
+        ], 1)
+    ]
+    context.segments = [
+        {
+            "id": f"U{index:04d}",
+            "ordinal": index,
+            "rawText": atom["rawText"],
+            "speakerRole": "interviewer" if index % 2 else "candidate",
+            "speakerConfidence": 0.96,
+            "atomIds": [atom["id"]],
+        }
+        for index, atom in enumerate(context.atoms, 1)
+    ]
+
+    class ProbeFocusRuntime:
+        def run_dialogue_worker(self, _utterances):
+            high = {"score": 94, "reason_codes": [], "evidence_atom_ids": [], "summary": ""}
+            semantic_type = {
+                "score": 72,
+                "reason_codes": ["QUESTION_TYPE_UNCERTAIN"],
+                "evidence_atom_ids": ["A0003"],
+                "summary": "追问同时涉及技术方法",
+            }
+            semantic_topic = {
+                "score": 74,
+                "reason_codes": ["TOPIC_GROUPING_UNCERTAIN"],
+                "evidence_atom_ids": ["A0003"],
+                "summary": "追问包含跨领域术语",
+            }
+            semantic_focus = {
+                "score": 76,
+                "reason_codes": ["PROBE_FOCUS_UNCERTAIN"],
+                "evidence_atom_ids": ["A0003"],
+                "summary": "同时考察实验设计和数据质量",
+            }
+            return {"question_turns": [
+                {
+                    "question_utterance_ids": ["U0001"],
+                    "answer_utterance_ids": ["U0002"],
+                    "turn_type": "main",
+                    "parent_question_anchor": None,
+                    "question_type": "项目经历",
+                    "topic_title": "履约策略项目",
+                    "question_boundary_assessment": high,
+                    "answer_boundary_assessment": high,
+                    "qa_pairing_assessment": high,
+                    "follow_up_assessment": None,
+                    "question_type_assessment": high,
+                    "topic_grouping_assessment": high,
+                },
+                {
+                    "question_utterance_ids": ["U0003"],
+                    "answer_utterance_ids": ["U0004"],
+                    "turn_type": "follow_up",
+                    "parent_question_anchor": "U0001",
+                    "question_type": "技术知识",
+                    "topic_title": "实验设计方法",
+                    "probe_focus": ["实验设计", "数据质量"],
+                    "question_boundary_assessment": high,
+                    "answer_boundary_assessment": high,
+                    "qa_pairing_assessment": high,
+                    "follow_up_assessment": high,
+                    "question_type_assessment": semantic_type,
+                    "topic_grouping_assessment": semantic_topic,
+                    "probe_focus_assessment": semantic_focus,
+                },
+            ]}
+
+    context.runtime = ProbeFocusRuntime()
+    cards = context._build_agent_cards()
+
+    assert cards[1]["turnType"] == "follow_up"
+    assert cards[1]["questionType"] == "项目经历"
+    assert cards[1]["topicTitle"] == "履约策略项目"
+    assert cards[1]["probeFocus"] == ["实验设计", "数据质量"]
+    assert cards[1]["needsConfirmation"] is False
+    assert cards[1]["confidenceDetails"]["agentSuggestedQuestionType"] == "技术知识"
+    assert {item["code"] for item in cards[1]["confidenceDetails"]["semanticNotices"]} == {
+        "QUESTION_TYPE_UNCERTAIN",
+        "TOPIC_GROUPING_UNCERTAIN",
+        "PROBE_FOCUS_UNCERTAIN",
+    }
 
 
 def test_dialogue_contract_drift_is_sanitized_without_lowering_high_confidence(settings_factory):

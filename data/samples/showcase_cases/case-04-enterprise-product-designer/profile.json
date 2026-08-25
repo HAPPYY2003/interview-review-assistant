@@ -1,0 +1,19 @@
+{
+  "company": "Microsoft",
+  "position": "Microsoft 365 产品设计师",
+  "round": "作品集与跨职能面试",
+  "interviewDate": "2026-08-20",
+  "reviewGoal": "检查用户研究、复杂信息架构、设计系统、无障碍、数据验证以及与产品工程团队协作能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "interviewerContexts": ["design", "product"]
+  },
+  "expectedFocus": [
+    "区分作品展示与候选人的真实决策贡献",
+    "核验可用性指标、业务结果与无障碍证据",
+    "关注候选人在设计系统约束和跨团队冲突中的取舍"
+  ]
+}

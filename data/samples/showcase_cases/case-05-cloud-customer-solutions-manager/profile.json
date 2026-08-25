@@ -1,0 +1,19 @@
+{
+  "company": "Amazon Web Services",
+  "position": "Customer Solutions Manager",
+  "round": "综合面试",
+  "interviewDate": "2026-08-20",
+  "reviewGoal": "检查客户导向、云迁移治理、技术与业务翻译、风险管理、高层沟通和可规模化方法",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "languageStyle": "zh_CN_with_english_terms"
+  },
+  "expectedFocus": [
+    "识别 Customer Outcomes、Migration、Governance、Executive Alignment 和 Scale 五个主题",
+    "区分项目活动指标、云采用指标与业务价值指标",
+    "检查候选人是否明确承认一次未经验证的迁移判断并给出机制改进"
+  ]
+}

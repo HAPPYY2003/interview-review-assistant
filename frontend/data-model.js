@@ -44,6 +44,10 @@ function performanceLevel(score) {
 }
 
 const QUESTION_TYPE_VALUES = ["自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他"];
+export const PROBE_FOCUS_VALUES = [
+  "补充细节", "个人贡献", "方法选择", "实验设计", "数据质量", "结果归因",
+  "业务决策", "一致性核查", "复盘反思", "岗位匹配", "其他"
+];
 const QUESTION_TYPE_ALIASES = {
   self_intro: "自我介绍",
   self_introduction: "自我介绍",
@@ -82,6 +86,38 @@ function normalizeQuestionType(value, question = "", topicTitle = "") {
   if (QUESTION_TYPE_VALUES.includes(topicPrefix)) return topicPrefix;
   const key = raw.toLowerCase().replace(/[\s-]+/g, "_");
   return QUESTION_TYPE_ALIASES[key] || inferQuestionType(`${topicTitle} ${question}`);
+}
+
+export function inferProbeFocus(text = "") {
+  const patterns = [
+    ["复盘反思", /重新做|重来|复盘|改进|改变哪|吸取.*教训|下次/],
+    ["结果归因", /归因|因果|因果关系|相关性|完全.*因为|证明.*带来|贡献了多少/],
+    ["实验设计", /实验|随机|对照组|实验组|样本量|显著性|显著|最小可检测|MDE|分流|灰度|污染/i],
+    ["数据质量", /数据.*(?:可信|准确|完整)|口径|清洗|异常值|缺失值|埋点|数据源|偏差|污染|外部事件/],
+    ["业务决策", /上线|决策|取舍|优先级|投入产出|ROI|风险|收益|是否推进|怎么判断/i],
+    ["一致性核查", /矛盾|前后不一|是否真实|怎么证明|凭什么|为什么不是|如何确认/],
+    ["个人贡献", /你(?:本人|个人)?做了什么|你的贡献|个人贡献|负责什么|职责边界|你推动|你主导/],
+    ["岗位匹配", /岗位|职位|适合|胜任|能力短板|为什么选择|求职动机/],
+    ["方法选择", /为什么(?:选择|采用|使用)|如何设计|怎么做|具体方法|方案选择|技术路线/],
+    ["补充细节", /具体|详细|然后呢|还有呢|展开|举例|过程|结果怎么样/]
+  ];
+  const matches = patterns.filter(([, pattern]) => pattern.test(String(text || ""))).map(([label]) => label);
+  return [...new Set(matches)].slice(0, 2).length ? [...new Set(matches)].slice(0, 2) : ["补充细节"];
+}
+
+export function normalizeProbeFocus(value, text = "") {
+  const source = Array.isArray(value) ? value : (value ? [value] : []);
+  const normalized = [...new Set(source.map(item => String(item || "").trim()).filter(item => PROBE_FOCUS_VALUES.includes(item)))].slice(0, 2);
+  return normalized.length ? normalized : inferProbeFocus(text);
+}
+
+export function questionTypeFromProbeFocus(focus = [], fallback = "其他") {
+  const values = new Set(Array.isArray(focus) ? focus : []);
+  if (values.has("实验设计") || values.has("数据质量") || values.has("方法选择") || values.has("结果归因")) return "技术知识";
+  if (values.has("业务决策")) return "业务理解";
+  if (values.has("复盘反思") || values.has("个人贡献") || values.has("一致性核查")) return "行为面试";
+  if (values.has("岗位匹配")) return "职业规划";
+  return normalizeQuestionType(fallback);
 }
 
 function inferTopicTitle(question = "", questionType = "") {
@@ -150,12 +186,19 @@ export function normalizeInterviewRecord(record = {}) {
           ? inferTopicTitle(mainTurn.interviewerQuestion, mainTurn.questionType)
           : sourceTitle;
         mainTurn.topicTitle = title;
+        const followUps = Array.isArray(topic.followUps)
+          ? topic.followUps.map(normalizeQuestionRecord).map(turn => ({
+              ...turn,
+              questionType: mainTurn.questionType,
+              topicTitle: title
+            }))
+          : [];
         return {
           ...topic,
           id: String(topic.id || mainTurn.id || crypto.randomUUID()),
           title,
           mainTurn,
-          followUps: Array.isArray(topic.followUps) ? topic.followUps.map(normalizeQuestionRecord) : []
+          followUps
         };
       })
     : [];
@@ -180,6 +223,7 @@ export function normalizeInterviewRecord(record = {}) {
     overallScores: { ...EMPTY_SCORES, ...(record.overallScores || {}) },
     topRisks: Array.isArray(record.topRisks) ? record.topRisks : [],
     auditNotes: Array.isArray(record.auditNotes) ? record.auditNotes : [],
+    topicReviewAudit: record.topicReviewAudit && typeof record.topicReviewAudit === "object" ? record.topicReviewAudit : null,
     growthPlanAudit: record.growthPlanAudit && typeof record.growthPlanAudit === "object" ? record.growthPlanAudit : null,
     report: record.report ? normalizeReportRecord(record.report) : null,
     createdAt: record.createdAt || new Date().toISOString(),
@@ -272,6 +316,10 @@ export function normalizeQuestionRecord(record = {}, options = {}) {
     confidenceDetails: record.confidenceDetails && typeof record.confidenceDetails === "object" ? record.confidenceDetails : {},
     confirmationReasons: Array.isArray(record.confirmationReasons) ? record.confirmationReasons : [],
     parseMethod: String(record.parseMethod || "legacy"),
+    probeFocus: (record.turnType || record.turn_type) === "follow_up"
+      ? normalizeProbeFocus(record.probeFocus || record.probe_focus, extractedQuestion)
+      : [],
+    probeFocusConfidence: Number(record.probeFocusConfidence ?? record.probe_focus_confidence ?? ((record.turnType || record.turn_type) === "follow_up" ? 84 : 100)),
     followUpImpact: String(record.followUpImpact || ""),
     questionSegmentIds: Array.isArray(record.questionSegmentIds) ? record.questionSegmentIds : (Array.isArray(record.question_segment_ids) ? record.question_segment_ids : []),
     answerSegmentIds: Array.isArray(record.answerSegmentIds) ? record.answerSegmentIds : (Array.isArray(record.answer_segment_ids) ? record.answer_segment_ids : []),
@@ -340,6 +388,7 @@ export function normalizeReportRecord(report = {}) {
       latestPracticeStatus: String(action.latestPracticeStatus || ""),
       latestPracticeSessionId: String(action.latestPracticeSessionId || ""),
       latestPracticeResult: String(action.latestPracticeResult || ""),
+      latestPracticeUpdatedAt: String(action.latestPracticeUpdatedAt || ""),
       selfRating: action.selfRating === null || action.selfRating === undefined || action.selfRating === ""
         ? null
         : (Number.isFinite(Number(action.selfRating)) ? Number(action.selfRating) : null)
@@ -354,6 +403,9 @@ export function normalizeReportRecord(report = {}) {
       overallScores: scores,
       overallEvaluation,
       capabilityGaps: gaps,
+      topicReviewAudit: sourceInterview.topicReviewAudit && typeof sourceInterview.topicReviewAudit === "object"
+        ? sourceInterview.topicReviewAudit
+        : null,
       growthPlanAudit: sourceInterview.growthPlanAudit && typeof sourceInterview.growthPlanAudit === "object"
         ? sourceInterview.growthPlanAudit
         : null

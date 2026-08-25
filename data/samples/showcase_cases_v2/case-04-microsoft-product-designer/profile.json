@@ -1,0 +1,19 @@
+{
+  "company": "Microsoft",
+  "position": "Microsoft 365 产品设计师",
+  "round": "作品集与跨职能面试",
+  "interviewDate": "2026-08-20",
+  "reviewGoal": "检查用户研究、复杂信息架构、无障碍、设计系统、数据验证、设计交付和跨团队决策能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "recommendedTopicCount": 6
+  },
+  "expectedFocus": [
+    "区分团队成果与候选人的个人设计判断",
+    "无障碍应落实为可测试规格，不只是价值口号",
+    "设计效果需要区分界面贡献和搜索算法贡献"
+  ]
+}

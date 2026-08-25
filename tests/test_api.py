@@ -107,6 +107,13 @@ def test_v1_api_end_to_end_and_sse_contract():
         assert report.json()["interview"]["overallEvaluation"]["score"] == report.json()["interview"]["overallScores"]["overall"]
         assert report.json()["interview"]["auditRound"] == 1
         assert report.json()["interview"]["capabilityGaps"]
+        assert report.json()["interview"]["topicReviewAudit"] == {
+            "decision": "pass",
+            "summary": "确定性引用校验完成",
+            "findings": [],
+            "round": 1,
+            "revisionCount": 0,
+        }
         assert report.json()["interview"]["growthPlanAudit"] == {
             "decision": "pass",
             "summary": "成长计划已通过确定性结构与引用校验。",
@@ -270,6 +277,74 @@ def test_question_patch_preserves_legacy_text_and_rejects_empty_question():
         )
         assert rejected.status_code == 422
         assert "问题原文不能为空" in rejected.json()["detail"]
+
+
+def test_question_patch_syncs_follow_up_type_and_preserves_probe_focus():
+    interview_id = f"probe-focus-patch-{uuid.uuid4()}"
+    main_id = f"main-{uuid.uuid4()}"
+    follow_up_id = f"follow-up-{uuid.uuid4()}"
+    main = {
+        "id": main_id,
+        "order": 1,
+        "interviewerQuestion": "请介绍一次你负责的项目。",
+        "candidateAnswer": "我负责履约策略分析。",
+        "questionType": "项目经历",
+        "topicRootId": main_id,
+        "turnType": "main",
+        "topicTitle": "履约策略项目",
+    }
+    follow_up = {
+        "id": follow_up_id,
+        "order": 2,
+        "interviewerQuestion": "为什么以商圈为单位随机，如何处理实验污染？",
+        "candidateAnswer": "我使用商圈作为随机单元并设置隔离期。",
+        "questionType": "技术知识",
+        "topicRootId": main_id,
+        "parentQuestionId": main_id,
+        "turnType": "follow_up",
+        "topicTitle": "实验设计方法",
+        "probeFocus": ["实验设计", "数据质量"],
+        "probeFocusConfidence": 88,
+        "confirmationReasons": [{
+            "code": "QUESTION_TYPE_UNCERTAIN",
+            "dimension": "questionType",
+            "score": 72,
+        }],
+        "needsConfirmation": True,
+    }
+
+    with TestClient(app) as client:
+        assert client.post("/api/v1/interviews", json={"id": interview_id}).status_code == 201
+        patched = client.patch(
+            f"/api/v1/interviews/{interview_id}/questions",
+            json={"questions": [main, follow_up]},
+        )
+
+        assert patched.status_code == 200
+        saved = {item["id"]: item for item in patched.json()["questions"]}
+        assert saved[follow_up_id]["questionType"] == "项目经历"
+        assert saved[follow_up_id]["topicTitle"] == "履约策略项目"
+        assert saved[follow_up_id]["probeFocus"] == ["实验设计", "数据质量"]
+        assert saved[follow_up_id]["needsConfirmation"] is False
+        assert saved[follow_up_id]["confirmationReasons"] == []
+
+        saved[main_id]["questionType"] = "行为面试"
+        saved[main_id]["topicTitle"] = "行为复盘"
+        updated = client.patch(
+            f"/api/v1/interviews/{interview_id}/questions",
+            json={"questions": list(saved.values())},
+        )
+        updated_follow_up = next(item for item in updated.json()["questions"] if item["id"] == follow_up_id)
+        assert updated_follow_up["questionType"] == "行为面试"
+        assert updated_follow_up["topicTitle"] == "行为复盘"
+        assert updated_follow_up["probeFocus"] == ["实验设计", "数据质量"]
+
+        invalid = {**updated_follow_up, "probeFocus": ["实验设计", "数据质量", "结果归因"]}
+        rejected = client.patch(
+            f"/api/v1/interviews/{interview_id}/questions",
+            json={"questions": [saved[main_id], invalid]},
+        )
+        assert rejected.status_code == 422
 
 
 def test_parse_api_supports_all_transcript_shapes_and_returns_atoms():
@@ -663,6 +738,7 @@ def test_action_practice_session_supports_draft_feedback_reuse_and_cascade_delet
         assert practice_action["practiceCount"] == 1
         assert practice_action["latestPracticeStatus"] == "reviewed"
         assert practice_action["latestPracticeSessionId"] == session_id
+        assert practice_action["latestPracticeUpdatedAt"] == session["updatedAt"]
 
         invalid_action = client.post(
             "/api/v1/growth-actions/not-an-action/practice-sessions",
@@ -683,6 +759,95 @@ def test_action_practice_session_supports_draft_feedback_reuse_and_cascade_delet
             assert connection.execute(
                 "SELECT COUNT(*) FROM practice_attempts WHERE session_id=?", (session_id,)
             ).fetchone()[0] == 0
+
+
+def test_restorable_practice_session_summaries_include_each_mode_and_exclude_content():
+    interview_id = f"practice-list-{uuid.uuid4()}"
+    pending_interview_id = f"practice-list-pending-{uuid.uuid4()}"
+    with TestClient(app) as client:
+        interview = database.create_interview({
+            "id": interview_id,
+            "company": "星河科技",
+            "position": "产品经理",
+            "raw_transcript": "面试官：介绍一个项目。\n候选人：我负责定义目标并推进上线。",
+        })
+        database.replace_questions(interview_id, review_service.parse_transcript(interview["raw_transcript"]))
+        database.confirm_questions(interview_id)
+        run = database.create_run(
+            interview_id,
+            agent_mode="fixture",
+            input_digest=workflow.input_digest(interview_id),
+        )
+        workflow.execute(run["id"])
+        actions = client.get(f"/api/v1/growth-plans/{run['id']}").json()["actions"]
+        first_action = actions[0]
+        second_action = actions[1] if len(actions) > 1 else actions[0]
+
+        generating, _ = database.create_or_get_practice_session(
+            interview_id=interview_id, run_id=run["id"],
+            action_id=first_action["id"], mode="oral_answer",
+        )
+        failed, _ = database.create_or_get_practice_session(
+            interview_id=interview_id, run_id=run["id"],
+            action_id=first_action["id"], mode="follow_up_drill",
+        )
+        failed = database.update_practice_session(failed["id"], {
+            "status": "failed", "errorCode": "PRACTICE_TIMEOUT",
+            "errorMessage": "不应出现在摘要响应中的内部错误正文",
+        })
+        draft, _ = database.create_or_get_practice_session(
+            interview_id=interview_id, run_id=run["id"],
+            action_id=first_action["id"], mode="case_builder",
+        )
+        database.update_practice_session(draft["id"], {
+            "status": "draft", "draftText": "不应出现在摘要响应中的练习草稿",
+        })
+        reviewing, _ = database.create_or_get_practice_session(
+            interview_id=interview_id, run_id=run["id"],
+            action_id=second_action["id"], mode="knowledge_quiz",
+        )
+        attempt = database.create_practice_attempt(
+            reviewing["id"], response_text="不应返回的练习答案", self_rating=3,
+        )
+        reviewed, _ = database.create_or_get_practice_session(
+            interview_id=interview_id, run_id=run["id"],
+            action_id=second_action["id"], mode="oral_answer",
+        )
+        database.update_practice_session(reviewed["id"], {"status": "reviewed"})
+
+        response = client.get(f"/api/v1/runs/{run['id']}/practice-sessions")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["runId"] == run["id"]
+        assert payload["status"] == "restorable"
+        items = payload["items"]
+        assert {item["id"] for item in items} == {
+            generating["id"], failed["id"], draft["id"], reviewing["id"],
+        }
+        assert [item["status"] for item in items[:2]] == ["reviewing", "generating"]
+        assert items[2]["status"] == "failed"
+        assert items[3]["status"] == "draft"
+        draft_summary = next(item for item in items if item["id"] == draft["id"])
+        reviewing_summary = next(item for item in items if item["id"] == reviewing["id"])
+        failed_summary = next(item for item in items if item["id"] == failed["id"])
+        assert draft_summary["hasDraft"] is True
+        assert reviewing_summary["attemptCount"] == 1
+        assert reviewing_summary["latestAttemptStatus"] == attempt["status"]
+        assert failed_summary["errorCode"] == "PRACTICE_TIMEOUT"
+        forbidden = {"draftText", "brief", "attempts", "responseText", "review", "errorMessage"}
+        assert all(not forbidden.intersection(item) for item in items)
+        assert len({item["mode"] for item in items if item["actionId"] == first_action["id"]}) == 3
+
+        assert client.get(
+            f"/api/v1/runs/{run['id']}/practice-sessions", params={"status": "all"},
+        ).status_code == 422
+        assert client.get("/api/v1/runs/missing/practice-sessions").status_code == 404
+
+        database.create_interview({"id": pending_interview_id, "company": "待处理", "position": "产品经理"})
+        pending_run = database.create_run(pending_interview_id, agent_mode="fixture")
+        assert client.get(
+            f"/api/v1/runs/{pending_run['id']}/practice-sessions"
+        ).status_code == 409
 
 
 def test_growth_snapshot_delete_keeps_interview_record():

@@ -11,10 +11,10 @@
     "questions": 7,
     "topics": 7,
     "followUps": 0,
-    "needsConfirmation": 7
+    "needsConfirmation": 0
   },
   "expectedFocus": [
-    "speaker_0 与 speaker_1 需要人工确认角色",
+    "speaker_0 与 speaker_1 根据整场问答分布自动映射角色",
     "回答缺少部分指标口径和个人贡献证据",
     "确认前不应直接启动正式复盘"
   ]

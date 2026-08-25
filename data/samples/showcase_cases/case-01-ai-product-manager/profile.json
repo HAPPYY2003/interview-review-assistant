@@ -1,0 +1,20 @@
+{
+  "company": "字节跳动（飞书）",
+  "position": "AI 产品经理",
+  "round": "业务二面",
+  "interviewDate": "2026-08-18",
+  "reviewGoal": "检查 AI 场景定义、Agent 边界、评测体系、权限安全、数据证据和商业化决策能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "recommendedTopics": 5,
+    "recommendedFollowUps": 10
+  },
+  "expectedFocus": [
+    "应把连续追问聚合到用户反馈分析、Agent 方案、评测、权限和商业化五个主题",
+    "核验离线准确率、人工处理时长、激活率和付费转化等指标是否能回查原回答",
+    "识别一次失败灰度中的决策责任，而不是只总结成功结果"
+  ]
+}

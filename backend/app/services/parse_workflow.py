@@ -14,7 +14,12 @@ from backend.app.agents.runtime import HelloAgentsRuntime
 from backend.app.config import Settings
 from backend.app.database import Database
 from backend.app.services.audio import DeepgramTranscriptionProvider, deepgram_segments, inspect_audio
-from backend.app.services.evidence import QUESTION_TYPES, infer_topic_title, normalize_question_type
+from backend.app.services.evidence import (
+    QUESTION_TYPES,
+    infer_topic_title,
+    normalize_probe_focus,
+    normalize_question_type,
+)
 from backend.app.services.transcript import (
     build_question_cards,
     map_speaker_roles,
@@ -67,6 +72,10 @@ ASSESSMENT_REASON_RULES = {
     "topic_grouping_assessment": (
         {ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN},
         ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN,
+    ),
+    "probe_focus_assessment": (
+        {ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN},
+        ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN,
     ),
 }
 
@@ -124,6 +133,10 @@ class ParsePipelineContext:
             text = self.material.get("text") or self.interview.get("raw_transcript", "")
             if not text.strip():
                 raise ValueError("面试文字稿为空")
+            reference_type = self._matching_non_transcript_material(text)
+            if reference_type:
+                label = "简历" if reference_type == "resume" else "岗位 JD"
+                raise ValueError(f"当前面试文字稿与{label}内容相同，请重新选择真实的面试文字稿")
             result = {"format": "text", "sizeBytes": len(text.encode("utf-8")), "characters": len(text)}
         self.inspection = result
         self.workflow.tool_event(self.parse_run_id, "InspectMaterial", {"format": result.get("suffix", result.get("format")), "sizeBytes": result["sizeBytes"]})
@@ -195,14 +208,17 @@ class ParsePipelineContext:
         if any(item["severity"] == "blocking" for item in self.validation_issues):
             raise ValueError("转写片段存在阻塞问题，无法继续拆题")
         self.workflow.phase(self.parse_run_id, "STRUCTURING", "正在恢复话轮并识别主问题、回答和追问关系")
+        validated_segments = self.segments
         cards: list[dict[str, Any]] = []
         agent_error = ""
+        using_agent_segments = False
         if self.settings.real_agent_enabled:
             try:
                 if self._needs_agent_utterances():
                     agent_segments = self._build_agent_utterances()
                     if agent_segments:
                         self.segments = agent_segments
+                        using_agent_segments = True
                 else:
                     self.workflow.tool_event(self.parse_run_id, "LocalUtterancesReused", {
                         "profileType": self.profile.profile_type if self.profile else "unknown",
@@ -212,14 +228,20 @@ class ParsePipelineContext:
                 cards = self._build_agent_cards()
             except (ValueError, ValidationError, TypeError) as exc:
                 agent_error = str(exc)
+                self.segments = validated_segments
+                using_agent_segments = False
                 self.workflow.tool_event(self.parse_run_id, "StructuredSubmissionRejected", {"message": agent_error[:180]})
         if not cards:
             # A malformed Agent payload is not evidence that the source references
             # are invalid. Let the deterministic parser derive confidence from the
             # actual transcript quality and boundaries.
+            self.segments = validated_segments
+            using_agent_segments = False
             cards = self._fallback_cards()
         errors = validate_question_cards(cards, self.segments)
         if errors:
+            if using_agent_segments:
+                self.segments = validated_segments
             cards = self._fallback_cards(force_confirmation=True)
             errors = validate_question_cards(cards, self.segments)
         self.questions = cards
@@ -244,6 +266,8 @@ class ParsePipelineContext:
             self.structure()
         self.workflow.phase(self.parse_run_id, "SUBMITTING", "正在回查片段引用并提交候选题卡")
         errors = validate_question_cards(self.questions, self.segments)
+        if not self.questions:
+            errors = ["NO_QUESTION_CARDS", *errors]
         self.accepted = bool(self.questions) and not errors
         data = {"accepted": self.accepted, "artifactId": self.parse_run_id, "questionCount": len(self.questions), "errors": errors[:10]}
         self.workflow.tool_event(self.parse_run_id, "SubmitQuestionCards", {"accepted": self.accepted, "questionCount": len(self.questions), "errorCount": len(errors)})
@@ -262,18 +286,23 @@ class ParsePipelineContext:
                 continue
             selected_payload, unresolved = first_payload, False
             first_batch = self._valid_utterance_batch(first_payload, chunk)
-            if self.profile.profile_type == "raw_stream" and not self._utterance_batch_is_confident(first_batch):
+            needs_second_pass = first_batch is None or (
+                self.profile.profile_type == "raw_stream" and not self._utterance_batch_is_confident(first_batch)
+            )
+            if needs_second_pass:
                 second_payload = self.runtime.run_utterance_worker(chunk, "speaker_first", core_start)
                 second_batch = self._valid_utterance_batch(second_payload, chunk) if second_payload else None
                 if first_batch is None and second_batch is not None:
                     selected_payload, first_batch = second_payload, second_batch
-                elif second_batch is not None and self._utterance_signature(first_payload) != self._utterance_signature(second_payload):
+                elif first_batch is not None and second_batch is not None and self._utterance_signature(first_payload) != self._utterance_signature(second_payload):
                     audit = self.runtime.run_parse_auditor(first_payload, second_payload) or {}
                     selection = audit.get("selected")
                     selected_payload = second_payload if selection == "speaker_first" else first_payload
                     unresolved = selection not in {"boundary_first", "speaker_first"}
                     first_batch = second_batch if selection == "speaker_first" else first_batch
-            batch = first_batch or UtteranceBatch.model_validate(selected_payload)
+            if first_batch is None:
+                raise ValueError("UTTERANCE_STRUCTURE_IMPLAUSIBLE")
+            batch = first_batch
             self._validate_assessment_atoms(batch.model_dump(mode="json"), {item["id"] for item in chunk})
             converted = utterances_from_submission(batch, chunk, self.raw_source, self.profile)
             for utterance in converted:
@@ -300,8 +329,19 @@ class ParsePipelineContext:
     def _needs_agent_utterances(self) -> bool:
         if not self.profile:
             return False
-        if self.profile.profile_type == "labeled_lines" and self.profile.speaker_label_coverage >= 0.8:
-            return False
+        if self.profile.profile_type in {"labeled_lines", "unlabeled_lines"}:
+            usable = [item for item in self.segments if not item.get("excluded")]
+            roles_are_known = all(item.get("speakerRole") in {"interviewer", "candidate", "system_noise"} for item in usable)
+            dialogue_roles = {item.get("speakerRole") for item in usable}
+            has_dialogue_shape = len(usable) > 1 and {"interviewer", "candidate"}.issubset(dialogue_roles)
+            speaker_scores = [float(item.get("speakerConfidence") or 0) for item in usable]
+            speaker_is_uncertain = any(
+                reason.get("code") == ConfirmationReasonCode.SPEAKER_ROLE_UNCERTAIN.value
+                for item in usable
+                for reason in item.get("confirmationReasons", [])
+            )
+            if usable and roles_are_known and has_dialogue_shape and min(speaker_scores, default=0) >= 0.8 and not speaker_is_uncertain:
+                return False
         if self.profile.profile_type == "audio":
             usable = [item for item in self.segments if not item.get("excluded")]
             known = [item for item in usable if item.get("speakerRole") in {"interviewer", "candidate"}]
@@ -320,7 +360,30 @@ class ParsePipelineContext:
             return None
         allowed = {item["id"] for item in atoms}
         referenced = {atom_id for item in batch.utterances for atom_id in item.atom_ids}
-        return batch if referenced and referenced.issubset(allowed) else None
+        if not referenced or not referenced.issubset(allowed):
+            return None
+        if self.profile and self.profile.profile_type in {"labeled_lines", "unlabeled_lines"} and len(atoms) >= 4:
+            dialogue_roles = {item.speaker_role for item in batch.utterances}
+            if len(batch.utterances) < 2 or not {"interviewer", "candidate"}.issubset(dialogue_roles):
+                return None
+        return batch
+
+    def _matching_non_transcript_material(self, text: str) -> str:
+        candidate = self._normalized_material_text(text)
+        if not candidate:
+            return ""
+        references = (
+            ("resume", self.interview.get("resume_text", "")),
+            ("job_description", self.interview.get("job_description", "")),
+        )
+        for material_type, reference in references:
+            if candidate == self._normalized_material_text(str(reference or "")):
+                return material_type
+        return ""
+
+    @staticmethod
+    def _normalized_material_text(text: str) -> str:
+        return re.sub(r"\s+", "", str(text or "")).strip()
 
     @staticmethod
     def _utterance_batch_is_confident(batch: UtteranceBatch | None) -> bool:
@@ -394,7 +457,7 @@ class ParsePipelineContext:
             a_segments = [utterance_map[item] for item in turn.answer_utterance_ids]
             question_text = "\n".join(item["rawText"] for item in q_segments).strip()
             answer_text = "\n".join(item["rawText"] for item in a_segments).strip()
-            question_type = normalize_question_type(turn.question_type, question_text)
+            suggested_question_type = normalize_question_type(turn.question_type, question_text)
             speaker = self._speaker_assessment([*q_segments, *a_segments])
             assessments = {
                 "speaker": speaker,
@@ -406,6 +469,8 @@ class ParsePipelineContext:
             }
             if turn.follow_up_assessment:
                 assessments["followUp"] = turn.follow_up_assessment
+            if turn.probe_focus_assessment:
+                assessments["probeFocus"] = turn.probe_focus_assessment
             hard_reasons = []
             if not answer_text:
                 hard_reasons.append(ConfirmationReasonCode.ANSWER_MISSING)
@@ -415,7 +480,7 @@ class ParsePipelineContext:
             is_follow_up = turn.turn_type == "follow_up" and bool(parent)
             local_follow_up_score = self._local_follow_up_score(
                 question_text,
-                question_type,
+                suggested_question_type,
                 turn.topic_title,
                 last_root,
             )
@@ -435,6 +500,10 @@ class ParsePipelineContext:
             confidence = calculate_turn_confidence(effective_turn_type, assessments, self.profile.source_quality, hard_reasons=hard_reasons)
             question_id = str(uuid.uuid4())
             topic_title = parent["title"] if is_follow_up else turn.topic_title or infer_topic_title(question_text, turn.question_type)
+            question_type = parent["questionType"] if is_follow_up else suggested_question_type
+            probe_focus = normalize_probe_focus(turn.probe_focus, question_text) if is_follow_up else []
+            probe_focus_confidence = float(turn.probe_focus_assessment.score if is_follow_up and turn.probe_focus_assessment else 100)
+            confidence["confidenceDetails"]["agentSuggestedQuestionType"] = suggested_question_type
             card = {
                 "id": question_id, "order": q_segments[0]["ordinal"], "interviewerQuestion": question_text,
                 "candidateAnswer": answer_text, "questionType": question_type,
@@ -446,6 +515,7 @@ class ParsePipelineContext:
                 "provenanceStatus": "conflict" if hard_reasons else "source", "followUpImpact": "",
                 "questionSegmentIds": list(turn.question_utterance_ids), "answerSegmentIds": list(turn.answer_utterance_ids),
                 "parseMethod": "agent", **confidence,
+                "probeFocus": probe_focus, "probeFocusConfidence": probe_focus_confidence,
             }
             cards.append(card)
             if not is_follow_up:
@@ -486,6 +556,10 @@ class ParsePipelineContext:
             if not topic_title or "\ufffd" in topic_title or len(topic_title) > 40:
                 topic_title = infer_topic_title(question_text, turn["question_type"])
             turn["topic_title"] = topic_title[:40]
+            if turn["turn_type"] == "follow_up":
+                turn["probe_focus"] = normalize_probe_focus(turn.get("probe_focus"), question_text)
+            else:
+                turn["probe_focus"] = []
 
             evidence_defaults = {
                 "question_boundary_assessment": question_atoms,
@@ -494,16 +568,22 @@ class ParsePipelineContext:
                 "follow_up_assessment": question_atoms,
                 "question_type_assessment": question_atoms,
                 "topic_grouping_assessment": [*question_atoms, *answer_atoms],
+                "probe_focus_assessment": question_atoms,
             }
             for field, (allowed_reasons, default_reason) in ASSESSMENT_REASON_RULES.items():
                 assessment = turn.get(field)
-                if field == "follow_up_assessment" and turn["turn_type"] == "main":
+                if field in {"follow_up_assessment", "probe_focus_assessment"} and turn["turn_type"] == "main":
                     turn[field] = None
                     continue
                 if not isinstance(assessment, dict):
-                    if field != "follow_up_assessment":
+                    if field not in {"follow_up_assessment", "probe_focus_assessment"}:
                         continue
-                    assessment = {"score": 60, "reason_codes": [], "evidence_atom_ids": [], "summary": ""}
+                    assessment = {
+                        "score": 76 if field == "probe_focus_assessment" else 60,
+                        "reason_codes": [default_reason.value],
+                        "evidence_atom_ids": evidence_defaults[field],
+                        "summary": "根据原问题生成默认考察重点" if field == "probe_focus_assessment" else "",
+                    }
                 turn[field] = self._sanitize_assessment(
                     assessment,
                     allowed_reasons,
@@ -585,6 +665,12 @@ class ParsePipelineContext:
                     None if clear_parent else ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN,
                     atom_refs,
                 )
+                focus_score = int(card.get("probeFocusConfidence", 84))
+                assessments["probeFocus"] = self._assessment(
+                    focus_score,
+                    ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN if focus_score < 80 else None,
+                    atom_refs,
+                )
             hard = []
             if not a_segments:
                 hard.append(ConfirmationReasonCode.ANSWER_MISSING)
@@ -652,6 +738,8 @@ class ParsePipelineContext:
         ]
         if turn.follow_up_assessment:
             assessments.append(turn.follow_up_assessment)
+        if turn.probe_focus_assessment:
+            assessments.append(turn.probe_focus_assessment)
         average = sum(item.score for item in assessments) / max(1, len(assessments))
         return (bool(turn.answer_utterance_ids), average, len(turn.answer_utterance_ids))
 

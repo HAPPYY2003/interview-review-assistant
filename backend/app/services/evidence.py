@@ -10,6 +10,10 @@ from backend.app.services.text_utils import repair_mojibake
 
 
 QUESTION_TYPES = ("自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他")
+PROBE_FOCUS_VALUES = (
+    "补充细节", "个人贡献", "方法选择", "实验设计", "数据质量", "结果归因",
+    "业务决策", "一致性核查", "复盘反思", "岗位匹配", "其他",
+)
 QUESTION_TYPE_ALIASES = {
     "self_intro": "自我介绍",
     "self_introduction": "自我介绍",
@@ -61,6 +65,32 @@ def normalize_question_type(value: Any, text: str = "") -> str:
     if key in QUESTION_TYPE_ALIASES:
         return QUESTION_TYPE_ALIASES[key]
     return infer_question_type(text)
+
+
+def infer_probe_focus(text: str) -> list[str]:
+    """Infer up to two cross-cutting focuses without changing the topic type."""
+    source = str(text or "").strip()
+    patterns = (
+        ("复盘反思", r"重新做|重来|复盘|改进|改变哪|吸取.*教训|下次"),
+        ("结果归因", r"归因|因果|因果关系|相关性|完全.*因为|证明.*带来|贡献了多少"),
+        ("实验设计", r"实验|随机|对照组|实验组|样本量|显著性|显著|最小可检测|MDE|分流|灰度|污染"),
+        ("数据质量", r"数据.*(?:可信|准确|完整)|口径|清洗|异常值|缺失值|埋点|数据源|偏差|污染|外部事件"),
+        ("业务决策", r"上线|决策|取舍|优先级|投入产出|ROI|风险|收益|是否推进|怎么判断"),
+        ("一致性核查", r"矛盾|前后不一|是否真实|怎么证明|凭什么|为什么不是|如何确认"),
+        ("个人贡献", r"你(?:本人|个人)?做了什么|你的贡献|个人贡献|负责什么|职责边界|你推动|你主导"),
+        ("岗位匹配", r"岗位|职位|适合|胜任|能力短板|为什么选择|求职动机"),
+        ("方法选择", r"为什么(?:选择|采用|使用)|如何设计|怎么做|具体方法|方案选择|技术路线"),
+        ("补充细节", r"具体|详细|然后呢|还有呢|展开|举例|过程|结果怎么样"),
+    )
+    matches = [label for label, pattern in patterns if re.search(pattern, source, re.I)]
+    return list(dict.fromkeys(matches))[:2] or ["补充细节"]
+
+
+def normalize_probe_focus(value: Any, text: str = "") -> list[str]:
+    items = value if isinstance(value, (list, tuple, set)) else ([value] if value else [])
+    normalized = [str(item or "").strip() for item in items]
+    normalized = list(dict.fromkeys(item for item in normalized if item in PROBE_FOCUS_VALUES))[:2]
+    return normalized or infer_probe_focus(text)
 
 
 def infer_topic_title(text: str, question_type: Any = "") -> str:

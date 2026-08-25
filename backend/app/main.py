@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,7 +64,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
 
 
-app = FastAPI(title="Offer Radar Agent", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="面试复盘助手", version="0.5.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
@@ -433,12 +433,45 @@ def patch_questions(interview_id: str, payload: QuestionPatch) -> dict[str, Any]
             item["candidateAnswer"] = item["extractedAnswer"]
         if not str(item.get("interviewerQuestion", "")).strip():
             raise HTTPException(status_code=422, detail="题卡问题原文不能为空，请返回解析结果重新分配问题片段")
-        resolved_codes = {"QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS", "ANSWER_MISSING", "REFERENCE_VALIDATION_FAILED"}
+        resolved_codes = {"QUESTION_BOUNDARY_UNCERTAIN", "ANSWER_BOUNDARY_UNCERTAIN", "QA_PAIRING_AMBIGUOUS", "REFERENCE_VALIDATION_FAILED"}
+        if str(item.get("candidateAnswer") or "").strip():
+            resolved_codes.add("ANSWER_MISSING")
         item["confirmationReasons"] = [reason for reason in item.get("confirmationReasons", []) if reason.get("code") not in resolved_codes]
-        item["needsConfirmation"] = False if item.get("confirmed") else bool(item["confirmationReasons"] or not item.get("interviewerQuestion"))
+        item["needsConfirmation"] = False if item.get("confirmed") else bool(
+            item["confirmationReasons"]
+            or not str(item.get("interviewerQuestion") or "").strip()
+            or not str(item.get("candidateAnswer") or "").strip()
+        )
         if item.get("editedQuestion") or item.get("editedAnswer") or question_ids or answer_ids:
             item["provenanceStatus"] = "edited"
         prepared.append(item)
+    by_id = {item["id"]: item for item in prepared}
+    semantic_codes = {"QUESTION_TYPE_UNCERTAIN", "TOPIC_GROUPING_UNCERTAIN", "PROBE_FOCUS_UNCERTAIN"}
+    for item in prepared:
+        if item.get("turnType") != "follow_up":
+            continue
+        parent = by_id.get(item.get("parentQuestionId"))
+        if not parent or parent.get("turnType") != "main":
+            continue
+        item["questionType"] = parent.get("questionType", "其他")
+        item["topicTitle"] = parent.get("topicTitle", item.get("topicTitle", ""))
+        details = dict(item.get("confidenceDetails") or {})
+        notices = list(details.get("semanticNotices") or [])
+        blocking_reasons = []
+        for reason in item.get("confirmationReasons", []):
+            if reason.get("code") in semantic_codes:
+                if not any(existing.get("code") == reason.get("code") for existing in notices):
+                    notices.append(reason)
+            else:
+                blocking_reasons.append(reason)
+        details["semanticNotices"] = notices[:4]
+        item["confidenceDetails"] = details
+        item["confirmationReasons"] = blocking_reasons
+        item["needsConfirmation"] = False if item.get("confirmed") else bool(
+            blocking_reasons
+            or not str(item.get("interviewerQuestion") or "").strip()
+            or not str(item.get("candidateAnswer") or "").strip()
+        )
     questions = database.replace_questions(interview_id, prepared)
     database.update_interview(interview_id, status="WAITING_CONFIRMATION", latest_run_id=None)
     return {"questions": questions, "invalidatedPreviousReport": True}
@@ -537,6 +570,21 @@ def get_run(run_id: str) -> dict[str, Any]:
         "checkpoint": checkpoint,
     }
     return run
+
+
+@app.get("/api/v1/runs/{run_id}/practice-sessions")
+def get_restorable_practice_sessions(
+    run_id: str,
+    status: Literal["restorable"] = Query(default="restorable"),
+) -> dict[str, Any]:
+    run = get_run_or_404(run_id)
+    if run["status"] != "COMPLETED":
+        raise HTTPException(status_code=409, detail="复盘报告尚未生成完成")
+    return {
+        "runId": run_id,
+        "status": status,
+        "items": database.list_restorable_practice_sessions(run_id),
+    }
 
 
 @app.get("/api/v1/runs/{run_id}/events")

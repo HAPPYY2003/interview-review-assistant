@@ -1,0 +1,20 @@
+{
+  "company": "美团",
+  "position": "履约数据分析师",
+  "round": "专业二面",
+  "interviewDate": "2026-08-19",
+  "reviewGoal": "检查指标拆解、因果识别、A/B 实验、异常诊断、业务推动能力，并演示无角色转写的人工校对",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "transcriptStyle": "asr_without_speaker_labels",
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "speakerMappingRequired": true
+  },
+  "expectedFocus": [
+    "首先确认奇数行更可能是面试官、偶数行更可能是候选人",
+    "口语中的停顿词不应被当作新问题，低置信度片段需人工确认",
+    "重点核验实验污染、区域溢出、护栏指标和业务落地证据"
+  ]
+}

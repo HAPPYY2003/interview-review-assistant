@@ -1,0 +1,19 @@
+{
+  "company": "腾讯云",
+  "position": "SRE 稳定性工程师",
+  "round": "技术二面",
+  "interviewDate": "2026-08-19",
+  "reviewGoal": "检查 SLO、告警治理、事故响应、根因分析、灰度回滚、容量、故障演练和跨团队稳定性治理能力",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "containsSystemNoise": true
+  },
+  "expectedFocus": [
+    "录音与麦克风提示应被排除",
+    "事故回答需要区分触发因素、根因、放大因素和恢复缺陷",
+    "候选人不能用告警数量下降代替真实可用性改善"
+  ]
+}

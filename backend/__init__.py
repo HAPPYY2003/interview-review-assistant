@@ -1,2 +1,1 @@
-"""Offer Radar backend package."""
-
+"""Interview review assistant backend package."""

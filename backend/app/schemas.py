@@ -80,6 +80,11 @@ class QuestionCard(APIModel):
     confidence_details: dict[str, Any] = Field(default_factory=dict, alias="confidenceDetails")
     confirmation_reasons: list[dict[str, Any]] = Field(default_factory=list, alias="confirmationReasons")
     parse_method: str = Field(default="legacy", alias="parseMethod")
+    probe_focus: list[Literal[
+        "补充细节", "个人贡献", "方法选择", "实验设计", "数据质量", "结果归因",
+        "业务决策", "一致性核查", "复盘反思", "岗位匹配", "其他",
+    ]] = Field(default_factory=list, max_length=2, alias="probeFocus")
+    probe_focus_confidence: float = Field(default=100, ge=0, le=100, alias="probeFocusConfidence")
 
 
 class QuestionPatch(APIModel):

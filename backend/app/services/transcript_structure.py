@@ -8,6 +8,12 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.services.text_utils import (
+    parse_transcript_line,
+    subtitle_sequence_line_indexes,
+    transcript_uses_short_timeline,
+)
+
 try:
     import jieba
 except ImportError:  # pragma: no cover - requirements include jieba
@@ -15,11 +21,6 @@ except ImportError:  # pragma: no cover - requirements include jieba
 
 
 QUESTION_TYPES = ("自我介绍", "项目经历", "技术知识", "行为面试", "业务理解", "职业规划", "反问环节", "其他")
-SPEAKER_PATTERN = re.compile(
-    r"^(?:(?P<time>\[[^\]]+\]|(?:\d{1,2}:){1,2}\d{2})\s*)?"
-    r"(?P<label>面试官|采访者|interviewer|问|q|候选人|求职者|candidate|答|a)\s*[:：]\s*(?P<text>.*)$",
-    re.I,
-)
 SENTENCE_END_PATTERN = re.compile(r"[。！？?!]")
 QUESTION_CUE_PATTERN = re.compile(r"(?:请|能否|可以|为什么|怎么|如何|介绍|讲讲|谈谈|说说|哪些|什么|是否|如果|你会|你在)")
 CANDIDATE_CUE_PATTERN = re.compile(r"^(?:我|我们|主要|首先|当时|后来|最后|因为|负责)")
@@ -34,6 +35,7 @@ class ConfirmationReasonCode(str, Enum):
     FOLLOWUP_PARENT_UNCERTAIN = "FOLLOWUP_PARENT_UNCERTAIN"
     QUESTION_TYPE_UNCERTAIN = "QUESTION_TYPE_UNCERTAIN"
     TOPIC_GROUPING_UNCERTAIN = "TOPIC_GROUPING_UNCERTAIN"
+    PROBE_FOCUS_UNCERTAIN = "PROBE_FOCUS_UNCERTAIN"
     SOURCE_QUALITY_LOW = "SOURCE_QUALITY_LOW"
     ANSWER_MISSING = "ANSWER_MISSING"
     CHUNK_OVERLAP_CONFLICT = "CHUNK_OVERLAP_CONFLICT"
@@ -49,6 +51,7 @@ REASON_LABELS = {
     ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN: "追问归属不明确",
     ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN: "题型分类不确定",
     ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN: "主题归并不确定",
+    ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN: "追问考察重点不确定",
     ConfirmationReasonCode.SOURCE_QUALITY_LOW: "原始文稿结构较弱",
     ConfirmationReasonCode.ANSWER_MISSING: "未识别到回答",
     ConfirmationReasonCode.CHUNK_OVERLAP_CONFLICT: "分块结果冲突",
@@ -105,11 +108,18 @@ class QuestionTurnSubmission(StrictModel):
     follow_up_assessment: ConfidenceAssessment | None = None
     question_type_assessment: ConfidenceAssessment
     topic_grouping_assessment: ConfidenceAssessment
+    probe_focus: list[Literal[
+        "补充细节", "个人贡献", "方法选择", "实验设计", "数据质量", "结果归因",
+        "业务决策", "一致性核查", "复盘反思", "岗位匹配", "其他",
+    ]] = Field(default_factory=list, max_length=2)
+    probe_focus_assessment: ConfidenceAssessment | None = None
 
     @model_validator(mode="after")
     def validate_follow_up(self) -> "QuestionTurnSubmission":
         if self.turn_type == "follow_up" and (not self.parent_question_anchor or not self.follow_up_assessment):
             raise ValueError("追问必须提交父问题锚点和追问归属评分")
+        if self.turn_type == "follow_up" and (not self.probe_focus or not self.probe_focus_assessment):
+            raise ValueError("追问必须提交考察重点和对应评分")
         _require_reason_subset(self.question_boundary_assessment, {ConfirmationReasonCode.QUESTION_BOUNDARY_UNCERTAIN, ConfirmationReasonCode.SOURCE_QUALITY_LOW})
         _require_reason_subset(self.answer_boundary_assessment, {ConfirmationReasonCode.ANSWER_BOUNDARY_UNCERTAIN, ConfirmationReasonCode.ANSWER_MISSING, ConfirmationReasonCode.SOURCE_QUALITY_LOW})
         _require_reason_subset(self.qa_pairing_assessment, {ConfirmationReasonCode.QA_PAIRING_AMBIGUOUS, ConfirmationReasonCode.ANSWER_MISSING})
@@ -117,6 +127,8 @@ class QuestionTurnSubmission(StrictModel):
         _require_reason_subset(self.topic_grouping_assessment, {ConfirmationReasonCode.TOPIC_GROUPING_UNCERTAIN})
         if self.follow_up_assessment:
             _require_reason_subset(self.follow_up_assessment, {ConfirmationReasonCode.MAIN_FOLLOWUP_UNCERTAIN, ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN})
+        if self.probe_focus_assessment:
+            _require_reason_subset(self.probe_focus_assessment, {ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN})
         return self
 
 
@@ -143,11 +155,19 @@ class TranscriptProfile:
 
 
 def profile_transcript(text: str) -> TranscriptProfile:
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    allow_short_timestamp = transcript_uses_short_timeline(text)
+    subtitle_indexes = subtitle_sequence_line_indexes(text)
+    parsed_lines = [
+        parse_transcript_line(line.strip(), allow_short_timestamp=allow_short_timestamp)
+        for index, line in enumerate((text or "").splitlines())
+        if line.strip() and index not in subtitle_indexes
+    ]
+    lines = [line for line in parsed_lines if line.text]
     line_count = len(lines)
-    labeled = sum(bool(SPEAKER_PATTERN.match(line)) for line in lines)
+    labeled = sum(bool(line.speaker_label) for line in lines)
     coverage = labeled / line_count if line_count else 0.0
-    punctuation_density = len(SENTENCE_END_PATTERN.findall(text or "")) / max(1, len(text or ""))
+    spoken_text = "\n".join(line.text for line in lines)
+    punctuation_density = len(SENTENCE_END_PATTERN.findall(spoken_text)) / max(1, len(spoken_text))
     if line_count >= 2 and coverage >= 0.6:
         profile_type, quality = "labeled_lines", 95
     elif line_count >= 2:
@@ -161,28 +181,36 @@ def profile_transcript(text: str) -> TranscriptProfile:
 
 def atomize_text(text: str, profile: TranscriptProfile) -> list[dict[str, Any]]:
     source = text or ""
+    allow_short_timestamp = transcript_uses_short_timeline(source)
+    subtitle_indexes = subtitle_sequence_line_indexes(source)
     spans: list[tuple[int, int, str, str, str]] = []
     if profile.profile_type in {"labeled_lines", "unlabeled_lines"}:
         cursor = 0
-        for line in source.splitlines(keepends=True):
+        for line_index, line in enumerate(source.splitlines(keepends=True)):
             content = line.rstrip("\r\n")
             stripped = content.strip()
-            if not stripped:
+            if not stripped or line_index in subtitle_indexes:
                 cursor += len(line)
                 continue
             leading = len(content) - len(content.lstrip())
             line_start = cursor + leading
-            match = SPEAKER_PATTERN.match(stripped)
-            label = match.group("label") if match else ""
-            body = match.group("text") if match else stripped
-            body_offset = stripped.find(body)
-            body_start = line_start + max(0, body_offset)
+            parsed = parse_transcript_line(stripped, allow_short_timestamp=allow_short_timestamp)
+            label = parsed.speaker_label
+            body = parsed.text
+            if not body:
+                cursor += len(line)
+                continue
+            body_start = line_start + parsed.text_offset
             role = _role_from_label(label)
             parts = _sentence_spans(body, body_start) if len(body) > 180 else [(body_start, body_start + len(body), body)]
             spans.extend((start, end, part, label, role) for start, end, part in parts if part.strip())
             cursor += len(line)
     elif profile.profile_type == "punctuated_stream":
-        spans.extend((start, end, part, "", "unknown") for start, end, part in _sentence_spans(source, 0))
+        parsed = parse_transcript_line(source, allow_short_timestamp=allow_short_timestamp)
+        spans.extend(
+            (start, end, part, parsed.speaker_label, _role_from_label(parsed.speaker_label))
+            for start, end, part in _sentence_spans(parsed.text, parsed.text_offset)
+        )
     else:
         if jieba:
             tokens = list(jieba.tokenize(source))
@@ -366,53 +394,65 @@ def calculate_turn_confidence(
     hard_reasons: Iterable[ConfirmationReasonCode] = (),
 ) -> dict[str, Any]:
     weights = (
-        {"speaker": 0.10, "questionBoundary": 0.15, "answerBoundary": 0.10, "qaPairing": 0.25, "followUp": 0.25, "questionType": 0.15}
+        {"speaker": 0.10, "questionBoundary": 0.15, "answerBoundary": 0.10, "qaPairing": 0.25, "followUp": 0.30, "probeFocus": 0.10}
         if turn_type == "follow_up"
         else {"speaker": 0.15, "questionBoundary": 0.20, "answerBoundary": 0.15, "qaPairing": 0.35, "questionType": 0.15}
     )
+    if turn_type == "follow_up" and "probeFocus" not in assessments:
+        assessments = {**assessments, "probeFocus": assessments["questionType"]}
     semantic = sum(assessments[name].score * weight for name, weight in weights.items())
     raw_score = round(semantic * 0.8 + source_quality * 0.2)
     effective = raw_score
-    reason_entries: list[dict[str, Any]] = []
+    blocking_entries: list[dict[str, Any]] = []
+    semantic_notices: list[dict[str, Any]] = []
     hard = list(dict.fromkeys(hard_reasons))
     for code in hard:
-        reason_entries.append(_reason_entry(code, "validation", 0, [], 10_000))
+        blocking_entries.append(_reason_entry(code, "validation", 0, [], 10_000))
     for name, weight in weights.items():
         assessment = assessments[name]
         for code in assessment.reason_codes:
-            reason_entries.append(_reason_entry(code, name, assessment.score, assessment.evidence_atom_ids, round(weight * (100 - assessment.score), 2), assessment.summary))
-    for name in ("topicGrouping",):
+            entry = _reason_entry(code, name, assessment.score, assessment.evidence_atom_ids, round(weight * (100 - assessment.score), 2), assessment.summary)
+            if code in {ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN, ConfirmationReasonCode.PROBE_FOCUS_UNCERTAIN}:
+                if turn_type == "main" and code == ConfirmationReasonCode.QUESTION_TYPE_UNCERTAIN and assessment.score < 60:
+                    blocking_entries.append(entry)
+                else:
+                    semantic_notices.append(entry)
+            elif code in {ConfirmationReasonCode.MAIN_FOLLOWUP_UNCERTAIN, ConfirmationReasonCode.FOLLOWUP_PARENT_UNCERTAIN} and assessment.score >= 70:
+                semantic_notices.append(entry)
+            else:
+                blocking_entries.append(entry)
+    for name in ("questionType", "topicGrouping") if turn_type == "follow_up" else ("topicGrouping",):
         assessment = assessments.get(name)
         if not assessment:
             continue
         for code in assessment.reason_codes:
-            reason_entries.append(_reason_entry(code, name, assessment.score, assessment.evidence_atom_ids, round(0.1 * (100 - assessment.score), 2), assessment.summary))
+            semantic_notices.append(_reason_entry(code, name, assessment.score, assessment.evidence_atom_ids, round(0.1 * (100 - assessment.score), 2), assessment.summary))
     if source_quality < 65:
-        reason_entries.append(_reason_entry(ConfirmationReasonCode.SOURCE_QUALITY_LOW, "sourceQuality", source_quality, [], round(0.2 * (100 - source_quality), 2)))
+        blocking_entries.append(_reason_entry(ConfirmationReasonCode.SOURCE_QUALITY_LOW, "sourceQuality", source_quality, [], round(0.2 * (100 - source_quality), 2)))
 
     core_names = ("speaker", "questionBoundary", "answerBoundary", "qaPairing")
     if hard or any(assessments[name].score < 60 for name in core_names):
         effective = min(effective, 64)
     warning = any(assessments[name].score < 75 for name in core_names)
-    warning = warning or assessments["questionType"].score < 60 or source_quality < 65
+    warning = warning or (turn_type == "main" and assessments["questionType"].score < 60) or source_quality < 65
     if turn_type == "follow_up":
         warning = warning or assessments["followUp"].score < 70
-    if assessments.get("topicGrouping"):
-        warning = warning or assessments["topicGrouping"].score < 70
-    needs_confirmation = bool(hard or warning or reason_entries)
+    needs_confirmation = bool(hard or warning or blocking_entries)
     if needs_confirmation:
         effective = min(effective, 84)
     level = "high" if effective >= 85 and not needs_confirmation else "medium" if effective >= 65 else "low"
-    reason_entries = _deduplicate_and_rank_reasons(reason_entries)[:3]
+    blocking_entries = _deduplicate_and_rank_reasons(blocking_entries)[:3]
+    semantic_notices = _deduplicate_and_rank_reasons(semantic_notices)[:4]
     return {
         "confidence": level, "confidenceScore": effective, "rawConfidenceScore": raw_score,
-        "needsConfirmation": needs_confirmation, "confirmationReasons": reason_entries,
+        "needsConfirmation": needs_confirmation, "confirmationReasons": blocking_entries,
         "confidenceDetails": {
             "sourceQuality": source_quality,
             "semanticScore": round(semantic),
             "rawScore": raw_score,
             "effectiveScore": effective,
             "dimensions": {name: value.model_dump(mode="json") for name, value in assessments.items()},
+            "semanticNotices": semantic_notices,
         },
     }
 
@@ -481,6 +521,8 @@ def _role_from_label(label: str) -> str:
         return "interviewer"
     if value in {"候选人", "求职者", "candidate", "答", "a"}:
         return "candidate"
+    if value in {"系统", "system"}:
+        return "system_noise"
     return "unknown"
 
 
@@ -495,7 +537,12 @@ def _text_from_atoms(atoms: list[dict[str, Any]], source: str) -> str:
         )
     start, end = atoms[0].get("startChar"), atoms[-1].get("endChar")
     if source and start is not None and end is not None:
-        return source[int(start):int(end)].strip()
+        source_slice = source[int(start):int(end)].strip()
+        if len(atoms) == 1:
+            return str(atoms[0].get("rawText", source_slice)).strip()
+        if any(parse_transcript_line(line, allow_short_timestamp=True).has_timeline for line in source_slice.splitlines()):
+            return "\n".join(str(item.get("rawText", "")).strip() for item in atoms if str(item.get("rawText", "")).strip())
+        return source_slice
     parts = [str(item.get("rawText", "")).strip() for item in atoms if str(item.get("rawText", "")).strip()]
     if parts and all(re.search(r"[\u3400-\u9fff]", part) for part in parts):
         return "".join(parts)

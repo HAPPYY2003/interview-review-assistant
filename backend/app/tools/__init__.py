@@ -1,4 +1,4 @@
-"""Custom HelloAgents tools used by the Offer Radar supervisor and subagents."""
+"""Custom tools used by the interview review supervisor and subagents."""
 
 from backend.app.tools.agent_tools import (
     build_agent_tools,

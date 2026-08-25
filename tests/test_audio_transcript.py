@@ -82,6 +82,58 @@ def test_deepgram_segments_validation_and_speaker_mapping():
     assert {issue["code"] for issue in result.issues} >= {"adjacent_duplicate"}
 
 
+def test_numbered_speakers_are_mapped_consistently_and_clear_role_uncertainty():
+    transcript = "\n".join([
+        "[00:00.000] speaker_0: 请介绍项目？",
+        "[00:05.000] speaker_1: 我负责需求分析。",
+        "[00:12.000] speaker_0: 你怎么验证结果？",
+        "[00:18.000] speaker_1: 我做了对照实验。",
+    ])
+    segments = segment_text(transcript)
+    for segment in segments:
+        segment["confidenceDetails"] = {
+            "speaker": {
+                "score": 72,
+                "reason_codes": ["SPEAKER_ROLE_UNCERTAIN"],
+                "evidence_atom_ids": [segment["id"]],
+                "summary": "缺少语义角色标签",
+            },
+            "boundary": {"score": 96, "reason_codes": [], "evidence_atom_ids": [], "summary": ""},
+        }
+        segment["confirmationReasons"] = [{"code": "SPEAKER_ROLE_UNCERTAIN"}]
+        segment["needsConfirmation"] = True
+
+    map_speaker_roles(segments)
+
+    assert {item["speakerRole"] for item in segments if item["speakerLabel"] == "speaker_0"} == {"interviewer"}
+    assert {item["speakerRole"] for item in segments if item["speakerLabel"] == "speaker_1"} == {"candidate"}
+    assert all(item["speakerConfidence"] >= 0.9 for item in segments)
+    assert all(not item["needsConfirmation"] for item in segments)
+    assert all(
+        reason.get("code") != "SPEAKER_ROLE_UNCERTAIN"
+        for item in segments
+        for reason in item.get("confirmationReasons", [])
+    )
+
+
+def test_clear_unlabeled_question_answer_sequence_clears_role_uncertainty():
+    transcript = "\n".join([
+        "00:00:06 请介绍项目？",
+        "00:00:15 我负责需求分析。",
+        "00:01:03 你怎么验证结果？",
+        "00:01:11 我做了对照实验。",
+    ])
+    segments = segment_text(transcript)
+
+    map_speaker_roles(segments)
+
+    assert [item["speakerRole"] for item in segments] == [
+        "interviewer", "candidate", "interviewer", "candidate",
+    ]
+    assert all(item["speakerConfidence"] == pytest.approx(0.88) for item in segments)
+    assert all(not item["needsConfirmation"] for item in segments)
+
+
 def test_chunk_overlap_merge_and_reference_validation():
     transcript = "\n".join(
         f"{'面试官' if index % 2 == 0 else '候选人'}：{'请说明方案？' if index % 2 == 0 else '这是回答。'}"

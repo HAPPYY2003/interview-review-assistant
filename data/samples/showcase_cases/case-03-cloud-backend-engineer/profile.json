@@ -1,0 +1,20 @@
+{
+  "company": "腾讯云",
+  "position": "云原生后端工程师",
+  "round": "技术二面",
+  "interviewDate": "2026-08-19",
+  "reviewGoal": "检查架构取舍、容量证据、故障处理、数据一致性、安全意识以及前后陈述冲突",
+  "analysisMode": "full_context",
+  "inputMode": "text",
+  "synthetic": true,
+  "expectedParse": {
+    "questionAnswerRounds": 15,
+    "containsExcludedNoise": true,
+    "containsContradiction": true
+  },
+  "expectedFocus": [
+    "系统噪声不应生成题卡",
+    "迁移是否零停机存在前后冲突，应由 Reflection 标记",
+    "重点检查候选人的个人实现、压测依据、恢复过程和长期治理"
+  ]
+}

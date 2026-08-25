@@ -33,7 +33,7 @@
 每次发布前更新 `CHANGELOG.md`，在 `main` 上创建带说明的标签，例如：
 
 ```powershell
-git tag -a v0.2.1 -m "Offer Radar Agent v0.2.1"
+git tag -a v0.2.1 -m "面试复盘助手 v0.2.1"
 git push origin main --follow-tags
 ```
 

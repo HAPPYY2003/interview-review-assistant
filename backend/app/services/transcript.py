@@ -6,16 +6,15 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from backend.app.services.evidence import infer_question_type, infer_topic_title
-from backend.app.services.text_utils import repair_mojibake
-
-
-SPEAKER_RE = re.compile(
-    r"^(?:(?P<time>\[[^\]]+\]|(?:\d{1,2}:){1,2}\d{2})\s*)?"
-    r"(?P<label>面试官|采访者|interviewer|问|q|候选人|求职者|candidate|答|a)\s*[:：]\s*(?P<text>.*)$",
-    re.I,
+from backend.app.services.evidence import infer_probe_focus, infer_question_type, infer_topic_title
+from backend.app.services.text_utils import (
+    parse_transcript_line,
+    repair_mojibake,
+    subtitle_sequence_line_indexes,
+    transcript_uses_short_timeline,
 )
 QUESTION_RE = re.compile(r"[?？]|^(?:请|你|为什么|怎么|如何|介绍|讲讲|谈谈|说说|哪些|什么|是否|能否)")
+CLEAR_QUESTION_RE = re.compile(r"^(?:请|你|您|为什么|怎么|如何|介绍|讲讲|谈谈|说说|哪些|什么|是否|能否|可以|具体|最终|结果|如果|假设|那|再|先|最后)")
 FOLLOW_UP_RE = re.compile(r"^(?:你刚才|刚才|具体|为什么|怎么证明|这个|这些|其中|最终|结果|关键|能再|请再|如果)")
 NOISE_RE = re.compile(r"(?:听得到吗|麦克风|网络|稍等|录音开始|字幕|转写|谢谢参加|再见)")
 
@@ -33,11 +32,13 @@ class TranscriptValidation:
 
 def segment_text(transcript: str) -> list[dict[str, Any]]:
     source = repair_mojibake(transcript or "")
+    allow_short_timestamp = transcript_uses_short_timeline(source)
+    subtitle_indexes = subtitle_sequence_line_indexes(source)
     spans: list[tuple[int, int, str]] = []
     cursor = 0
-    for line in source.splitlines(keepends=True):
+    for line_index, line in enumerate(source.splitlines(keepends=True)):
         content = line.rstrip("\r\n")
-        if content.strip():
+        if content.strip() and line_index not in subtitle_indexes:
             leading = len(content) - len(content.lstrip())
             spans.append((cursor + leading, cursor + len(content), content.strip()))
         cursor += len(line)
@@ -47,7 +48,7 @@ def segment_text(transcript: str) -> list[dict[str, Any]]:
 
     expanded: list[tuple[int, int, str]] = []
     for start, end, text in spans:
-        if SPEAKER_RE.match(text) or len(text) <= 180:
+        if parse_transcript_line(text, allow_short_timestamp=allow_short_timestamp).speaker_label or len(text) <= 180:
             expanded.append((start, end, text))
             continue
         for match in re.finditer(r".+?(?:[。！？?!；;]+|$)", text):
@@ -56,13 +57,15 @@ def segment_text(transcript: str) -> list[dict[str, Any]]:
                 expanded.append((start + match.start(), start + match.end(), part))
 
     segments: list[dict[str, Any]] = []
-    for index, (start, end, original) in enumerate(expanded, 1):
-        match = SPEAKER_RE.match(original)
-        label = match.group("label") if match else ""
-        text = match.group("text").strip() if match else original
+    for start, end, original in expanded:
+        parsed = parse_transcript_line(original, allow_short_timestamp=allow_short_timestamp)
+        label = parsed.speaker_label
+        text = parsed.text
+        if not text:
+            continue
+        index = len(segments) + 1
         role = _role_from_label(label)
-        text_offset = original.find(text)
-        text_start = start + max(0, text_offset)
+        text_start = start + parsed.text_offset
         confidence = 0.99 if role != "unknown" else 0.58
         segments.append(
             {
@@ -90,26 +93,59 @@ def map_speaker_roles(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for segment in segments:
         if segment.get("speakerLabel"):
             labels[segment["speakerLabel"]].append(segment)
-    if not labels or all(any(item.get("speakerRole") != "unknown" for item in items) for items in labels.values()):
+    if not labels:
+        _stabilize_unlabeled_qa_sequence(segments)
         return segments
 
-    scores = []
+    semantic_roles = {label: _role_from_label(label) for label in labels}
+    unresolved_labels = [label for label, role in semantic_roles.items() if role == "unknown"]
+    if not unresolved_labels:
+        return segments
+
+    scores: list[tuple[float, str]] = []
     for label, items in labels.items():
+        if semantic_roles[label] != "unknown":
+            continue
         questions = sum(bool(QUESTION_RE.search(item.get("normalizedText", ""))) for item in items)
         scores.append((questions / max(1, len(items)), label))
     scores.sort(reverse=True)
+    if len(scores) < 2:
+        return segments
+
     interviewer_labels = {label for ratio, label in scores if ratio >= 0.45}
-    if not interviewer_labels and scores:
+    if not interviewer_labels:
         interviewer_labels.add(scores[0][1])
-    candidates = [label for _, label in reversed(scores) if label not in interviewer_labels]
-    candidate_label = candidates[0] if candidates else None
+    candidate_labels = {label for _, label in scores if label not in interviewer_labels}
+    if not candidate_labels and scores[0][0] - scores[-1][0] >= 0.2:
+        candidate_labels.add(scores[-1][1])
+        interviewer_labels.discard(scores[-1][1])
+
+    ratios = {label: ratio for ratio, label in scores}
+    interviewer_floor = min((ratios[label] for label in interviewer_labels), default=0.0)
+    candidate_ceiling = max((ratios[label] for label in candidate_labels), default=1.0)
 
     for segment in segments:
         label = segment.get("speakerLabel", "")
+        semantic_role = semantic_roles.get(label, "unknown")
+        if semantic_role != "unknown":
+            segment["speakerRole"] = semantic_role
+            continue
         if label in interviewer_labels:
-            segment["speakerRole"] = "interviewer"
-        elif label == candidate_label:
-            segment["speakerRole"] = "candidate"
+            margin = ratios[label] - candidate_ceiling
+            _apply_inferred_speaker_role(
+                segment,
+                "interviewer",
+                _role_inference_score(margin, len(labels[label])),
+                "根据整场同一说话人编号的提问比例完成角色映射",
+            )
+        elif label in candidate_labels:
+            margin = interviewer_floor - ratios[label]
+            _apply_inferred_speaker_role(
+                segment,
+                "candidate",
+                _role_inference_score(margin, len(labels[label])),
+                "根据整场同一说话人编号的提问比例完成角色映射",
+            )
         else:
             segment["speakerRole"] = "unknown"
             segment["needsConfirmation"] = True
@@ -179,7 +215,7 @@ def build_question_cards(segments: list[dict[str, Any]]) -> list[dict[str, Any]]
         if segment.get("excluded"):
             continue
         role = segment.get("speakerRole")
-        text = segment.get("rawText", "").strip()
+        text = segment.get("normalizedText", segment.get("rawText", "")).strip()
         if role == "system_noise" or not text:
             continue
         is_question = role == "interviewer" or (role == "unknown" and bool(QUESTION_RE.search(text)))
@@ -190,12 +226,14 @@ def build_question_cards(segments: list[dict[str, Any]]) -> list[dict[str, Any]]
             if not follow_up:
                 root = None
             question_id = str(uuid.uuid4())
+            suggested_type = infer_question_type(text)
+            question_type = root["questionType"] if follow_up and root else suggested_type
             current = {
                 "id": question_id,
                 "order": len(questions) + 1,
                 "interviewerQuestion": text,
                 "candidateAnswer": "",
-                "questionType": infer_question_type(text),
+                "questionType": question_type,
                 "confidence": confidence_label(
                     float(segment.get("confidence", 0)),
                     needs_confirmation=bool(segment.get("needsConfirmation")),
@@ -216,6 +254,9 @@ def build_question_cards(segments: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "followUpImpact": "",
                 "questionSegmentIds": [segment["id"]],
                 "answerSegmentIds": [],
+                "probeFocus": infer_probe_focus(text) if follow_up else [],
+                "probeFocusConfidence": 84 if follow_up else 100,
+                "confidenceDetails": {"agentSuggestedQuestionType": suggested_type} if follow_up else {},
             }
             if not follow_up:
                 root = current
@@ -278,7 +319,81 @@ def _role_from_label(label: str) -> str:
         return "interviewer"
     if normalized in {"候选人", "求职者", "candidate", "答", "a"}:
         return "candidate"
+    if normalized in {"系统", "system"}:
+        return "system_noise"
     return "unknown"
+
+
+def _role_inference_score(margin: float, sample_count: int) -> int:
+    if sample_count >= 2 and margin >= 0.4:
+        return 92
+    if margin >= 0.2:
+        return 84
+    return 76
+
+
+def _stabilize_unlabeled_qa_sequence(segments: list[dict[str, Any]]) -> None:
+    usable = [item for item in segments if not item.get("excluded") and str(item.get("normalizedText") or item.get("rawText") or "").strip()]
+    if len(usable) < 4:
+        return
+    question_indexes = [
+        index for index, item in enumerate(usable)
+        if _is_clear_question(str(item.get("normalizedText") or item.get("rawText") or ""))
+    ]
+    if len(question_indexes) < 2 or question_indexes[0] > 1:
+        return
+    boundaries = [*question_indexes, len(usable)]
+    if any(following - current < 2 for current, following in zip(boundaries, boundaries[1:])):
+        return
+    if (len(usable) - question_indexes[0]) / len(usable) < 0.8:
+        return
+
+    question_index_set = set(question_indexes)
+    for index, segment in enumerate(usable):
+        if index < question_indexes[0]:
+            continue
+        role = "interviewer" if index in question_index_set else "candidate"
+        _apply_inferred_speaker_role(
+            segment,
+            role,
+            88,
+            "根据整场连续的提问与回答序列完成角色映射",
+        )
+
+
+def _is_clear_question(text: str) -> bool:
+    value = text.strip()
+    return value.endswith(("?", "？")) or bool(CLEAR_QUESTION_RE.search(value))
+
+
+def _apply_inferred_speaker_role(segment: dict[str, Any], role: str, score: int, summary: str) -> None:
+    segment["speakerRole"] = role
+    is_audio = segment.get("startTime") is not None
+    if not is_audio or segment.get("speakerConfidence") is None:
+        segment["speakerConfidence"] = score / 100
+    if score < 80:
+        segment["needsConfirmation"] = True
+        return
+
+    details = segment.setdefault("confidenceDetails", {})
+    details["speaker"] = {
+        "score": score,
+        "reason_codes": [],
+        "evidence_atom_ids": [],
+        "summary": summary,
+    }
+    reasons = [
+        item for item in segment.get("confirmationReasons", [])
+        if item.get("code") != "SPEAKER_ROLE_UNCERTAIN"
+    ]
+    segment["confirmationReasons"] = reasons
+    if is_audio:
+        segment["needsConfirmation"] = bool(reasons) or float(segment.get("confidence") or 0) < 0.75
+    else:
+        boundary = details.get("boundary") or {}
+        boundary_score = float(boundary.get("score") or 100) / 100
+        segment["confidence"] = min(score / 100, boundary_score)
+        segment["needsConfirmation"] = bool(reasons) or segment["confidence"] < 0.75
 
 
 def _topic_title(question: str) -> str:
