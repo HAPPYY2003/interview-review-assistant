@@ -1,29 +1,137 @@
 # Interview Review Assistant
 
-> A local-first, evidence-driven interview review workspace that turns raw transcripts into verified question cards, structured feedback, and actionable practice.
+> Turn an interview transcript into a review you can verify, act on, and practice from.
 
-[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![SQLite](https://img.shields.io/badge/SQLite-local--first-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![CI](https://github.com/HAPPYY2003/interview-review-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/HAPPYY2003/interview-review-assistant/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-100%2B-success)](#quality-and-testing)
+Interview Review Assistant is a local-first product for job seekers who want more than a generic AI summary. It reconstructs the interview, asks the user to confirm uncertain questions, links feedback to the original material, and turns recurring weaknesses into focused practice.
 
-Interview Review Assistant is both a working AI product and my product management portfolio project. It does more than send an interview transcript to a language model for a one-shot summary. The product is designed around four harder questions:
+I created this project as a product management portfolio case: from problem framing and workflow design to usability iteration, quality evaluation, and release planning.
 
-- Can every important conclusion be traced back to the original material?
-- Can the user correct parsing mistakes before they affect the report?
-- Can feedback be converted into a concrete practice loop?
-- Can a long-running AI workflow recover when a model or service fails?
-
-I led the product definition, interaction design, agent workflow design, implementation, testing, and release iteration. The repository includes a deterministic demo mode, synthetic sample data, and an optional real-model mode.
-
-> **Language note:** Repository documentation is in English. The current product UI and synthetic interview corpus are Chinese-first because the initial target users are Chinese-speaking job seekers.
+> **Language note:** Repository documentation is in English. The current product interface and sample interviews are Chinese-first because the initial target users are Chinese-speaking job seekers.
 
 ![Interview review report overview](docs/images/report-overview.png)
 
-## Try It in 3 Minutes
+## Product at a Glance
 
-The default `fixture` mode does not call a language model or upload private material. It is the fastest way to explore the complete product flow.
+| Area | Description |
+| --- | --- |
+| Target user | Job seekers who have an interview transcript or recording and want to improve across multiple interviews |
+| Core problem | Important follow-ups are easy to forget, AI conclusions are difficult to verify, and advice often remains too generic to use |
+| Product promise | Preserve the original interview, surface evidence-backed feedback, and provide a clear next practice step |
+| My role | Product manager, product designer, and independent builder |
+| Current stage | Working MVP with a safe demonstration mode and optional private review mode |
+
+## The Problem
+
+Most interview reviews depend on memory. Candidates usually retain one uncomfortable question or a vague feeling that an answer went badly, but miss the complete chain of questions, follow-ups, evidence, and interviewer signals.
+
+Using a general AI chat tool improves speed but creates new risks:
+
+- A follow-up may be treated as an unrelated question.
+- Feedback may sound convincing without being supported by the transcript.
+- The candidate's experience may be rewritten into facts that never happened.
+- A long report may explain the problem without helping the user practice.
+- Sensitive resumes, recordings, and interview content require clear privacy boundaries.
+
+The product therefore focuses on one principle:
+
+> AI can help interpret the interview, but the user should be able to verify the source and retain control over uncertain decisions.
+
+## The Experience
+
+```text
+Add interview material
+→ Confirm reconstructed questions and follow-ups
+→ Review evidence-backed feedback
+→ Identify repeated skill and knowledge gaps
+→ Choose the next action
+→ Practice and receive structured feedback
+```
+
+### 1. Add Interview Material
+
+Users can paste a transcript or upload text, documents, and prerecorded audio. The product supports both structured transcripts and noisier speech-to-text material.
+
+Private material remains on the user's computer by default. Audio is only sent for transcription after the user explicitly confirms consent and de-identification.
+
+### 2. Confirm Questions Before Review
+
+The product reconstructs:
+
+- Main interview questions.
+- Candidate answers.
+- Follow-up questions and their relationship to the main topic.
+- Observable uncertainty such as unclear speakers, missing answers, or questionable boundaries.
+
+Users review the uncertain parts before the final analysis begins. They can correct content, change a speaker, merge related topics, split a follow-up into a new topic, or remove noise.
+
+This step prevents an early parsing mistake from contaminating the entire report.
+
+### 3. Read an Evidence-Backed Report
+
+The report includes:
+
+- An overall interview evaluation.
+- Five dimensions: relevance, structure, evidence, analytical depth, and role fit.
+- Skill and knowledge gaps linked to the questions that revealed them.
+- Topic-by-topic views of answer logic, interviewer signals, problem diagnosis, improved wording, and source evidence.
+- Quality-review notes that explain whether important risks were found or corrected.
+
+Every important conclusion can be traced back to the interview, resume, or job description. Improved answers reorganize confirmed facts and mark missing information instead of inventing experience.
+
+### 4. Turn Feedback into Next Actions
+
+The product converts repeated weaknesses into a short list of next actions. Each action explains:
+
+- Why it matters.
+- Which gap and interview question it came from.
+- What the user should work on.
+- What "done" looks like.
+
+Actions are not forced into a "one task per day" schedule. Users can choose the most valuable next step based on their next interview and available time.
+
+### 5. Practice Inside the Report
+
+Each action can open one of four practice modes:
+
+| Mode | Best for |
+| --- | --- |
+| Oral answer | Explaining an experience clearly and concisely |
+| Follow-up drill | Preparing for deeper questions about contribution, evidence, and decisions |
+| Case builder | Completing missing context, process, metrics, and reflection |
+| Knowledge quiz | Checking role-specific concepts and methods |
+
+Drafts are saved locally. Users can leave, return, submit another attempt, compare feedback, and decide when an action is complete. New facts introduced during practice are marked for verification and never change the original report automatically.
+
+![Action practice drawer](docs/images/action-practice.png)
+
+## Key Product Decisions
+
+| Product decision | Why it matters |
+| --- | --- |
+| Confirm the reconstructed interview before analysis | An incorrect question-answer structure would weaken every later conclusion |
+| Preserve the source separately from user edits | Users can correct transcription problems without losing the original record |
+| Require evidence for important judgments | Plausible feedback is not always trustworthy feedback |
+| Keep scoring rules consistent | The same performance should not receive a different total score because of wording variation |
+| Review both the diagnosis and the action plan | A good diagnosis can still lead to generic or unsupported advice |
+| Add practice at the point of action | Reading feedback alone rarely creates behavior change |
+| Store private material locally by default | Interview transcripts often contain personal and company-sensitive information |
+
+## A Typical Product Walkthrough
+
+For a portfolio interview or product review, the recommended demonstration takes about five minutes:
+
+1. Start with a prepared synthetic interview so no private information is exposed.
+2. Show how main questions and follow-ups are reconstructed.
+3. Correct one intentionally uncertain item to demonstrate user control.
+4. Open a completed report and trace one diagnosis back to its source.
+5. Show how the same issue becomes a concrete next action.
+6. Open a practice session, submit a short response, and review the feedback.
+
+This walkthrough demonstrates the complete user value loop without waiting for a live review to finish.
+
+## Try It Locally
+
+The default demonstration mode uses synthetic material and does not require an AI service key.
 
 ### Option A: Docker
 
@@ -35,11 +143,9 @@ cd interview-review-assistant
 docker compose up --build
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The Docker setup uses fixture mode by default and stores application data in a named local volume.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
-### Option B: Python
-
-Prerequisite: Python 3.11
+### Option B: Python 3.11
 
 Windows PowerShell:
 
@@ -61,322 +167,96 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
-python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Then open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+Then:
 
-### First Product Walkthrough
+1. Open **New Review**.
+2. Select the demo-data action or use synthetic material from `data/samples/`.
+3. Confirm the question cards.
+4. Open the report and start one practice session.
 
-1. Open **New Review** in the left navigation.
-2. Use the demo-data action or upload synthetic material from `data/samples/`.
-3. Start parsing and review the generated main questions and follow-ups.
-4. Confirm the question cards to launch the four-stage review workflow.
-5. Open the report, inspect evidence references, and start an action practice session.
+To use your own private AI service, follow the comments in [`.env.example`](.env.example). Keep the key on the server and never commit `.env`.
 
-No API key is required for this walkthrough.
+## Privacy and Responsible Use
 
-## Product Snapshot
+- The demonstration data is synthetic.
+- Personal transcripts, recordings, reports, and practice history are excluded from Git.
+- Private materials are stored locally by default.
+- Users must obtain permission before uploading another person's recording.
+- A deleted interview also removes its related review and practice records.
+- The product does not estimate hiring probability or claim to predict an employer's decision.
 
-| Area | Description |
-| --- | --- |
-| Target users | Job seekers who have an interview transcript or recording and want a rigorous review and practice loop |
-| Core problem | Generic AI summaries are difficult to verify, easy to hallucinate, and rarely translate into action |
-| Product position | A local-first, evidence-driven, human-controlled interview review assistant |
-| My role | Product manager, product designer, and independent developer |
-| Current stage | Working MVP with deterministic demo mode and optional real-model execution |
-| Stack | FastAPI, SQLite, Vanilla JavaScript, an agent runtime, Deepgram, and local BM25 retrieval |
+For friends, interviewers, or evaluators, use demonstration mode and synthetic data on a trusted machine.
 
-## Product Case Study
+## Product Iteration and Quality Evaluation
 
-### The Challenge
-
-After an interview, candidates usually remember fragments: one weak answer, an uncomfortable follow-up, or a vague sense that something went wrong. A generic AI summary can be fast, but it introduces new product risks:
-
-- Questions, answers, and follow-ups may be grouped incorrectly.
-- Scores and recommendations may not be supported by the transcript.
-- The model may rewrite the candidate's experience instead of preserving the source.
-- Advice often remains a reading artifact rather than becoming a training task.
-- Timeouts or invalid structured output can force the user to restart an expensive workflow.
-- Resumes, recordings, and interview transcripts create a sensitive privacy boundary.
-
-### The Product Thesis
+The product is improved through a repeatable loop:
 
 ```text
-Let AI interpret meaning, let deterministic code enforce evidence and rules,
-and let the user retain final control over uncertain decisions.
+Observe a failed or costly user case
+→ classify the root cause
+→ define one improvement hypothesis
+→ test representative development cases
+→ run the full regression set
+→ record the version and remaining risks
+→ validate the stable version on unseen cases
 ```
 
-This thesis shaped the workflow, data model, interface, failure states, and release priorities.
+The question-reconstruction evaluation focuses on five primary measures:
 
-### Key Product Decisions
+- Completion rate.
+- Question identification quality.
+- Answer assignment quality.
+- Follow-up relationship quality.
+- Weighted user correction effort.
 
-| Decision | User problem addressed | Product implementation |
-| --- | --- | --- |
-| Parse before reviewing | A wrong question-answer structure contaminates every later conclusion | Main questions and follow-ups are grouped into topics, then paused for human confirmation |
-| Preserve source and edits separately | Users need to fix transcription errors without destroying provenance | Raw segments remain immutable; edits are stored separately; references still point to the source |
-| Make evidence a first-class object | Plausible feedback is not necessarily trustworthy feedback | Evidence IDs are registered by local tools and must resolve to a character range or timestamp |
-| Calculate scores in code | A model should not freely invent or adjust aggregate scores | The model submits evidence-supported dimension levels; fixed weights produce the final score |
-| Audit both review and plan | A good diagnosis can still produce a weak or unsupported action plan | Topic reviews are audited before planning, and the growth plan receives a final audit before release |
-| Connect the report to practice | Reading recommendations does not create behavioral change | Every action can open an oral, follow-up, case-building, or knowledge practice session |
-| Default to local storage | Interview materials contain sensitive personal and company information | SQLite stores product data locally; cloud transcription requires explicit consent |
+Evidence fidelity, unsafe pass-through, false alarms, time, and usage cost are retained as quality safeguards.
 
-### End-to-End User Journey
+The project includes synthetic examples and a repeatable evaluation process. Simulated reports are used only to test the reporting format; published performance claims must come from authorized, anonymized, and previously unseen cases.
 
-```mermaid
-flowchart LR
-    A[Add transcript or audio] --> B[Inspect and transcribe]
-    B --> C[Structure questions]
-    C --> D[Human verification]
-    D --> E[Evidence review]
-    E --> F[Topic quality audit]
-    F --> G[Growth plan]
-    G --> H[Growth plan audit]
-    H --> I[Review report]
-    I --> J[Action practice]
-    J --> K[Structured feedback]
-```
+## Current Evidence and Boundaries
 
-## Core Experience
+What the current project demonstrates:
 
-### 1. Multi-Source Input
+- A working end-to-end experience from transcript to practice.
+- Synthetic scenarios covering different roles, transcript formats, follow-ups, and failure states.
+- Automated checks for important product paths and known regression risks.
+- Recoverable failed reviews and persistent practice drafts.
+- Versioned product iterations and documented release history.
 
-- Paste text or upload TXT, PDF, DOCX, MP3, M4A, WAV, FLAC, or OGG files.
-- PDF and DOCX files are limited to 5 MB; scanned-document OCR is outside the current scope.
-- Audio files are limited to 200 MB and 120 minutes.
-- Optional Deepgram `nova-3` transcription preserves timestamps, speaker labels, and confidence.
+What the project does **not** yet claim:
 
-### 2. Semantic Parsing with Human Verification
-
-- The system creates immutable source segments and removes timeline markers, subtitle counters, and obvious noise.
-- It identifies interviewer turns, candidate turns, main questions, answers, and follow-up relationships.
-- A topic type is determined by the main question; each follow-up stores a separate probe focus.
-- Uncertain boundaries, speaker roles, parent relationships, or source references are routed to focused review.
-- Users can edit content and speaker roles, merge topics, split follow-ups, or exclude noise before analysis.
-
-### 3. Recoverable Four-Stage Review
-
-```text
-Evidence review -> Topic quality audit -> Growth plan -> Growth plan final audit
-```
-
-- **Evidence review:** analyzes the answer, follow-ups, resume, job description, and local knowledge base.
-- **Topic quality audit:** checks unsupported judgments, invalid references, score conflicts, missed follow-ups, and unsuitable answer frameworks.
-- **Growth plan:** converts repeated capability gaps into next actions instead of a generic daily checklist.
-- **Growth plan final audit:** checks coverage, executability, verifiable completion criteria, invented claims, and prohibited hiring-probability language.
-
-Each stage saves a versioned artifact and checkpoint. A failed or timed-out run can resume from the latest completed stage instead of restarting the interview.
-
-### 4. Evidence-Driven Report
-
-The report contains:
-
-- Overall interview evaluation and five-dimension scoring.
-- Skill and knowledge gaps linked to source questions.
-- Next actions with verifiable completion criteria.
-- Topic-level views for answer logic, interviewer signals, diagnosis, improved answer, and evidence.
-- Separate topic-review and growth-plan audit summaries.
-- Markdown export and cross-interview trend views.
-
-The fixed scoring model is:
-
-| Dimension | Weight |
-| --- | ---: |
-| Relevance | 20% |
-| Structure | 15% |
-| Evidence | 25% |
-| Analytical depth | 20% |
-| Role fit | 20% |
-
-### 5. Action Practice
-
-Every next action supports four practice modes:
-
-| Mode | Intended use |
-| --- | --- |
-| Oral answer | Practice explaining an experience clearly within a time limit |
-| Follow-up drill | Prepare for deeper questions about contribution, data, and decisions |
-| Case builder | Complete missing context, process, metrics, and failure material |
-| Knowledge quiz | Check role-specific concepts, methods, and tools |
-
-Practice briefs are generated only when requested, so they do not increase formal review time. Drafts, attempts, and structured feedback remain local. New claims or numbers introduced during practice are marked for verification and never become report evidence automatically.
-
-![Action practice drawer](docs/images/action-practice.png)
-
-## Information Architecture
-
-The current workspace has three primary areas:
-
-- **Interview Records:** inspect status, continue verification, resume a failed workflow, or open a completed report.
-- **New Review:** add role context, resume, job description, transcript, or audio and start parsing.
-- **Growth Trends:** compare overall scores, dimension changes, and repeated gaps across interviews.
-
-The report explains the problem and proposes actions. The practice drawer completes one focused training task. This separation keeps the report scannable while leaving room for a future cross-interview practice center.
-
-## System Architecture
-
-```mermaid
-flowchart TD
-    UI[Vanilla JS workspace] --> API[FastAPI API]
-    API --> PARSE[Asynchronous parsing pipeline]
-    PARSE --> ASR[Optional Deepgram transcription]
-    PARSE --> WORKERS[Chunked semantic workers]
-    WORKERS --> HITL[Human question-card verification]
-    HITL --> WF[Recoverable review state machine]
-    WF --> EVIDENCE[Evidence analysis]
-    WF --> AUDIT[Topic quality audit]
-    WF --> GROWTH[Growth plan generation]
-    WF --> FINAL_AUDIT[Growth plan final audit]
-    FINAL_AUDIT --> REPORT[Report and action practice]
-    API --> DB[(SQLite)]
-    WF --> TRACE[Sessions, traces, and artifacts]
-    EVIDENCE --> KB[Local BM25 knowledge base]
-```
-
-### AI and Deterministic-Code Responsibilities
-
-| Stage | AI responsibility | Deterministic responsibility |
-| --- | --- | --- |
-| Parsing | Semantic roles, question-answer grouping, follow-up relationships, and probe focus | Timeline cleanup, character offsets, schemas, provenance, and conflict validation |
-| Evidence review | Diagnose logic, select an answer framework, and interpret observable interviewer signals | Provide a restricted evidence packet, validate evidence IDs and numbers, and aggregate scores |
-| Quality audit | Find unsupported claims, omissions, and contradictions | Limit rounds, lock a valid submission, and version artifacts |
-| Growth plan | Generate capability gaps, actions, and completion criteria | Validate topic/evidence/gap relationships and ensure high-priority gap coverage |
-| Practice | Generate a personalized brief and structured feedback | Save drafts and attempts, flag factual risks, and control status and timeouts |
-
-## Run with a Real Model
-
-Fixture mode is recommended for product evaluation and demos. To use real model execution, update the server-side `.env` file:
-
-```dotenv
-AGENT_RUNTIME=helloagents
-LLM_MODEL_ID=gpt-4.1-mini
-LLM_API_KEY=your-key
-LLM_BASE_URL=https://api.openai.com/v1
-
-ASR_PROVIDER=deepgram
-DEEPGRAM_MODEL=nova-3
-DEEPGRAM_API_KEY=your-deepgram-key
-
-WEB_VERIFY_ENABLED=false
-TAVILY_API_KEY=
-```
-
-- Without an LLM key, real mode returns an explicit configuration error; it does not disguise deterministic output as model output.
-- Without a Deepgram key, text parsing still works and audio transcription is unavailable.
-- Web verification is disabled by default. When enabled, web results can supplement factual references but cannot raise an interview score by themselves.
-
-## Data and Privacy
-
-- `.env`, SQLite databases, uploads, audio, sessions, traces, and logs are excluded from Git.
-- Transcripts, question cards, reports, and practice history are stored in local SQLite by default.
-- Audio is sent to Deepgram only after the user confirms consent and de-identification.
-- Deleting an interview cascades to its materials, question cards, reports, growth actions, and practice history.
-- SSE and trace logs exclude API keys, full private materials, and hidden model reasoning.
-- All companies, roles, resumes, metrics, and interview answers in repository samples are synthetic.
-
-For friends or evaluators, use fixture mode and synthetic data. Do not upload private interview material to a shared or untrusted machine.
-
-## Quality and Testing
-
-The project contains more than 100 automated tests covering:
-
-- Document and audio inspection, timeline cleanup, speaker inference, and topic organization.
-- Character/timestamp provenance, evidence validation, numeric constraints, and scoring.
-- Structured AI submissions, timeouts, retries, checkpoints, and artifact versions.
-- Growth-plan audits, action practice, draft recovery, and cascading deletion.
-- Complete desktop and mobile user journeys through Playwright.
-
-Install development dependencies and run:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
-node --check frontend\app.js
-node --check frontend\data-model.js
-```
-
-With the fixture server running, execute the UI regression suite:
-
-```powershell
-.\.venv\Scripts\python.exe tests\ui_smoke.py http://127.0.0.1:8000 data
-```
-
-Automated tests do not call a real model or upload private material.
-
-## API Overview
-
-| Capability | Endpoint |
-| --- | --- |
-| Create and manage interviews | `POST/GET /api/v1/interviews` |
-| Add material and start parsing | `POST /api/v1/interviews/{id}/materials`, `POST /parse` |
-| Parse status and events | `GET /api/v1/parse-runs/{id}`, `GET /events` |
-| Human editing and confirmation | `PATCH /segments`, `PATCH /questions`, `POST /confirm` |
-| Start and resume review | `POST /review-runs`, `POST /api/v1/runs/{id}/resume` |
-| Read a report | `GET /api/v1/interviews/{id}/report` |
-| Growth actions | `GET /api/v1/growth-plans/{runId}`, `PATCH /growth-actions/{id}` |
-| Practice | `POST /growth-actions/{id}/practice-sessions`, `POST /practice-sessions/{id}/submit` |
-| Growth trends | `GET /api/v1/profile/trends` |
-
-Interactive API documentation is available at `/docs` while the service is running.
-
-## Repository Structure
-
-```text
-backend/app/agents/     AI runtime and role adapters
-backend/app/services/   Parsing, evidence, review, practice, and state machines
-backend/app/tools/      Controlled tools with Pydantic schemas
-frontend/               Vanilla JavaScript product workspace
-knowledge/              Answer frameworks, question types, and scoring guidance
-data/samples/           Synthetic demonstration material
-tests/                  Unit, API, workflow, and UI regression tests
-docs/                   Versioning guidance and portfolio assets
-```
-
-## Product Validation and Metrics
-
-The current repository demonstrates engineering and workflow validation rather than claiming production adoption. Existing evidence includes a runnable end-to-end MVP, deterministic fixture flows, synthetic cross-role cases, and automated regression coverage.
-
-The next product validation phase should track:
-
-- **Activation:** percentage of users who create a review and reach question-card confirmation.
-- **Time to first report:** median time from material submission to report release.
-- **Verification burden:** percentage of topics that require manual correction.
-- **Recovery success:** percentage of failed runs completed through checkpoint recovery.
-- **Practice conversion:** percentage of recommended actions that start a practice session.
-- **Repeat value:** percentage of users who return for a second interview review or practice attempt.
-
-Any future analytics should be opt-in, documented, and separated from private transcript content.
+- Production-scale adoption.
+- Validated hiring-outcome prediction.
+- Accuracy results from private data that has not been formally labeled and frozen.
+- Multi-user cloud security or account isolation.
 
 ## Roadmap
 
-### Delivered
-
-- Text, document, and prerecorded-audio input.
-- Semantic parsing, main-question/follow-up grouping, and human verification.
-- Evidence-driven scoring, topic-level review, and two-stage quality auditing.
-- Growth trends, next actions, and report-level practice sessions.
-- Timeout handling, deterministic fallback, and checkpoint recovery.
-
 ### Next
 
-- A cross-interview practice center for drafts, feedback, and attempt history.
-- Practice progress in capability trends while keeping it separate from interview scores.
+- A practice center that brings together drafts, feedback, and attempt history across interviews.
+- Practice progress in growth trends while keeping it separate from interview scores.
 - Spoken-answer practice with pacing and delivery feedback.
-- Supervisor-level risk classification and dynamic tool permissions by topic.
-- Optional cloud deployment with accounts, tenant isolation, usage limits, deletion controls, and opt-in analytics.
+- Optional account-based deployment with clear deletion controls and opt-in usage analytics.
+- Larger user testing focused on action completion, return usage, and repeat interview value.
 
-### Intentionally Out of Scope
+### Intentionally Out of Scope for the Current MVP
 
-- OCR for scanned PDFs, live interview recording, and local speech models.
-- Multi-user collaboration and automatic job application.
-- Vector databases and hiring-probability predictions.
+- Live interview recording.
+- Automatic job applications.
+- Hiring-probability predictions.
+- Multi-user collaboration.
 
 ## What This Portfolio Demonstrates
 
-1. **End-to-end product thinking:** expanding a report generator into an input, verification, diagnosis, audit, action, practice, and feedback loop.
-2. **Responsible AI boundaries:** assigning semantic judgment to models while keeping evidence, permissions, scoring, and writes under deterministic control.
-3. **Failure experience design:** turning timeouts, invalid structures, and unavailable services into understandable, recoverable product states.
-4. **Complex information architecture:** making scores, gaps, actions, topic reviews, and evidence scannable without hiding provenance.
-5. **Verifiable delivery:** combining synthetic cases, fixture mode, and automated tests so the project can be demonstrated reliably rather than only described as a prototype.
+1. **Problem framing:** translating a vague "AI interview summary" request into a verifiable user journey.
+2. **Human-centered AI design:** deciding where the product should automate, ask for confirmation, or preserve uncertainty.
+3. **Information architecture:** making evidence, scores, gaps, actions, and practice understandable in one workspace.
+4. **Failure experience design:** helping users recover without repeating expensive work.
+5. **Metric-driven iteration:** connecting Bad Cases to a hypothesis, a measurable change, and a release decision.
+6. **Responsible product boundaries:** protecting private material and avoiding unsupported hiring claims.
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and [docs/version-control.md](docs/version-control.md) for repository conventions.
+See [CHANGELOG.md](CHANGELOG.md) for release history.
